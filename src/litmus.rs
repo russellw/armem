@@ -87,6 +87,8 @@ pub struct Test {
     /// Declared types of named locations (default: signed 64-bit).
     pub loc_types: BTreeMap<u64, LocType>,
     pub symbols: Vec<(String, u64)>,
+    /// Arrays: base address -> (element size in bytes, element count).
+    pub arrays: BTreeMap<u64, (u64, u64)>,
     pub locations: Vec<Obs>,
     pub condition: Option<Condition>,
 }
@@ -147,10 +149,16 @@ impl Test {
     pub fn obs_name(&self, o: Obs) -> String {
         match o {
             Obs::Reg(t, r) => format!("{}:X{}", t, r),
+            Obs::Mem(a) if self.arrays.contains_key(&a) => format!("{}[0]", self.symbol_name(a).unwrap()),
             Obs::Mem(a) => match self.symbol_name(a) {
                 Some(n) => n.to_string(),
                 None => match self.symbols.iter().filter(|(_, sa)| *sa <= a).max_by_key(|(_, sa)| *sa) {
-                    Some((n, sa)) if a - sa < SYM_STRIDE => format!("[{}+{}]", n, a - sa),
+                    Some((n, sa)) if a - sa < SYM_STRIDE => match self.arrays.get(sa) {
+                        Some(&(elem, count)) if (a - sa) % elem == 0 && (a - sa) / elem < count => {
+                            format!("{}[{}]", n, (a - sa) / elem)
+                        }
+                        _ => format!("[{}+{}]", n, a - sa),
+                    },
                     _ => format!("[{:#x}]", a),
                 },
             },
@@ -191,6 +199,8 @@ impl fmt::Display for Quant {
 
 struct Symbols {
     syms: Vec<(String, u64)>,
+    /// Arrays: base address -> (element size in bytes, element count).
+    arrays: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Symbols {
@@ -307,7 +317,7 @@ pub fn parse(src: &str) -> Result<Test> {
         return Err("missing init block { ... }".into());
     }
 
-    let mut syms = Symbols { syms: Vec::new() };
+    let mut syms = Symbols { syms: Vec::new(), arrays: BTreeMap::new() };
     let mut reg_inits: Vec<(usize, u8, u64)> = Vec::new();
     let mut init_mem = BTreeMap::new();
     let mut loc_types = BTreeMap::new();
@@ -321,7 +331,8 @@ pub fn parse(src: &str) -> Result<Test> {
             None => (stmt, None),
         };
         // An optional C-like type precedes the name: "uint8_t x", "int *p".
-        let lhs = lhs.replace('*', " * ");
+        // herd also accepts spaces in register names: "0: X1".
+        let lhs = lhs.replace('*', " * ").replace(": ", ":").replace(" :", ":");
         let words: Vec<&str> = lhs.split_whitespace().collect();
         let Some((&name, ty_words)) = words.split_last() else {
             return Err(format!("bad init statement '{}'", stmt));
@@ -333,7 +344,14 @@ pub fn parse(src: &str) -> Result<Test> {
             };
             reg_inits.push((t, r, v));
         } else {
-            let lname = name.trim_start_matches('[').trim_end_matches(']');
+            // "x", "[x]", or an array declaration "x[N]".
+            let (lname, count) = match name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                Some((n, c)) if !n.is_empty() => {
+                    let c: u64 = c.trim().parse().map_err(|_| format!("bad array size in '{}'", stmt))?;
+                    (n, Some(c))
+                }
+                _ => (name.trim_start_matches('[').trim_end_matches(']'), None),
+            };
             if !is_ident(lname) {
                 return Err(format!("bad init statement '{}'", stmt));
             }
@@ -351,6 +369,20 @@ pub fn parse(src: &str) -> Result<Test> {
                     parse_type(&tw)?
                 }
             };
+            if let Some(count) = count {
+                let elem = ty.size.bytes();
+                if count == 0 || elem * count > SYM_STRIDE {
+                    return Err(format!("array '{}' must have 1..={} bytes", lname, SYM_STRIDE));
+                }
+                if rhs.is_some() {
+                    return Err(format!("array '{}' cannot be initialized", lname));
+                }
+                for i in 0..count {
+                    loc_types.insert(a + i * elem, ty);
+                }
+                syms.arrays.insert(a, (elem, count));
+                continue;
+            }
             loc_types.insert(a, ty);
             let v = match rhs {
                 Some(r) => syms.value(r)?,
@@ -438,7 +470,17 @@ pub fn parse(src: &str) -> Result<Test> {
             }
         }
     }
-    Ok(Test { name, threads, init_regs, init_mem, loc_types, symbols: syms.syms, locations, condition })
+    Ok(Test {
+        name,
+        threads,
+        init_regs,
+        init_mem,
+        loc_types,
+        symbols: syms.syms,
+        arrays: syms.arrays,
+        locations,
+        condition,
+    })
 }
 
 /// Bring constants compared with memory locations into the location's
@@ -482,12 +524,18 @@ fn tokenize(s: &str) -> Vec<String> {
             let st = i;
             while i < cs.len() && (cs[i].is_ascii_alphanumeric() || "_:.-+".contains(cs[i])) {
                 i += 1;
+                // herd allows "0: X1"; join it into one token.
+                if cs[i - 1] == ':' {
+                    while i < cs.len() && cs[i].is_whitespace() {
+                        i += 1;
+                    }
+                }
             }
             if i == st {
                 toks.push(c.to_string());
                 i += 1;
             } else {
-                toks.push(cs[st..i].iter().collect());
+                toks.push(cs[st..i].iter().filter(|c| !c.is_whitespace()).collect());
             }
         }
     }
@@ -526,7 +574,21 @@ impl CondParser<'_> {
             return Ok(Obs::Reg(th, r));
         }
         if is_ident(&t) {
-            return Ok(Obs::Mem(self.syms.get(&t)));
+            let a = self.syms.get(&t);
+            if self.peek() == Some("[") {
+                // Array element x[i].
+                self.pos += 1;
+                let i = asm::parse_int(&self.next()?)? as u64;
+                self.expect("]")?;
+                let Some(&(elem, count)) = self.syms.arrays.get(&a) else {
+                    return Err(format!("'{}' is not an array", t));
+                };
+                if i >= count {
+                    return Err(format!("index {} out of bounds for '{}'", i, t));
+                }
+                return Ok(Obs::Mem(a + i * elem));
+            }
+            return Ok(Obs::Mem(a));
         }
         Err(format!("bad observable '{}'", t))
     }
@@ -608,9 +670,26 @@ fn parse_final(s: &str, syms: &mut Symbols) -> Result<(Vec<Obs>, Option<Conditio
                 let prop = p.or()?;
                 condition = Some(Condition { quant, prop });
             }
+            ";" => p.pos += 1,
             "filter" => return Err("filter clauses are not supported".into()),
             _ => return Err(format!("unexpected '{}' in final section", t)),
         }
     }
     Ok((locations, condition))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn herd_spacing_forms() {
+        // Spaces inside "0: X1" and a ';' after the condition, as herd allows.
+        let t = parse(
+            "AArch64 T\n{ x = 0; 0: X1 = x; 1:X1=x; }\n P0 | P1 ;\n MOV W0,#1 | LDR W0,[X1] ;\n STR W0,[X1] | ;\nexists (1: X0 = 1);\n",
+        )
+        .unwrap();
+        assert_eq!(t.init_regs[0][1], t.init_regs[1][1]);
+        assert_eq!(t.observables(), vec![Obs::Reg(1, 0)]);
+    }
 }

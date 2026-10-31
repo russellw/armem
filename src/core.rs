@@ -9,11 +9,29 @@ use crate::isa::*;
 /// A timestamp/view. 0 is the initial state of memory.
 pub type View = u32;
 
-/// A register value together with its dependency view.
+/// A register value together with its dependency views.
+///
+/// `view` covers address and data dependencies (which order later reads
+/// and writes). `pick` (always >= `view`) additionally covers "pick"
+/// dependencies: values that were only *selected* by a condition, as in
+/// `CSEL` or the comparison of a `CAS`. In Arm's model those order later
+/// writes but not later reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RV {
     pub val: u64,
     pub view: View,
+    pub pick: View,
+}
+
+impl RV {
+    /// A value with no dependencies.
+    pub fn imm(val: u64) -> RV {
+        RV { val, view: 0, pick: 0 }
+    }
+    /// `val` with the dependencies of both `a` and `b`.
+    pub fn joined(val: u64, a: RV, b: RV) -> RV {
+        RV { val, view: a.view.max(b.view), pick: a.pick.max(b.pick) }
+    }
 }
 
 /// Architectural state of a thread that is independent of the memory model.
@@ -45,7 +63,19 @@ pub enum MemOp {
     StorePair { addr: RV, data: RV, data2: RV, size: Size },
     StoreExcl { addr: RV, data: RV, rs: RegOp, size: Size, release: bool },
     /// Atomic read-modify-write. For CAS, `cmp` is Some(expected).
-    Rmw { addr: RV, op: RmwOp, operand: RV, cmp: Option<RV>, rt: RegOp, size: Size, acquire: bool, release: bool },
+    /// `noret`: the loaded value is discarded (destination XZR/WZR). Such a
+    /// read has no acquire semantics and is not ordered by `DMB LD`.
+    Rmw {
+        addr: RV,
+        op: RmwOp,
+        operand: RV,
+        cmp: Option<RV>,
+        rt: RegOp,
+        size: Size,
+        acquire: bool,
+        release: bool,
+        noret: bool,
+    },
     Barrier(Barrier),
 }
 
@@ -53,16 +83,21 @@ pub enum MemOp {
 pub enum Step {
     /// The thread has finished.
     Done,
-    /// A local instruction was executed. `ctrl` is the view of a branch
-    /// condition, if the instruction was a conditional branch.
+    /// A local instruction was executed. `ctrl` is the (pick) view of a
+    /// branch condition, if the instruction was a conditional branch.
     Local { ctrl: Option<View> },
     /// The next instruction needs the memory model. The pc has not been
     /// advanced; the model must call `Core::retire` after performing it.
     Mem(MemOp),
 }
 
-fn join(a: View, b: View) -> View {
-    a.max(b)
+/// Apply a register extend/shift.
+fn extend(v: u64, e: Extend) -> u64 {
+    match e {
+        Extend::Lsl(s) => v << s,
+        Extend::Uxtw(s) => (v & 0xffff_ffff) << s,
+        Extend::Sxtw(s) => ((v as u32 as i32 as i64) as u64) << s,
+    }
 }
 
 impl Core {
@@ -79,20 +114,24 @@ impl Core {
             return RV::default();
         }
         let v = self.regs[r.idx as usize];
-        RV { val: Size::of(r).mask(v.val), view: v.view }
+        RV { val: Size::of(r).mask(v.val), ..v }
     }
 
     pub fn set(&mut self, r: RegOp, v: RV) {
         if r.idx == ZR {
             return;
         }
-        self.regs[r.idx as usize] = RV { val: Size::of(r).mask(v.val), view: v.view };
+        self.regs[r.idx as usize] = RV { val: Size::of(r).mask(v.val), ..v };
     }
 
     fn operand(&self, o: Operand, wide: bool) -> RV {
         match o {
             Operand::Reg(r) => self.get(r),
-            Operand::Imm(i) => RV { val: if wide { i } else { i & 0xffff_ffff }, view: 0 },
+            Operand::Imm(i) => RV::imm(if wide { i } else { i & 0xffff_ffff }),
+            Operand::RegExt(r, e) => {
+                let v = self.get(r);
+                RV { val: extend(v.val, e), ..v }
+            }
         }
     }
 
@@ -102,19 +141,14 @@ impl Core {
         if let Writeback::Post(_) = a.writeback {
             return b;
         }
-        let (off, view) = match a.offset {
-            Offset::Imm(i) => (i as u64, 0),
+        let off = match a.offset {
+            Offset::Imm(i) => RV::imm(i as u64),
             Offset::Reg(r, e) => {
                 let v = self.get(r);
-                let o = match e {
-                    Extend::Lsl(s) => v.val << s,
-                    Extend::Uxtw(s) => (v.val & 0xffff_ffff) << s,
-                    Extend::Sxtw(s) => ((v.val as u32 as i32 as i64) as u64) << s,
-                };
-                (o, v.view)
+                RV { val: extend(v.val, e), ..v }
             }
         };
-        RV { val: b.val.wrapping_add(off), view: join(b.view, view) }
+        RV::joined(b.val.wrapping_add(off.val), b, off)
     }
 
     /// Advance past the current (memory) instruction, performing any base
@@ -135,7 +169,7 @@ impl Core {
                 _ => None,
             };
             if let Some(v) = new {
-                self.set(a.base, RV { val: v, view: b.view });
+                self.set(a.base, RV { val: v, ..b });
             }
         }
         self.pc += 1;
@@ -152,7 +186,7 @@ impl Core {
         let mut next = self.pc + 1;
         match *ins {
             Instr::Nop => {}
-            Instr::MovImm { rd, imm } => self.set(rd, RV { val: imm, view: 0 }),
+            Instr::MovImm { rd, imm } => self.set(rd, RV::imm(imm)),
             Instr::MovReg { rd, rn } => {
                 let v = self.get(rn);
                 self.set(rd, v)
@@ -182,7 +216,6 @@ impl Core {
                     AluOp::Mul => x.wrapping_mul(y),
                 };
                 let r = size.mask(r);
-                let view = join(a.view, b.view);
                 if flags {
                     let sign = 1u64 << (bits - 1);
                     let n = r & sign != 0;
@@ -201,9 +234,9 @@ impl Core {
                         _ => (false, false),
                     };
                     let nzcv = (n as u64) << 3 | (z as u64) << 2 | (c as u64) << 1 | v as u64;
-                    self.flags = RV { val: nzcv, view };
+                    self.flags = RV::joined(nzcv, a, b);
                 }
-                self.set(rd, RV { val: r, view });
+                self.set(rd, RV::joined(r, a, b));
             }
             Instr::Csel { rd, rn, rm, cond, inc } => {
                 let f = self.flags;
@@ -211,21 +244,22 @@ impl Core {
                     self.get(rn)
                 } else {
                     let m = self.get(rm);
-                    RV { val: if inc { m.val.wrapping_add(1) } else { m.val }, view: m.view }
+                    RV { val: if inc { m.val.wrapping_add(1) } else { m.val }, ..m }
                 };
-                // The result depends on the flags as well as the chosen operand.
-                self.set(rd, RV { val: v.val, view: join(v.view, f.view) });
+                // The result has a data dependency on the chosen operand and
+                // only a pick dependency on the flags.
+                self.set(rd, RV { pick: v.pick.max(f.pick), ..v });
             }
             Instr::B { target } => next = target,
             Instr::BCond { cond, target } => {
-                ctrl = Some(self.flags.view);
+                ctrl = Some(self.flags.pick);
                 if cond.holds(self.flags.val) {
                     next = target;
                 }
             }
             Instr::Cbz { rt, nonzero, target } => {
                 let v = self.get(rt);
-                ctrl = Some(v.view);
+                ctrl = Some(v.pick);
                 if (v.val != 0) == nonzero {
                     next = target;
                 }
@@ -264,7 +298,7 @@ impl Core {
                 });
             }
             Instr::Rmw { op, rs, rt, addr, size, acquire, release } => {
-                // ST<op> forms (rt = ZR) do not have acquire semantics.
+                let noret = rt.idx == ZR;
                 return Step::Mem(MemOp::Rmw {
                     addr: self.addr(&addr),
                     op,
@@ -272,8 +306,9 @@ impl Core {
                     cmp: None,
                     rt,
                     size,
-                    acquire: acquire && rt.idx != ZR,
+                    acquire: acquire && !noret,
                     release,
+                    noret,
                 });
             }
             Instr::Cas { rs, rt, addr, size, acquire, release } => {
@@ -284,8 +319,9 @@ impl Core {
                     cmp: Some(self.get(rs)),
                     rt: rs,
                     size,
-                    acquire,
+                    acquire: acquire && rs.idx != ZR,
                     release,
+                    noret: rs.idx == ZR,
                 });
             }
             Instr::Barrier(b) => return Step::Mem(MemOp::Barrier(b)),

@@ -18,15 +18,21 @@
 //!
 //! Mixed-size accesses: memory is byte-addressed. A message has a
 //! footprint (address and size), and coherence and forwarding are tracked
-//! per byte. An aligned read is single-copy atomic: it takes effect at one
-//! point of the memory order, and each byte reads the latest write covering
-//! it at that point, so different bytes may come from different writes but
-//! no aligned write is ever seen torn. An unaligned read behaves as
-//! independent byte reads. (This mixed-size extension is ours; it is not
-//! part of the published Promising-ARM model.)
+//! per byte. An aligned read is single-copy atomic: relative to other
+//! threads it takes effect at one point of the memory order, and each byte
+//! reads the latest write by another thread covering it at that point (or a
+//! later write of the thread's own), so no aligned write is ever seen torn.
+//! An unaligned read behaves as independent byte reads. (This mixed-size
+//! extension is ours; it is not part of the published Promising-ARM model,
+//! but it agrees with Arm's axiomatic model in herd7.)
+//!
+//! Dependencies follow Arm's model: registers carry a plain view (address,
+//! data and ordinary control dependencies) and a *pick* view that also
+//! includes dependencies through conditional selects and CAS comparisons.
+//! Pick dependencies order later writes, but not later reads.
 
 use crate::core::{Core, MemOp, RV, Step, View, pair_value, rmw_result, split_pair};
-use crate::isa::{Barrier, Instr, LoadKind, Size};
+use crate::isa::{Barrier, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
@@ -50,11 +56,18 @@ impl Msg {
     }
 }
 
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Fwd {
     ts: View,
+    /// Address and data dependencies of the write.
     view: View,
-    xcl: bool,
+    /// The same, including pick dependencies.
+    pick: View,
+    /// For the write of an exclusive pair or atomic: the view of its read.
+    /// An acquire read of this write is ordered after that read (Arm's
+    /// `[M]; rmw; lrs; [A|Q]`), though not after the write itself.
+    xview: View,
 }
 
 /// Exclusive monitor set by a load-exclusive.
@@ -64,18 +77,31 @@ struct Monitor {
     size: Size,
     /// Timestamp each byte was read from.
     srcs: Vec<View>,
+    /// The view of the read.
+    view: View,
 }
 
 /// State of one thread under the Promising-ARM model.
+///
+/// Views ending in `_p` include pick dependencies. Following Arm's model,
+/// pick dependencies order later writes (and anything after an ISB) but not
+/// later reads, so the views constraining reads (`v_rnew`) exclude them and
+/// those constraining writes (`v_wnew`, `v_cap`) include them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TState {
     core: Core,
-    /// Views: reads/writes so far (old), lower bounds for future reads/writes (new).
+    /// Reads so far (excluding NoRet atomics' reads).
     v_rold: View,
+    v_rold_p: View,
+    /// Reads of NoRet atomics so far (ordered by DMB SY but not DMB LD).
+    v_rnoret: View,
+    v_rnoret_p: View,
+    /// Writes so far.
     v_wold: View,
+    /// Lower bounds for future reads / writes.
     v_rnew: View,
     v_wnew: View,
-    /// Control and address dependencies of everything so far.
+    /// Control and address dependencies of everything so far (with picks).
     v_cap: View,
     /// Latest release write (orders later LDAR, which is RCsc).
     v_rel: View,
@@ -93,6 +119,9 @@ impl TState {
         TState {
             core: Core::new(regs),
             v_rold: 0,
+            v_rold_p: 0,
+            v_rnoret: 0,
+            v_rnoret_p: 0,
             v_wold: 0,
             v_rnew: 0,
             v_wnew: 0,
@@ -125,12 +154,40 @@ enum Mode {
     Final,
 }
 
+/// How a read orders later accesses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ReadKind {
+    load: LoadKind,
+    /// A NoRet atomic's read (its value is discarded).
+    noret: bool,
+}
+
+impl ReadKind {
+    fn plain() -> ReadKind {
+        ReadKind { load: LoadKind::Plain, noret: false }
+    }
+    fn of(load: LoadKind) -> ReadKind {
+        ReadKind { load, noret: false }
+    }
+}
+
+/// How a write is ordered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct WriteKind {
+    release: bool,
+    /// For the write of an exclusive pair or atomic: the view of its read.
+    xview: View,
+    /// The write of an acquire+release atomic, which orders everything after it.
+    full: bool,
+}
+
 /// Outcome of one way of performing a read.
 struct ReadResult {
     state: TState,
     val: u128,
     srcs: Vec<View>,
-    vpost: View,
+    /// Dependency views of the value read.
+    dep: RV,
 }
 
 /// A candidate write to promise: (address, size, value).
@@ -177,6 +234,11 @@ fn pieces(a: u64, n: u64, granule: u64, lse2: bool) -> Vec<(u64, u64)> {
 /// A successor state, with any messages newly appended to memory.
 type Succ = (TState, Vec<Msg>);
 
+/// The dependency views of a register value read from memory.
+fn dep(view: View, pick: View) -> RV {
+    RV { val: 0, view, pick: pick.max(view) }
+}
+
 impl<'a> Solo<'a> {
     fn new(test: &'a Test, cfg: &Options, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
         Solo {
@@ -209,29 +271,82 @@ impl<'a> Solo<'a> {
         if t == 0 { self.test.init_byte(b) } else { self.msg(ext, t).byte(b) }
     }
 
-    /// The latest write covering byte `b` at or before timestamp `t`.
-    fn latest(&self, ext: &[Msg], b: u64, t: View) -> View {
-        (1..=t).rev().find(|&u| self.msg(ext, u).covers(b)).unwrap_or(0)
+    /// Is message `t` (0 = initial memory) written by another thread?
+    fn external(&self, ext: &[Msg], t: View) -> bool {
+        t == 0 || self.msg(ext, t).tid != self.tid
+    }
+
+    /// Timestamps byte `b` may be read from, given the lower bound `bound`:
+    /// the last write covering `b` at or before `bound`, or any later one.
+    fn byte_choices(&self, ext: &[Msg], b: u64, bound: View) -> Vec<View> {
+        let n = self.len(ext);
+        let last = (1..=bound.min(n)).rev().find(|&t| self.msg(ext, t).covers(b)).unwrap_or(0);
+        let mut out = vec![last];
+        out.extend((bound + 1..=n).filter(|&t| self.msg(ext, t).covers(b)));
+        out
+    }
+
+    /// The first external write covering `b` after timestamp `t`.
+    fn next_external(&self, ext: &[Msg], b: u64, t: View) -> Option<View> {
+        (t + 1..=self.len(ext)).find(|&u| self.external(ext, u) && self.msg(ext, u).covers(b))
+    }
+
+    /// The latest external write (or 0 for initial memory) covering `b` at
+    /// or before `t`.
+    fn latest_external(&self, ext: &[Msg], b: u64, t: View) -> View {
+        (1..=t).rev().find(|&u| self.external(ext, u) && self.msg(ext, u).covers(b)).unwrap_or(0)
     }
 
     /// Possible per-byte sources for a single-copy-atomic read of bytes
-    /// `a..a+n`. The read takes effect at one point `T` in the memory order
-    /// (at or after `bound`), and every byte reads the latest write covering
-    /// it at or before `T`. Only values of `T` where a covering write occurs
-    /// give distinct results.
-    fn atomic_read_choices(&self, ext: &[Msg], a: u64, n: u64, bound: View) -> Vec<Vec<View>> {
-        let len = self.len(ext);
-        let bound = bound.min(len);
-        let mut points = vec![bound];
-        points.extend((bound + 1..=len).filter(|&t| {
+    /// `p..p+len`, each byte being allowed the sources in `cands`.
+    ///
+    /// Relative to other threads the read takes effect at one point `T` of
+    /// the memory order: a byte read from an external write (or initial
+    /// memory) reads the latest external write covering it at `T`, and a
+    /// byte read from one of the thread's own writes must not have been
+    /// overwritten externally by `T`. (Own writes impose no such
+    /// constraint: in Arm's model, reading from them does not order the read.)
+    fn atomic_choices(&self, ext: &[Msg], p: u64, len: u64, cands: &[Vec<View>]) -> Vec<Vec<View>> {
+        if len == 1 {
+            return cands[0].iter().map(|&t| vec![t]).collect();
+        }
+        let mut points = vec![0];
+        points.extend((1..=self.len(ext)).filter(|&t| {
             let m = self.msg(ext, t);
-            m.addr < a + n && a < m.addr + m.size.bytes()
+            self.external(ext, t) && m.addr < p + len && p < m.addr + m.size.bytes()
         }));
         let mut out: Vec<Vec<View>> = Vec::new();
-        for t in points {
-            let srcs: Vec<View> = (a..a + n).map(|b| self.latest(ext, b, t)).collect();
-            if !out.contains(&srcs) {
-                out.push(srcs);
+        for big_t in points {
+            let mut combos: Vec<Vec<View>> = vec![Vec::new()];
+            for (i, c) in cands.iter().enumerate() {
+                let b = p + i as u64;
+                let le = self.latest_external(ext, b, big_t);
+                let opts: Vec<View> = c
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        if self.external(ext, t) {
+                            t == le
+                        } else {
+                            self.next_external(ext, b, t).is_none_or(|u| u > big_t)
+                        }
+                    })
+                    .collect();
+                combos = combos
+                    .iter()
+                    .flat_map(|c| {
+                        opts.iter().map(move |&t| {
+                            let mut c2 = c.clone();
+                            c2.push(t);
+                            c2
+                        })
+                    })
+                    .collect();
+            }
+            for c in combos {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
             }
         }
         out
@@ -240,18 +355,28 @@ impl<'a> Solo<'a> {
     /// Perform a read of `size` bytes at `addr.val`; one result per allowed
     /// choice of source writes. The read consists of single-copy-atomic
     /// pieces of `granule` bytes (or single bytes, where a piece is not
-    /// aligned), each of which takes effect at its own point.
-    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: LoadKind, size: Size, granule: u64) -> Vec<ReadResult> {
+    /// aligned).
+    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: ReadKind, size: Size, granule: u64) -> Vec<ReadResult> {
         let a = addr.val;
         let n = size.bytes();
+        let acquire = kind.load != LoadKind::Plain;
         let mut vpre = addr.view.max(st.v_rnew);
-        if kind == LoadKind::Acquire {
+        if kind.load == LoadKind::Acquire {
             vpre = vpre.max(st.v_rel);
         }
         let mut combos: Vec<Vec<View>> = vec![Vec::new()];
         for (p, len) in pieces(a, n, granule, self.lse2) {
-            let bound = (p..p + len).map(|b| st.coh(b)).fold(vpre, View::max);
-            let choices = self.atomic_read_choices(ext, p, len, bound);
+            // Reading one of our own unfulfilled promises makes it
+            // unfulfillable (coherence would then require it to be later
+            // than itself), so those are never candidates.
+            let cands: Vec<Vec<View>> = (p..p + len)
+                .map(|b| {
+                    let mut c = self.byte_choices(ext, b, vpre.max(st.coh(b)));
+                    c.retain(|t| !st.promises.contains(t));
+                    c
+                })
+                .collect();
+            let choices = self.atomic_choices(ext, p, len, &cands);
             combos = combos
                 .iter()
                 .flat_map(|c| {
@@ -265,33 +390,44 @@ impl<'a> Solo<'a> {
         }
 
         let mut out = Vec::new();
-        // Reading one of our own unfulfilled promises makes it unfulfillable
-        // (coherence would then require it to be later than itself).
-        for srcs in combos.into_iter().filter(|c| !c.iter().any(|t| st.promises.contains(t))) {
+        for srcs in combos {
             let mut val = 0u128;
             let mut rview = 0;
+            let mut rpick = 0;
             for (i, &t) in srcs.iter().enumerate().rev() {
                 let b = a + i as u64;
                 val = (val << 8) | self.byte_value(ext, b, t) as u128;
-                let v = match st.fwd.get(&b) {
-                    Some(f) if f.ts == t && !(f.xcl && kind == LoadKind::Acquire) => f.view,
-                    _ => t,
-                };
-                rview = rview.max(v);
+                match st.fwd.get(&b) {
+                    Some(f) if f.ts == t => {
+                        rview = rview.max(f.view);
+                        if acquire {
+                            rview = rview.max(f.xview);
+                        }
+                        rpick = rpick.max(f.pick);
+                    }
+                    _ => rview = rview.max(t),
+                }
             }
             let vpost = vpre.max(rview);
+            let ppost = vpost.max(rpick).max(addr.pick);
             let mut s = st.clone();
             for i in 0..n {
                 let b = a + i;
                 s.coh.insert(b, st.coh(b).max(vpost));
             }
-            s.v_rold = s.v_rold.max(vpost);
-            if kind != LoadKind::Plain {
-                s.v_rnew = s.v_rnew.max(vpost);
-                s.v_wnew = s.v_wnew.max(vpost);
+            if kind.noret {
+                s.v_rnoret = s.v_rnoret.max(vpost);
+                s.v_rnoret_p = s.v_rnoret_p.max(ppost);
+            } else {
+                s.v_rold = s.v_rold.max(vpost);
+                s.v_rold_p = s.v_rold_p.max(ppost);
             }
-            s.v_cap = s.v_cap.max(addr.view);
-            out.push(ReadResult { state: s, val, srcs, vpost });
+            if acquire {
+                s.v_rnew = s.v_rnew.max(vpost);
+                s.v_wnew = s.v_wnew.max(ppost);
+            }
+            s.v_cap = s.v_cap.max(addr.pick);
+            out.push(ReadResult { state: s, val, srcs, dep: dep(vpost, ppost) });
         }
         out
     }
@@ -308,9 +444,10 @@ impl<'a> Solo<'a> {
         })
     }
 
-    /// Perform a write of `val` (`size` bytes) to `addr.val`. `atomic`
-    /// imposes an atomicity constraint relative to an earlier read
-    /// (per-byte sources, and whether only other threads' writes count).
+    /// Perform a write of `val` (`size` bytes) to `addr.val`, whose data has
+    /// dependencies `data`. `atomic` imposes an atomicity constraint relative
+    /// to an earlier read (per-byte sources, and whether only other threads'
+    /// writes count).
     #[allow(clippy::too_many_arguments)]
     fn do_write(
         &mut self,
@@ -319,29 +456,37 @@ impl<'a> Solo<'a> {
         addr: RV,
         size: Size,
         val: u128,
-        data_view: View,
-        release: bool,
-        xcl: bool,
+        data: RV,
+        kind: WriteKind,
         atomic: Option<(&[View], bool)>,
     ) -> Vec<Succ> {
         let a = addr.val;
         let n = size.bytes();
         let new_msg = Msg { addr: a, size, val, tid: self.tid };
-        let mut vpre = addr.view.max(data_view).max(st.v_wnew).max(st.v_cap);
-        if release {
-            vpre = vpre.max(st.v_rold).max(st.v_wold);
+        let mut vpre = addr.pick.max(data.pick).max(st.v_wnew).max(st.v_cap);
+        if kind.release {
+            vpre = vpre.max(st.v_rold_p).max(st.v_rnoret_p).max(st.v_wold);
         }
         let apply = |t: View| {
             let mut s = st.clone();
-            let fwd = Fwd { ts: t, view: addr.view.max(data_view), xcl };
+            let fwd = Fwd {
+                ts: t,
+                view: addr.view.max(data.view),
+                pick: addr.pick.max(data.pick),
+                xview: kind.xview,
+            };
             for b in a..a + n {
                 s.coh.insert(b, t);
                 s.fwd.insert(b, fwd);
             }
             s.v_wold = s.v_wold.max(t);
-            s.v_cap = s.v_cap.max(addr.view);
-            if release {
+            s.v_cap = s.v_cap.max(addr.pick);
+            if kind.release {
                 s.v_rel = s.v_rel.max(t);
+            }
+            if kind.full {
+                s.v_rnew = s.v_rnew.max(t);
+                s.v_wnew = s.v_wnew.max(t);
             }
             s.promises.remove(&t);
             s
@@ -383,19 +528,20 @@ impl<'a> Solo<'a> {
         addr: RV,
         size: Size,
         val: u128,
-        data_view: View,
+        data: RV,
         release: bool,
     ) -> Vec<Succ> {
         let a = addr.val;
+        let kind = WriteKind { release, ..WriteKind::default() };
         let mut states: Vec<Succ> = vec![(st.clone(), ext.to_vec())];
         for (p, len) in pieces(a, size.bytes(), size.bytes(), self.lse2) {
             let psize = Size::from_bytes(len).expect("piece size");
             let shifted = val >> (8 * (p - a));
             let pval = if len >= 16 { shifted } else { shifted & ((1u128 << (8 * len)) - 1) };
-            let paddr = RV { val: p, view: addr.view };
+            let paddr = RV { val: p, ..addr };
             let mut next = Vec::new();
             for (s, e) in states {
-                next.extend(self.do_write(&s, &e, paddr, psize, pval, data_view, release, false, None));
+                next.extend(self.do_write(&s, &e, paddr, psize, pval, data, kind, None));
             }
             states = next;
         }
@@ -425,32 +571,31 @@ impl<'a> Solo<'a> {
     fn mem_successors(&mut self, st: TState, ext: &[Msg], op: MemOp) -> Vec<Succ> {
         let prog = self.prog;
         let mut out = Vec::new();
+        let status = |ok: bool| RV::imm(if ok { 0 } else { 1 });
         match op {
             MemOp::Barrier(b) => {
                 let mut s = st;
-                let (rold, wold) = (s.v_rold, s.v_wold);
                 match b {
                     Barrier::Full => {
-                        let v = rold.max(wold);
-                        s.v_rnew = s.v_rnew.max(v);
-                        s.v_wnew = s.v_wnew.max(v);
+                        s.v_rnew = s.v_rnew.max(s.v_rold).max(s.v_rnoret).max(s.v_wold);
+                        s.v_wnew = s.v_wnew.max(s.v_rold_p).max(s.v_rnoret_p).max(s.v_wold);
                     }
                     Barrier::Ld => {
-                        s.v_rnew = s.v_rnew.max(rold);
-                        s.v_wnew = s.v_wnew.max(rold);
+                        s.v_rnew = s.v_rnew.max(s.v_rold);
+                        s.v_wnew = s.v_wnew.max(s.v_rold_p);
                     }
-                    Barrier::St => s.v_wnew = s.v_wnew.max(wold),
+                    Barrier::St => s.v_wnew = s.v_wnew.max(s.v_wold),
                     Barrier::Isb => s.v_rnew = s.v_rnew.max(s.v_cap),
                 }
                 s.core.retire(prog);
                 out.push((s, ext.to_vec()));
             }
             MemOp::Load { addr, rt, size, signed, kind, excl } => {
-                for r in self.do_read(&st, ext, addr, kind, size, size.bytes()) {
+                for r in self.do_read(&st, ext, addr, ReadKind::of(kind), size, size.bytes()) {
                     let mut s = r.state;
-                    s.core.set(rt, RV { val: size.extend(r.val as u64, signed), view: r.vpost });
+                    s.core.set(rt, RV { val: size.extend(r.val as u64, signed), ..r.dep });
                     if excl {
-                        s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs });
+                        s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs, view: r.dep.view });
                     }
                     s.core.retire(prog);
                     out.push((s, ext.to_vec()));
@@ -460,15 +605,15 @@ impl<'a> Solo<'a> {
                 // A W pair is one 8-byte single-copy-atomic read; an X pair
                 // is atomic only per 8-byte half (a successful STXP is what
                 // guarantees the two halves were consistent).
-                let kind = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
+                let kind = ReadKind::of(if acquire { LoadKind::Acquire } else { LoadKind::Plain });
                 let total = size.double();
                 let granule = total.bytes().min(8);
                 for r in self.do_read(&st, ext, addr, kind, total, granule) {
                     let mut s = r.state;
                     let (lo, hi) = split_pair(r.val, size);
-                    s.core.set(rt, RV { val: lo, view: r.vpost });
-                    s.core.set(rt2, RV { val: hi, view: r.vpost });
-                    s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs });
+                    s.core.set(rt, RV { val: lo, ..r.dep });
+                    s.core.set(rt2, RV { val: hi, ..r.dep });
+                    s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs, view: r.dep.view });
                     s.core.retire(prog);
                     out.push((s, ext.to_vec()));
                 }
@@ -477,19 +622,18 @@ impl<'a> Solo<'a> {
                 let total = size.double();
                 let mut f = st.clone();
                 f.xcl = None;
-                f.core.set(rs, RV { val: 1, view: 0 });
+                f.core.set(rs, status(false));
                 f.core.retire(prog);
                 out.push((f, ext.to_vec()));
                 if let Some(m) = &st.xcl {
                     if m.addr == addr.val && m.size == total {
                         let srcs = m.srcs.clone();
                         let val = pair_value(data.val, data2.val, size);
-                        let dview = data.view.max(data2.view);
-                        for (mut s, e) in
-                            self.do_write(&st, ext, addr, total, val, dview, release, true, Some((&srcs[..], true)))
-                        {
+                        let kind = WriteKind { release, xview: m.view, full: false };
+                        let data = RV::joined(0, data, data2);
+                        for (mut s, e) in self.do_write(&st, ext, addr, total, val, data, kind, Some((&srcs[..], true))) {
                             s.xcl = None;
-                            s.core.set(rs, RV { val: 0, view: 0 });
+                            s.core.set(rs, status(true));
                             s.core.retire(prog);
                             out.push((s, e));
                         }
@@ -500,22 +644,22 @@ impl<'a> Solo<'a> {
                 let total = size.double();
                 if self.lse2 && addr.val % total.bytes() == 0 {
                     // FEAT_LSE2: an aligned pair is one single-copy-atomic read.
-                    for r in self.do_read(&st, ext, addr, LoadKind::Plain, total, total.bytes()) {
+                    for r in self.do_read(&st, ext, addr, ReadKind::plain(), total, total.bytes()) {
                         let mut s = r.state;
                         let (lo, hi) = split_pair(r.val, size);
-                        s.core.set(rt, RV { val: size.extend(lo, signed), view: r.vpost });
-                        s.core.set(rt2, RV { val: size.extend(hi, signed), view: r.vpost });
+                        s.core.set(rt, RV { val: size.extend(lo, signed), ..r.dep });
+                        s.core.set(rt2, RV { val: size.extend(hi, signed), ..r.dep });
                         s.core.retire(prog);
                         out.push((s, ext.to_vec()));
                     }
                 } else {
                     // Two independent reads: the second does not depend on the first.
-                    let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
-                    for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size, size.bytes()) {
-                        for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size, size.bytes()) {
+                    let addr2 = RV { val: addr.val + size.bytes(), ..addr };
+                    for r1 in self.do_read(&st, ext, addr, ReadKind::plain(), size, size.bytes()) {
+                        for r2 in self.do_read(&r1.state, ext, addr2, ReadKind::plain(), size, size.bytes()) {
                             let mut s = r2.state;
-                            s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), view: r1.vpost });
-                            s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), view: r2.vpost });
+                            s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), ..r1.dep });
+                            s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), ..r2.dep });
                             s.core.retire(prog);
                             out.push((s, ext.to_vec()));
                         }
@@ -523,7 +667,7 @@ impl<'a> Solo<'a> {
                 }
             }
             MemOp::Store { addr, data, size, release } => {
-                for (mut s, e) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release) {
+                for (mut s, e) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data, release) {
                     s.core.retire(prog);
                     out.push((s, e));
                 }
@@ -533,12 +677,12 @@ impl<'a> Solo<'a> {
                 let states = if self.lse2 && addr.val % total.bytes() == 0 {
                     // FEAT_LSE2: an aligned pair is one single-copy-atomic write.
                     let val = pair_value(data.val, data2.val, size);
-                    self.do_store(&st, ext, addr, total, val, data.view.max(data2.view), false)
+                    self.do_store(&st, ext, addr, total, val, RV::joined(0, data, data2), false)
                 } else {
-                    let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
+                    let addr2 = RV { val: addr.val + size.bytes(), ..addr };
                     let mut states = Vec::new();
-                    for (s1, e1) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data.view, false) {
-                        states.extend(self.do_store(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2.view, false));
+                    for (s1, e1) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data, false) {
+                        states.extend(self.do_store(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2, false));
                     }
                     states
                 };
@@ -548,32 +692,32 @@ impl<'a> Solo<'a> {
                 }
             }
             MemOp::StoreExcl { addr, data, rs, size, release } => {
-                // Failure is always possible (and certain without a matching monitor).
+                // Failure is always possible (and certain without a matching
+                // monitor). The status register carries no dependency.
                 let mut f = st.clone();
                 f.xcl = None;
-                f.core.set(rs, RV { val: 1, view: 0 });
+                f.core.set(rs, status(false));
                 f.core.retire(prog);
                 out.push((f, ext.to_vec()));
                 if let Some(m) = &st.xcl {
                     if m.addr == addr.val && m.size == size {
                         let srcs = m.srcs.clone();
-                        let atomic = Some((&srcs[..], true));
-                        for (mut s, e) in
-                            self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release, true, atomic)
-                        {
+                        let kind = WriteKind { release, xview: m.view, full: false };
+                        let val = size.mask(data.val) as u128;
+                        for (mut s, e) in self.do_write(&st, ext, addr, size, val, data, kind, Some((&srcs[..], true))) {
                             s.xcl = None;
-                            s.core.set(rs, RV { val: 0, view: 0 });
+                            s.core.set(rs, status(true));
                             s.core.retire(prog);
                             out.push((s, e));
                         }
                     }
                 }
             }
-            MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release } => {
-                let kind = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
-                for r in self.do_read(&st, ext, addr, kind, size, size.bytes()) {
+            MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release, noret } => {
+                let load = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
+                for r in self.do_read(&st, ext, addr, ReadKind { load, noret }, size, size.bytes()) {
                     let old = r.val as u64;
-                    let reg = RV { val: old, view: r.vpost };
+                    let reg = RV { val: old, ..r.dep };
                     match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
                         None => {
                             let mut s = r.state;
@@ -582,12 +726,34 @@ impl<'a> Solo<'a> {
                             out.push((s, ext.to_vec()));
                         }
                         Some(new) => {
-                            let dview = r.vpost.max(operand.view).max(cmp.map_or(0, |c| c.view));
+                            // CAS and SWP store a register; whether CAS stores
+                            // at all depends on the comparison (a pick
+                            // dependency). Other atomics compute from the old value.
+                            let data = match (cmp, op) {
+                                (Some(c), _) => {
+                                    RV { pick: operand.pick.max(c.pick).max(r.dep.pick), ..operand }
+                                }
+                                (None, RmwOp::Swp) => operand,
+                                (None, _) => RV::joined(0, operand, r.dep),
+                            };
+                            // A successful CAS leaves Rs holding the value it
+                            // already had. Like herd7, allow that value to come
+                            // either from the memory read or from the old Rs
+                            // (then depending on the read only through the
+                            // comparison: a pick dependency).
+                            let mut outs = vec![reg];
+                            if let Some(c) = cmp {
+                                outs.push(RV { val: old, view: c.view, pick: c.pick.max(r.dep.pick) });
+                            }
+                            let kind = WriteKind { release, xview: r.dep.view, full: acquire && release };
                             let atomic = Some((&r.srcs[..], false));
-                            for (mut s, e) in self.do_write(&r.state, ext, addr, size, new as u128, dview, release, false, atomic) {
-                                s.core.set(rt, reg);
-                                s.core.retire(prog);
-                                out.push((s, e));
+                            for (s, e) in self.do_write(&r.state, ext, addr, size, new as u128, data, kind, atomic) {
+                                for &o in &outs {
+                                    let mut s = s.clone();
+                                    s.core.set(rt, o);
+                                    s.core.retire(prog);
+                                    out.push((s, e.clone()));
+                                }
                             }
                         }
                     }

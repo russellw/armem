@@ -2,6 +2,6 @@ AArch64 SCA-H
 "An aligned halfword write is never seen torn by an aligned halfword read"
 { uint16_t x; 0:X1=x; 1:X1=x; }
  P0            | P1           ;
- MOV W0,#0x101 | LDRH W0,[X1] ;
+ MOV W0,#257 | LDRH W0,[X1] ;
  STRH W0,[X1]  |              ;
 exists (1:X0=1 \/ 1:X0=256)

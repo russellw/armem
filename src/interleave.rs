@@ -143,7 +143,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                     MemOp::Load { addr, rt, size, signed, excl, .. } => {
                         let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
                         let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: v, view: 0 });
+                        t.core.set(rt, RV { val: v, pick: 0, view: 0 });
                         if excl {
                             t.mon = Some((addr.val, size));
                         }
@@ -154,8 +154,8 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         let total = size.double();
                         let (lo, hi) = split_pair(n.read(tid, addr.val, total, test), size);
                         let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: lo, view: 0 });
-                        t.core.set(rt2, RV { val: hi, view: 0 });
+                        t.core.set(rt, RV { val: lo, pick: 0, view: 0 });
+                        t.core.set(rt2, RV { val: hi, pick: 0, view: 0 });
                         t.mon = Some((addr.val, total));
                         t.core.retire(prog);
                         true
@@ -171,7 +171,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                             }
                             let t = &mut n.threads[tid];
                             t.mon = None;
-                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, view: 0 });
+                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
                             t.core.retire(prog);
                             true
                         }
@@ -181,8 +181,8 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         let v1 = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
                         let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test) as u64, signed);
                         let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: v1, view: 0 });
-                        t.core.set(rt2, RV { val: v2, view: 0 });
+                        t.core.set(rt, RV { val: v1, pick: 0, view: 0 });
+                        t.core.set(rt2, RV { val: v2, pick: 0, view: 0 });
                         t.core.retire(prog);
                         true
                     }
@@ -207,7 +207,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                             }
                             let t = &mut n.threads[tid];
                             t.mon = None;
-                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, view: 0 });
+                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
                             t.core.retire(prog);
                             true
                         }
@@ -221,7 +221,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                                 n.commit(tid, (addr.val, size, new as u128));
                             }
                             let t = &mut n.threads[tid];
-                            t.core.set(rt, RV { val: old, view: 0 });
+                            t.core.set(rt, RV { val: old, pick: 0, view: 0 });
                             t.core.retire(prog);
                             true
                         }

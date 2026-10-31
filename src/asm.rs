@@ -89,6 +89,22 @@ fn parse_shift_amount(s: &str) -> Result<u8> {
     Ok(parse_imm(s)? as u8)
 }
 
+/// Parse an extend/shift specifier such as `SXTW`, `UXTW #2` or `LSL #3`.
+fn parse_extend(s: &str) -> Result<Extend> {
+    let u = s.trim().to_ascii_uppercase();
+    let (kind, amt) = match u.split_once(char::is_whitespace) {
+        Some((k, a)) => (k.to_string(), a.to_string()),
+        None => (u.clone(), String::new()),
+    };
+    let amt = parse_shift_amount(&amt)?;
+    Ok(match kind.as_str() {
+        "LSL" => Extend::Lsl(amt),
+        "UXTW" => Extend::Uxtw(amt),
+        "SXTW" => Extend::Sxtw(amt),
+        _ => return Err(format!("bad extend '{}'", s)),
+    })
+}
+
 fn parse_addr(s: &str) -> Result<Addr> {
     let t = s.trim();
     let (t, pre) = match t.strip_suffix('!') {
@@ -108,22 +124,7 @@ fn parse_addr(s: &str) -> Result<Addr> {
         1 => Offset::Imm(0),
         2 if parts[1].starts_with('#') => Offset::Imm(parse_imm(parts[1])? as i64),
         2 => Offset::Reg(parse_reg(parts[1])?, Extend::Lsl(0)),
-        3 => {
-            let r = parse_reg(parts[1])?;
-            let ext = parts[2].to_ascii_uppercase();
-            let (kind, amt) = match ext.split_once(char::is_whitespace) {
-                Some((k, a)) => (k.to_string(), a.to_string()),
-                None => (ext.clone(), String::new()),
-            };
-            let amt = parse_shift_amount(&amt)?;
-            let e = match kind.as_str() {
-                "LSL" => Extend::Lsl(amt),
-                "UXTW" => Extend::Uxtw(amt),
-                "SXTW" => Extend::Sxtw(amt),
-                _ => return Err(format!("bad extend in '{}'", s)),
-            };
-            Offset::Reg(r, e)
-        }
+        3 => Offset::Reg(parse_reg(parts[1])?, parse_extend(parts[2])?),
         _ => return Err(format!("bad address '{}'", s)),
     };
     if pre && !matches!(offset, Offset::Imm(_)) {
@@ -279,8 +280,12 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
     }
 
     let alu = |op: AluOp, flags: bool| -> Result<Instr> {
-        want(&ops, 3, m)?;
-        Ok(Instr::Alu { op, rd: reg(0)?, rn: reg(1)?, op2: parse_operand(&ops[2])?, flags })
+        let op2 = match ops.len() {
+            3 => parse_operand(&ops[2])?,
+            4 => Operand::RegExt(parse_reg(&ops[2])?, parse_extend(&ops[3])?),
+            _ => return Err(format!("{} expects 3 or 4 operands, got {}", m, ops.len())),
+        };
+        Ok(Instr::Alu { op, rd: reg(0)?, rn: reg(1)?, op2, flags })
     };
 
     let ins = match m {
@@ -292,6 +297,18 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
                 Instr::MovImm { rd, imm: Size::of(rd).mask(parse_imm(&ops[1])? as u64) }
             } else {
                 Instr::MovReg { rd, rn: reg(1)? }
+            }
+        }
+        "SXTW" => {
+            // Alias of SBFM; modeled as XZR | sign-extended Wn.
+            want(&ops, 2, m)?;
+            let rd = reg(0)?;
+            Instr::Alu {
+                op: AluOp::Orr,
+                rd,
+                rn: RegOp { idx: ZR, wide: true },
+                op2: Operand::RegExt(reg(1)?, Extend::Sxtw(0)),
+                flags: false,
             }
         }
         "ADD" => alu(AluOp::Add, false)?,
@@ -582,6 +599,15 @@ mod tests {
         assert_eq!((addr.offset, addr.writeback), (Offset::Imm(8), Writeback::Pre));
         let Instr::StorePair { addr, .. } = p("STP X0,X1,[X2],#-16").unwrap() else { panic!() };
         assert_eq!(addr.writeback, Writeback::Post(-16));
+    }
+
+    #[test]
+    fn extended_register_operands() {
+        let Instr::Alu { op2, .. } = p("ADD X7,X6,W4,SXTW").unwrap() else { panic!() };
+        assert!(matches!(op2, Operand::RegExt(_, Extend::Sxtw(0))));
+        let Instr::Alu { op, rn, op2, .. } = p("SXTW X11,W6").unwrap() else { panic!() };
+        assert_eq!((op, rn.idx), (AluOp::Orr, ZR));
+        assert!(matches!(op2, Operand::RegExt(_, Extend::Sxtw(0))));
     }
 
     #[test]

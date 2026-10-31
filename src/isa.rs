@@ -115,6 +115,8 @@ pub struct Addr {
 pub enum Operand {
     Reg(RegOp),
     Imm(u64),
+    /// Extended or shifted register, e.g. `W4, SXTW` or `X2, LSL #3`.
+    RegExt(RegOp, Extend),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

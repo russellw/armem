@@ -1,6 +1,6 @@
 AArch64 LDP-X-torn
 "An X-register LDP/STP pair is only 128-bit atomic with FEAT_LSE2"
-{ 0:X1=x; 1:X1=x; }
+{ uint64_t x[2]; 0:X1=x; 1:X1=x; }
  P0              | P1              ;
  MOV X0,#1       | LDP X2,X3,[X1]  ;
  STP X0,X0,[X1]  |                 ;

@@ -68,3 +68,7 @@ unaligned-cross-block  yes  no
 unaligned-cross-block  yes  no   lse2
 MP+dmb.sy+ldp          no   no   lse2
 MP+stp+dmb.sy          no   no   lse2
+MP+dmb.sy+csel-addr    yes  no
+LB+csel-datas          no   no
+MP+rel+ldaddnoret-dmb.ld yes no
+MP+rel+cas-addr        yes  no

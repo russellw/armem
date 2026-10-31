@@ -66,8 +66,10 @@ exists (1:X2=0)
   unless given. The optional C type (`uint8_t`, `int16_t`, `int`,
   `uint32_t`, `int64_t`, `uint64_t`, pointers, ...) sets the size and
   signedness used to read the location's final value. The default is a
-  signed 64-bit integer. Values may be written `sym+offset`, and
-  conditions may refer to `[sym+offset]`.
+  signed 64-bit integer. Arrays are declared as `uint64_t x[2]` and their
+  elements named `x[i]` in conditions. Values may be written
+  `sym+offset`, and conditions may also refer to `[sym+offset]` (armem
+  only; herd7 does not accept this form).
 * Final section: optional `locations [...]`, then `exists`, `~exists` or
   `forall` with `/\`, `\/`, `~` and parentheses.
 * The reported state contains the registers and locations named in the
@@ -77,8 +79,9 @@ exists (1:X2=0)
 ### Supported instructions
 
 `MOV/MOVZ`, `ADD(S)`, `SUB(S)`, `AND(S)`, `ORR`, `EOR`, `LSL`, `LSR`, `ASR`,
-`MUL`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`, `CSET`, `B`, `B.cond`,
-`CBZ/CBNZ`, `NOP`, and these memory accesses:
+`MUL`, `SXTW`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`, `CSET`, `B`,
+`B.cond`, `CBZ/CBNZ`, `NOP`, and these memory accesses (ALU instructions
+also accept an extended register operand, as in `ADD X7,X6,W4,SXTW`):
 
 * loads/stores: `LDR`, `STR`, `LDUR`, `STUR`, with byte/halfword forms
   (`LDRB`, `LDRH`, `STRB`, `STRH`) and sign-extending forms (`LDRSB`,
@@ -99,14 +102,29 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
 ## How it works
 
 * **ARM model** (`src/promising.rs`): the operational *Promising-ARM* model
-  (Pulte et al., PLDI 2019), which is proven equivalent to the official
-  ARMv8 axiomatic model. Memory is a list of write messages. Each thread
-  keeps *views* (timestamps) that limit which messages a read can still
-  return. Register values carry views, so address, data and control
+  (Pulte et al., PLDI 2019), which was proven equivalent to the ARMv8
+  axiomatic model of the time. Memory is a list of write messages. Each
+  thread keeps *views* (timestamps) that limit which messages a read can
+  still return. Register values carry views, so address, data and control
   dependencies are tracked exactly, false dependencies included (e.g.
   `EOR W4,W0,W0`), as the architecture requires. Out-of-order writes are
   *promises*. A thread may only make a promise if it can certify it,
   i.e. show that running alone it can fulfill it later.
+
+  Arm's current model (`aarch64.cat` in herdtools7) has rules added since
+  that paper, and armem follows them:
+  * *Pick* dependencies (through `CSEL`'s condition flags or a `CAS`
+    comparison) order later writes but not later reads. Registers carry
+    a second view for these.
+  * A *NoRet* atomic (one whose result register is `XZR`/`WZR`) is not
+    ordered by `DMB LD`, and has no acquire semantics.
+  * The write of an acquire+release atomic (`SWPAL`, `CASAL`, ...)
+    orders all later accesses.
+  * An acquire read of the thread's own exclusive or atomic write is
+    ordered after that atomic's *read*, not after its write.
+  * A successful `CAS` may take the result register's dependencies
+    either from the memory read or from the old register value. herd7
+    explores both alternatives, and so does armem.
   Exploration is *promise-first*:
   1. enumerate every sequence of certified promises (memory states);
   2. for each one, run every thread alone to completion, fulfilling
@@ -135,9 +153,10 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   non-exclusive access that stays within an aligned 16-byte block is
   single-copy atomic even if unaligned. Running a test with and without
   `--lse2` shows whether code relies on LSE2 atomicity.
-  This mixed-size and LSE2 modeling is our own extension. The published
-  Promising-ARM model covers only same-size accesses, so this part has
-  not been checked against the axiomatic model.
+  This mixed-size and LSE2 modeling is our own extension of
+  Promising-ARM. The aligned mixed-size cases are checked against herd7's
+  `-variant mixed` (see below). herd7 rejects unaligned accesses and has
+  no LSE2 option, so those parts are checked only by our own tests.
 * **Reference models** (`src/interleave.rs`): SC and x86-TSO. These
   enumerate interleavings, with FIFO store buffers for TSO. A full `DMB`
   acts like `MFENCE`, and atomics act as locked operations. They run the
@@ -148,15 +167,54 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 61 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 65 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
-exclusive pairs, and FEAT_LSE2 atomicity. Their expected ARMv8/TSO
-verdicts are in `litmus/expected.txt` (one line per test and option set;
-an optional `lse2` column runs the test with `--lse2`), and `cargo test`
-checks them. The tests also check that every SC outcome is reachable under TSO and
+exclusive pairs, FEAT_LSE2 atomicity, and the pick, NoRet and CAS
+dependency rules. Their expected ARMv8/TSO verdicts are in
+`litmus/expected.txt` (one line per test and option set; an optional
+`lse2` column runs the test with `--lse2`), and `cargo test` checks them.
+The tests also check that every SC outcome is reachable under TSO and
 under ARM, and that results are deterministic.
+
+## Validation against herd7
+
+Arm's official memory model is the axiomatic `aarch64.cat`, which runs in
+[herd7](https://github.com/herd/herdtools7). `scripts/compare_herd.py`
+runs a set of litmus tests through both herd7 and armem and compares the
+complete sets of final states:
+
+```
+scripts/install_herdtools.sh                 # herd7/diy7 into ~/.local/opt
+cargo build --release
+scripts/compare_herd.py -q litmus/*.litmus   # -q: only show disagreements
+scripts/gen_diy.sh /tmp/diy 2 6              # generate tests with diy7
+scripts/gen_diy.sh /tmp/diyat 2 5 atomics    # ... with atomics and CSEL
+scripts/compare_herd.py -q /tmp/diy/*.litmus
+```
+
+Tests with byte/halfword or pair accesses run in herd7 with
+`-variant mixed`. A test reports `MATCH` (same states), `MISMATCH`,
+`KNOWN-DIFF` (a deliberate, documented difference), or `SUPERSET`
+(a loop test where armem finds extra states because herd7 unrolls loops
+only a bounded number of times).
+
+Current results (herdtools7 7.58):
+
+| Test set | Tests | Result |
+|---|---|---|
+| herdtools7 catalogue (`aarch64`, `aarch64-mixed`, `aarch64-pick`, `aarch64-down-one-leg`) | 216 | 213 match; herd7 fails on 3 |
+| diy7, basic edges, 2 threads | 2949 | all match |
+| diy7, basic edges, 3 threads | 5428 | all match |
+| diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
+| diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
+| `litmus/` | 65 | 57 match, 1 known difference; herd7 times out or rejects 7 |
+
+The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
+a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when
+a matching `STXP` succeeds, and GCC and LLVM rely on that rule, so armem
+lets a lone `LDXP` be torn.
 
 ## Limitations (current)
 
@@ -164,7 +222,8 @@ under ARM, and that results are deterministic.
 * The TSO and SC reference models read both halves of an `LDP` in a
   single step. They perform an `STP` as two consecutive stores, and
   ignore `--lse2`.
-* The status register written by `STXR` carries no dependency.
+* The status register written by `STXR` carries no dependency (as in
+  Arm's model).
 * The search is exhaustive, so it suits small snippets. The number of
   promise orders grows quickly with the number of writes.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so

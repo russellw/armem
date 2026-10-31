@@ -28,19 +28,48 @@ impl fmt::Display for RegOp {
 }
 
 /// Access size in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Size {
+    B1,
+    B2,
     B4,
     B8,
 }
 
 impl Size {
-    pub fn mask(self, v: u64) -> u64 {
+    pub fn bytes(self) -> u64 {
         match self {
-            Size::B4 => v & 0xffff_ffff,
-            Size::B8 => v,
+            Size::B1 => 1,
+            Size::B2 => 2,
+            Size::B4 => 4,
+            Size::B8 => 8,
         }
     }
+    pub fn from_bytes(n: u64) -> Option<Size> {
+        Some(match n {
+            1 => Size::B1,
+            2 => Size::B2,
+            4 => Size::B4,
+            8 => Size::B8,
+            _ => return None,
+        })
+    }
+    pub fn mask(self, v: u64) -> u64 {
+        match self {
+            Size::B8 => v,
+            s => v & ((1u64 << (8 * s.bytes())) - 1),
+        }
+    }
+    /// Zero- or sign-extend a `self`-sized value to 64 bits.
+    pub fn extend(self, v: u64, signed: bool) -> u64 {
+        let v = self.mask(v);
+        if !signed || self == Size::B8 {
+            return v;
+        }
+        let shift = 64 - 8 * self.bytes();
+        (((v << shift) as i64) >> shift) as u64
+    }
+    /// Size of a register operand (W = 4 bytes, X = 8 bytes).
     pub fn of(r: RegOp) -> Size {
         if r.wide { Size::B8 } else { Size::B4 }
     }
@@ -59,11 +88,23 @@ pub enum Offset {
     Reg(RegOp, Extend),
 }
 
-/// Addressing mode `[base, offset]`.
+/// Base register writeback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Writeback {
+    /// `[Xn, off]`: no writeback.
+    None,
+    /// `[Xn, #imm]!`: access at Xn+imm, then Xn := Xn+imm.
+    Pre,
+    /// `[Xn], #imm`: access at Xn, then Xn := Xn+imm.
+    Post(i64),
+}
+
+/// Addressing mode `[base, offset]`, possibly with writeback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Addr {
     pub base: RegOp,
     pub offset: Offset,
+    pub writeback: Writeback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,16 +198,21 @@ pub enum Instr {
     BCond { cond: Cond, target: usize },
     /// CBZ / CBNZ
     Cbz { rt: RegOp, nonzero: bool, target: usize },
-    /// LDR / LDAR / LDAPR / LDXR / LDAXR
-    Load { rt: RegOp, addr: Addr, kind: LoadKind, excl: bool },
-    /// STR / STLR
-    Store { rt: RegOp, addr: Addr, release: bool },
-    /// STXR / STLXR
-    StoreExcl { rs: RegOp, rt: RegOp, addr: Addr, release: bool },
+    /// LDR{B,H,SB,SH,SW} / LDUR* / LDAR* / LDAPR* / LDXR* / LDAXR*.
+    /// `signed` sign-extends the loaded value into `rt`.
+    Load { rt: RegOp, addr: Addr, size: Size, signed: bool, kind: LoadKind, excl: bool },
+    /// STR{B,H} / STUR* / STLR*
+    Store { rt: RegOp, addr: Addr, size: Size, release: bool },
+    /// STXR* / STLXR*
+    StoreExcl { rs: RegOp, rt: RegOp, addr: Addr, size: Size, release: bool },
+    /// LDP / LDNP / LDPSW: two independent loads from consecutive addresses.
+    LoadPair { rt: RegOp, rt2: RegOp, addr: Addr, size: Size, signed: bool },
+    /// STP / STNP: two independent stores to consecutive addresses.
+    StorePair { rt: RegOp, rt2: RegOp, addr: Addr, size: Size },
     /// LDADD / SWP / ... (rs = operand, rt = destination of old value)
-    Rmw { op: RmwOp, rs: RegOp, rt: RegOp, addr: Addr, acquire: bool, release: bool },
+    Rmw { op: RmwOp, rs: RegOp, rt: RegOp, addr: Addr, size: Size, acquire: bool, release: bool },
     /// CAS rs, rt, [addr]: compare with rs, store rt, old value into rs.
-    Cas { rs: RegOp, rt: RegOp, addr: Addr, acquire: bool, release: bool },
+    Cas { rs: RegOp, rt: RegOp, addr: Addr, size: Size, acquire: bool, release: bool },
     Barrier(Barrier),
 }
 
@@ -199,10 +245,7 @@ impl Cond {
 
 impl RmwOp {
     pub fn apply(self, old: u64, operand: u64, size: Size) -> u64 {
-        let (sold, sop) = match size {
-            Size::B4 => (old as u32 as i32 as i64, operand as u32 as i32 as i64),
-            Size::B8 => (old as i64, operand as i64),
-        };
+        let (sold, sop) = (size.extend(old, true) as i64, size.extend(operand, true) as i64);
         let r = match self {
             RmwOp::Add => old.wrapping_add(operand),
             RmwOp::Clr => old & !operand,

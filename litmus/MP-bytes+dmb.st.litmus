@@ -1,0 +1,9 @@
+AArch64 MP-bytes+dmb.st
+{ uint16_t x; 0:X1=x; 1:X1=x; }
+ P0           | P1           ;
+ MOV W0,#1    | LDRH W0,[X1] ;
+ STRB W0,[X1] |              ;
+ DMB ST       |              ;
+ ADD X2,X1,#1 |              ;
+ STRB W0,[X2] |              ;
+exists (1:X0=256)

@@ -3,8 +3,8 @@
 //! simpler and faster operational concurrency model", PLDI 2019).
 //!
 //! Memory is a list of write messages; a message's timestamp is its
-//! 1-based position in the list (0 denotes the initial value of every
-//! location). Each thread keeps *views* (timestamps) that bound which
+//! 1-based position in the list (0 denotes the initial value of all of
+//! memory). Each thread keeps *views* (timestamps) that bound which
 //! messages it may still read and where its writes may be placed.
 //! Out-of-order writes are modeled by *promises*: a thread may append a
 //! write to memory early, provided it can later fulfill it (certification).
@@ -15,6 +15,15 @@
 //! fulfill exactly its promises. Every behavior of the model is reachable
 //! this way, and in phase 2 the threads cannot affect each other, so the
 //! final states are simply the product of each thread's final states.
+//!
+//! Mixed-size accesses: memory is byte-addressed. A message has a
+//! footprint (address and size), and coherence and forwarding are tracked
+//! per byte. An aligned read is single-copy atomic: it takes effect at one
+//! point of the memory order, and each byte reads the latest write covering
+//! it at that point, so different bytes may come from different writes but
+//! no aligned write is ever seen torn. An unaligned read behaves as
+//! independent byte reads. (This mixed-size extension is ours; it is not
+//! part of the published Promising-ARM model.)
 
 use crate::core::{Core, MemOp, RV, Step, View, rmw_result};
 use crate::isa::{Barrier, Instr, LoadKind, Size};
@@ -24,9 +33,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Msg {
-    pub loc: u64,
+    pub addr: u64,
+    pub size: Size,
     pub val: u64,
     pub tid: usize,
+}
+
+impl Msg {
+    fn covers(&self, b: u64) -> bool {
+        b >= self.addr && b < self.addr + self.size.bytes()
+    }
+    fn byte(&self, b: u64) -> u8 {
+        (self.val >> (8 * (b - self.addr))) as u8
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,6 +53,15 @@ struct Fwd {
     ts: View,
     view: View,
     xcl: bool,
+}
+
+/// Exclusive monitor set by a load-exclusive.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Monitor {
+    addr: u64,
+    size: Size,
+    /// Timestamp each byte was read from.
+    srcs: Vec<View>,
 }
 
 /// State of one thread under the Promising-ARM model.
@@ -49,12 +77,11 @@ struct TState {
     v_cap: View,
     /// Latest release write (orders later LDAR, which is RCsc).
     v_rel: View,
-    /// Per-location coherence view.
+    /// Per-byte coherence view.
     coh: BTreeMap<u64, View>,
-    /// Forwarding bank: latest own write per location.
+    /// Forwarding bank: latest own write per byte.
     fwd: BTreeMap<u64, Fwd>,
-    /// Exclusive monitor: (location, timestamp read, post view).
-    xcl: Option<(u64, View, View)>,
+    xcl: Option<Monitor>,
     /// Outstanding (unfulfilled) promises.
     promises: BTreeSet<View>,
 }
@@ -75,29 +102,19 @@ impl TState {
             promises: BTreeSet::new(),
         }
     }
-    /// Forget all view information (used where only values matter).
-    fn erase_views(mut self) -> TState {
-        for r in self.core.regs.iter_mut() {
-            r.view = 0;
-        }
-        self.core.flags.view = 0;
-        let pc = self.core.clone();
-        let mut fresh = TState::new([0; 31]);
-        fresh.core = pc;
-        fresh.xcl = self.xcl.map(|(l, _, _)| (l, 0, 0));
-        fresh.promises = std::mem::take(&mut self.promises);
-        fresh
-    }
 
-    fn coh(&self, loc: u64) -> View {
-        self.coh.get(&loc).copied().unwrap_or(0)
+    fn coh(&self, b: u64) -> View {
+        self.coh.get(&b).copied().unwrap_or(0)
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
-    /// Over-approximate the writes the thread might promise: reads may see
-    /// any value written to the location, every write is a new message.
+    /// Find the writes the thread might promise: explore like `Certify`
+    /// (without stopping) and record every newly appended write. Up to the
+    /// point where a promisable write executes, this exploration is at least
+    /// as permissive as any run certifying that promise, so no candidate is
+    /// missed.
     Collect,
     /// Search for a run that fulfills all outstanding promises; new writes
     /// may be appended to (a local copy of) memory.
@@ -106,17 +123,28 @@ enum Mode {
     Final,
 }
 
+/// Outcome of one way of performing a read.
+struct ReadResult {
+    state: TState,
+    val: u64,
+    srcs: Vec<View>,
+    vpost: View,
+}
+
+/// A candidate write to promise: (address, size, value).
+type Candidate = (u64, Size, u64);
+
 /// Exhaustive exploration of one thread running alone against a memory.
 struct Solo<'a> {
+    test: &'a Test,
     prog: &'a [Instr],
     tid: usize,
-    init: &'a BTreeMap<u64, u64>,
     base: Vec<Msg>,
     fuel: u32,
     mode: Mode,
     /// Visited states (with the step counter zeroed) -> fewest steps seen.
     visited: HashMap<(TState, Vec<Msg>), u32>,
-    candidates: BTreeSet<(u64, u64)>,
+    candidates: BTreeSet<Candidate>,
     finals: BTreeSet<Vec<u64>>,
     final_regs: &'a [u8],
     certified: bool,
@@ -129,9 +157,9 @@ type Succ = (TState, Vec<Msg>);
 impl<'a> Solo<'a> {
     fn new(test: &'a Test, cfg: &Config, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
         Solo {
+            test,
             prog: &test.threads[tid],
             tid,
-            init: &test.init_mem,
             base,
             fuel: cfg.fuel,
             mode,
@@ -153,121 +181,172 @@ impl<'a> Solo<'a> {
         (self.base.len() + ext.len()) as View
     }
 
-    fn value(&self, ext: &[Msg], loc: u64, t: View) -> u64 {
-        if t == 0 { self.init.get(&loc).copied().unwrap_or(0) } else { self.msg(ext, t).val }
+    fn byte_value(&self, ext: &[Msg], b: u64, t: View) -> u8 {
+        if t == 0 { self.test.init_byte(b) } else { self.msg(ext, t).byte(b) }
     }
 
-    /// Timestamps a read of `loc` may read from, given the lower bound `bound`:
-    /// the last write to `loc` at or before `bound`, or any later write.
-    fn read_choices(&self, ext: &[Msg], loc: u64, bound: View) -> Vec<View> {
-        let n = self.len(ext);
-        let mut out = Vec::new();
-        if self.mode == Mode::Collect {
-            out.push(0);
-            out.extend((1..=n).filter(|&t| self.msg(ext, t).loc == loc));
-            return out;
+    /// The latest write covering byte `b` at or before timestamp `t`.
+    fn latest(&self, ext: &[Msg], b: u64, t: View) -> View {
+        (1..=t).rev().find(|&u| self.msg(ext, u).covers(b)).unwrap_or(0)
+    }
+
+    /// Possible per-byte sources for a single-copy-atomic read of bytes
+    /// `a..a+n`. The read takes effect at one point `T` in the memory order
+    /// (at or after `bound`), and every byte reads the latest write covering
+    /// it at or before `T`. Only values of `T` where a covering write occurs
+    /// give distinct results.
+    fn atomic_read_choices(&self, ext: &[Msg], a: u64, n: u64, bound: View) -> Vec<Vec<View>> {
+        let len = self.len(ext);
+        let bound = bound.min(len);
+        let mut points = vec![bound];
+        points.extend((bound + 1..=len).filter(|&t| {
+            let m = self.msg(ext, t);
+            m.addr < a + n && a < m.addr + m.size.bytes()
+        }));
+        let mut out: Vec<Vec<View>> = Vec::new();
+        for t in points {
+            let srcs: Vec<View> = (a..a + n).map(|b| self.latest(ext, b, t)).collect();
+            if !out.contains(&srcs) {
+                out.push(srcs);
+            }
         }
-        let last = (1..=bound.min(n)).rev().find(|&t| self.msg(ext, t).loc == loc).unwrap_or(0);
-        out.push(last);
-        out.extend((bound + 1..=n).filter(|&t| self.msg(ext, t).loc == loc));
         out
     }
 
-    /// Is there no write to `loc` strictly between `from` and `to`
-    /// (by a thread other than us, if `others_only`)?
-    fn atomic(&self, ext: &[Msg], loc: u64, from: View, to: View, others_only: bool) -> bool {
-        (from + 1..to).all(|t| {
-            let m = self.msg(ext, t);
-            m.loc != loc || (others_only && m.tid == self.tid)
-        })
-    }
-
-    /// Perform a read; returns the post-states (one per choice of message)
-    /// with the value read and its timestamp.
-    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: LoadKind, size: Size) -> Vec<(TState, u64, View, View)> {
-        let loc = addr.val;
+    /// Perform a read of `size` bytes at `addr.val`; one result per allowed
+    /// choice of source writes.
+    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: LoadKind, size: Size) -> Vec<ReadResult> {
+        let a = addr.val;
+        let n = size.bytes();
         let mut vpre = addr.view.max(st.v_rnew);
         if kind == LoadKind::Acquire {
             vpre = vpre.max(st.v_rel);
         }
-        let bound = vpre.max(st.coh(loc));
+        let combos: Vec<Vec<View>> = if a % n == 0 {
+            let bound = (a..a + n).map(|b| st.coh(b)).fold(vpre, View::max);
+            self.atomic_read_choices(ext, a, n, bound)
+        } else {
+            // Unaligned: each byte is an independent single-copy-atomic access.
+            let mut combos: Vec<Vec<View>> = vec![Vec::new()];
+            for b in a..a + n {
+                let choices = self.atomic_read_choices(ext, b, 1, vpre.max(st.coh(b)));
+                combos = combos
+                    .iter()
+                    .flat_map(|c| {
+                        choices.iter().map(move |t| {
+                            let mut c2 = c.clone();
+                            c2.push(t[0]);
+                            c2
+                        })
+                    })
+                    .collect();
+            }
+            combos
+        };
+
         let mut out = Vec::new();
-        for t in self.read_choices(ext, loc, bound) {
-            let val = size.mask(self.value(ext, loc, t));
-            let rview = match st.fwd.get(&loc) {
-                Some(f) if f.ts == t && !(f.xcl && kind == LoadKind::Acquire) => f.view,
-                _ => t,
-            };
+        // Reading one of our own unfulfilled promises makes it unfulfillable
+        // (coherence would then require it to be later than itself).
+        for srcs in combos.into_iter().filter(|c| !c.iter().any(|t| st.promises.contains(t))) {
+            let mut val = 0u64;
+            let mut rview = 0;
+            for (i, &t) in srcs.iter().enumerate().rev() {
+                let b = a + i as u64;
+                val = (val << 8) | self.byte_value(ext, b, t) as u64;
+                let v = match st.fwd.get(&b) {
+                    Some(f) if f.ts == t && !(f.xcl && kind == LoadKind::Acquire) => f.view,
+                    _ => t,
+                };
+                rview = rview.max(v);
+            }
             let vpost = vpre.max(rview);
             let mut s = st.clone();
-            s.coh.insert(loc, st.coh(loc).max(vpost));
+            for i in 0..n {
+                let b = a + i;
+                s.coh.insert(b, st.coh(b).max(vpost));
+            }
             s.v_rold = s.v_rold.max(vpost);
             if kind != LoadKind::Plain {
                 s.v_rnew = s.v_rnew.max(vpost);
                 s.v_wnew = s.v_wnew.max(vpost);
             }
             s.v_cap = s.v_cap.max(addr.view);
-            out.push((s, val, t, vpost));
+            out.push(ReadResult { state: s, val, srcs, vpost });
         }
         out
     }
 
-    /// Perform a write of `val` to `addr.val`. `atomic_from` imposes an
-    /// atomicity constraint relative to an earlier read at that timestamp
-    /// (`others_only` for exclusives). Returns post-states.
+    /// No write to the footprint between each byte's source and `t`
+    /// (by another thread, if `others_only`)?
+    fn atomic(&self, ext: &[Msg], a: u64, srcs: &[View], t: View, others_only: bool) -> bool {
+        srcs.iter().enumerate().all(|(i, &from)| {
+            let b = a + i as u64;
+            (from + 1..t).all(|u| {
+                let m = self.msg(ext, u);
+                !m.covers(b) || (others_only && m.tid == self.tid)
+            })
+        })
+    }
+
+    /// Perform a write of `val` (`size` bytes) to `addr.val`. `atomic`
+    /// imposes an atomicity constraint relative to an earlier read
+    /// (per-byte sources, and whether only other threads' writes count).
     #[allow(clippy::too_many_arguments)]
     fn do_write(
         &mut self,
         st: &TState,
         ext: &[Msg],
         addr: RV,
+        size: Size,
         val: u64,
         data_view: View,
         release: bool,
         xcl: bool,
-        atomic_from: Option<(View, bool)>,
+        atomic: Option<(&[View], bool)>,
     ) -> Vec<Succ> {
-        let loc = addr.val;
-        let mut out = Vec::new();
-        if self.mode == Mode::Collect {
-            self.candidates.insert((loc, val));
-            let mut e = ext.to_vec();
-            e.push(Msg { loc, val, tid: self.tid });
-            return vec![(st.clone(), e)];
-        }
+        let a = addr.val;
+        let n = size.bytes();
+        let new_msg = Msg { addr: a, size, val, tid: self.tid };
         let mut vpre = addr.view.max(data_view).max(st.v_wnew).max(st.v_cap);
         if release {
             vpre = vpre.max(st.v_rold).max(st.v_wold);
         }
         let apply = |t: View| {
             let mut s = st.clone();
-            s.coh.insert(loc, t);
+            let fwd = Fwd { ts: t, view: addr.view.max(data_view), xcl };
+            for b in a..a + n {
+                s.coh.insert(b, t);
+                s.fwd.insert(b, fwd);
+            }
             s.v_wold = s.v_wold.max(t);
             s.v_cap = s.v_cap.max(addr.view);
             if release {
                 s.v_rel = s.v_rel.max(t);
             }
-            s.fwd.insert(loc, Fwd { ts: t, view: addr.view.max(data_view), xcl });
             s.promises.remove(&t);
             s
         };
-        let ok_atomic = |t: View| match atomic_from {
-            Some((from, others_only)) => self.atomic(ext, loc, from, t, others_only),
+        let ok_atomic = |t: View| match atomic {
+            Some((srcs, others_only)) => self.atomic(ext, a, srcs, t, others_only),
             None => true,
         };
+        let coh_ok = |t: View| (a..a + n).all(|b| st.coh(b) < t);
+        let mut out = Vec::new();
         // Fulfill an outstanding promise.
         for &t in &st.promises {
-            let m = self.msg(ext, t);
-            if m.loc == loc && m.val == val && vpre < t && st.coh(loc) < t && ok_atomic(t) {
+            if *self.msg(ext, t) == new_msg && vpre < t && coh_ok(t) && ok_atomic(t) {
                 out.push((apply(t), ext.to_vec()));
             }
         }
-        // Or (while certifying) write a new message at the end of memory.
-        if self.mode == Mode::Certify {
+        // Or (except in the final phase) write a new message at the end of memory.
+        if self.mode != Mode::Final {
             let t = self.len(ext) + 1;
             if ok_atomic(t) {
+                if self.mode == Mode::Collect {
+                    self.candidates.insert((a, size, val));
+                }
                 let mut e = ext.to_vec();
-                e.push(Msg { loc, val, tid: self.tid });
+                e.push(new_msg);
                 out.push((apply(t), e));
             }
         }
@@ -295,6 +374,7 @@ impl<'a> Solo<'a> {
     }
 
     fn mem_successors(&mut self, st: TState, ext: &[Msg], op: MemOp) -> Vec<Succ> {
+        let prog = self.prog;
         let mut out = Vec::new();
         match op {
             MemOp::Barrier(b) => {
@@ -313,23 +393,48 @@ impl<'a> Solo<'a> {
                     Barrier::St => s.v_wnew = s.v_wnew.max(wold),
                     Barrier::Isb => s.v_rnew = s.v_rnew.max(s.v_cap),
                 }
-                s.core.retire();
+                s.core.retire(prog);
                 out.push((s, ext.to_vec()));
             }
-            MemOp::Load { addr, rt, size, kind, excl } => {
-                for (mut s, val, t, vpost) in self.do_read(&st, ext, addr, kind, size) {
-                    s.core.set(rt, RV { val, view: vpost });
+            MemOp::Load { addr, rt, size, signed, kind, excl } => {
+                for r in self.do_read(&st, ext, addr, kind, size) {
+                    let mut s = r.state;
+                    s.core.set(rt, RV { val: size.extend(r.val, signed), view: r.vpost });
                     if excl {
-                        s.xcl = Some((addr.val, t, vpost));
+                        s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs });
                     }
-                    s.core.retire();
+                    s.core.retire(prog);
                     out.push((s, ext.to_vec()));
                 }
             }
+            MemOp::LoadPair { addr, rt, rt2, size, signed } => {
+                // Two independent reads: the second does not depend on the first.
+                let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
+                for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size) {
+                    for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size) {
+                        let mut s = r2.state;
+                        s.core.set(rt, RV { val: size.extend(r1.val, signed), view: r1.vpost });
+                        s.core.set(rt2, RV { val: size.extend(r2.val, signed), view: r2.vpost });
+                        s.core.retire(prog);
+                        out.push((s, ext.to_vec()));
+                    }
+                }
+            }
             MemOp::Store { addr, data, size, release } => {
-                for (mut s, e) in self.do_write(&st, ext, addr, size.mask(data.val), data.view, release, false, None) {
-                    s.core.retire();
+                for (mut s, e) in self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, release, false, None) {
+                    s.core.retire(prog);
                     out.push((s, e));
+                }
+            }
+            MemOp::StorePair { addr, data, data2, size } => {
+                let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
+                for (s1, e1) in self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, false, false, None) {
+                    for (mut s, e) in
+                        self.do_write(&s1, &e1, addr2, size, size.mask(data2.val), data2.view, false, false, None)
+                    {
+                        s.core.retire(prog);
+                        out.push((s, e));
+                    }
                 }
             }
             MemOp::StoreExcl { addr, data, rs, size, release } => {
@@ -337,15 +442,18 @@ impl<'a> Solo<'a> {
                 let mut f = st.clone();
                 f.xcl = None;
                 f.core.set(rs, RV { val: 1, view: 0 });
-                f.core.retire();
+                f.core.retire(prog);
                 out.push((f, ext.to_vec()));
-                if let Some((loc, tr, _)) = st.xcl {
-                    if loc == addr.val {
-                        let atomic = if self.mode == Mode::Collect { None } else { Some((tr, true)) };
-                        for (mut s, e) in self.do_write(&st, ext, addr, size.mask(data.val), data.view, release, true, atomic) {
+                if let Some(m) = &st.xcl {
+                    if m.addr == addr.val && m.size == size {
+                        let srcs = m.srcs.clone();
+                        let atomic = Some((&srcs[..], true));
+                        for (mut s, e) in
+                            self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, release, true, atomic)
+                        {
                             s.xcl = None;
                             s.core.set(rs, RV { val: 0, view: 0 });
-                            s.core.retire();
+                            s.core.retire(prog);
                             out.push((s, e));
                         }
                     }
@@ -353,22 +461,22 @@ impl<'a> Solo<'a> {
             }
             MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release } => {
                 let kind = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
-                for (s, old, tr, vpost) in self.do_read(&st, ext, addr, kind, size) {
-                    let reg = RV { val: old, view: vpost };
-                    match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
+                for r in self.do_read(&st, ext, addr, kind, size) {
+                    let reg = RV { val: r.val, view: r.vpost };
+                    match rmw_result(op, r.val, operand.val, cmp.map(|c| c.val), size) {
                         None => {
-                            let mut s = s;
+                            let mut s = r.state;
                             s.core.set(rt, reg);
-                            s.core.retire();
+                            s.core.retire(prog);
                             out.push((s, ext.to_vec()));
                         }
                         Some(new) => {
-                            let dview = vpost.max(operand.view).max(cmp.map_or(0, |c| c.view));
-                            let atomic = if self.mode == Mode::Collect { None } else { Some((tr, false)) };
-                            for (mut s2, e) in self.do_write(&s, ext, addr, new, dview, release, false, atomic) {
-                                s2.core.set(rt, reg);
-                                s2.core.retire();
-                                out.push((s2, e));
+                            let dview = r.vpost.max(operand.view).max(cmp.map_or(0, |c| c.view));
+                            let atomic = Some((&r.srcs[..], false));
+                            for (mut s, e) in self.do_write(&r.state, ext, addr, size, new, dview, release, false, atomic) {
+                                s.core.set(rt, reg);
+                                s.core.retire(prog);
+                                out.push((s, e));
                             }
                         }
                     }
@@ -401,11 +509,7 @@ impl<'a> Solo<'a> {
                 continue;
             }
             let succs = self.successors(&st, &ext);
-            if self.mode == Mode::Collect {
-                stack.extend(succs.into_iter().map(|(s, e)| (s.erase_views(), e)));
-            } else {
-                stack.extend(succs);
-            }
+            stack.extend(succs);
         }
     }
 }
@@ -415,8 +519,13 @@ pub struct Config {
 }
 
 pub fn explore(test: &Test, cfg: &Config) -> Outcomes {
-    let proj = Projection::new(test);
     let n = test.threads.len();
+    if n == 1 {
+        // A lone thread sees its own accesses in program order: its behaviors
+        // are exactly the sequentially consistent ones.
+        return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel);
+    }
+    let proj = Projection::new(test);
     let mut results = Outcomes::new(test.observables());
     let mut seen: HashSet<Vec<Msg>> = HashSet::new();
     let mut stack: Vec<Vec<Msg>> = vec![Vec::new()];
@@ -443,15 +552,11 @@ pub fn explore(test: &Test, cfg: &Config) -> Outcomes {
             per_thread.push(s.finals);
         }
         if per_thread.iter().all(|f| !f.is_empty()) {
-            let memval = |a: u64| {
-                mem.iter()
-                    .rev()
-                    .find(|m| m.loc == a)
-                    .map(|m| m.val)
-                    .unwrap_or_else(|| test.init_mem.get(&a).copied().unwrap_or(0))
+            let byte = |b: u64| {
+                mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b))
             };
             for state in proj.combine(&per_thread, &|o| match o {
-                Obs::Mem(a) => memval(a),
+                Obs::Mem(a) => test.loc_value(a, &byte),
                 Obs::Reg(..) => unreachable!(),
             }) {
                 results.insert(state);
@@ -463,9 +568,9 @@ pub fn explore(test: &Test, cfg: &Config) -> Outcomes {
             let mut c = solo(tid, &mem, Mode::Collect);
             c.run(start(tid, &mem));
             results.truncated |= c.truncated;
-            for (loc, val) in c.candidates {
+            for (addr, size, val) in c.candidates {
                 let mut m2 = mem.clone();
-                m2.push(Msg { loc, val, tid });
+                m2.push(Msg { addr, size, val, tid });
                 if seen.contains(&m2) {
                     continue;
                 }

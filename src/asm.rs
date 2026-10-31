@@ -91,10 +91,14 @@ fn parse_shift_amount(s: &str) -> Result<u8> {
 
 fn parse_addr(s: &str) -> Result<Addr> {
     let t = s.trim();
+    let (t, pre) = match t.strip_suffix('!') {
+        Some(r) => (r.trim(), true),
+        None => (t, false),
+    };
     let inner = t
         .strip_prefix('[')
         .and_then(|x| x.strip_suffix(']'))
-        .ok_or_else(|| format!("bad address '{}' (pre/post-index not supported)", s))?;
+        .ok_or_else(|| format!("bad address '{}'", s))?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
     let base = parse_reg(parts[0])?;
     if !base.wide {
@@ -122,7 +126,62 @@ fn parse_addr(s: &str) -> Result<Addr> {
         }
         _ => return Err(format!("bad address '{}'", s)),
     };
-    Ok(Addr { base, offset })
+    if pre && !matches!(offset, Offset::Imm(_)) {
+        return Err(format!("pre-index needs an immediate offset: '{}'", s));
+    }
+    let writeback = if pre { Writeback::Pre } else { Writeback::None };
+    Ok(Addr { base, offset, writeback })
+}
+
+/// Parse the address operand at `ops[i]`, plus an optional post-index
+/// immediate at `ops[i + 1]`. The address must be the last operand.
+fn parse_mem_operand(ops: &[String], i: usize, mnem: &str) -> Result<Addr> {
+    let a = ops.get(i).ok_or_else(|| format!("{}: missing address operand", mnem))?;
+    let mut addr = parse_addr(a)?;
+    match ops.len() - i {
+        1 => {}
+        2 => {
+            if addr.writeback != Writeback::None || addr.offset != Offset::Imm(0) {
+                return Err(format!("{}: bad post-index form", mnem));
+            }
+            addr.writeback = Writeback::Post(parse_imm(&ops[i + 1])? as i64);
+        }
+        _ => return Err(format!("{}: too many operands", mnem)),
+    }
+    Ok(addr)
+}
+
+/// Split a load/store mnemonic such as `LDRSB` or `STLXRH` into its base
+/// (ending in `R`) and its size suffix.
+fn split_size_suffix(m: &str) -> Option<(&str, &str)> {
+    let i = m.rfind('R')?;
+    let (base, suffix) = m.split_at(i + 1);
+    match suffix {
+        "" | "B" | "H" | "SB" | "SH" | "SW" => Some((base, suffix)),
+        _ => None,
+    }
+}
+
+/// Decode a size suffix: (size, signed). None means "size of register".
+fn suffix_size(suffix: &str) -> (Option<Size>, bool) {
+    match suffix {
+        "B" => (Some(Size::B1), false),
+        "H" => (Some(Size::B2), false),
+        "SB" => (Some(Size::B1), true),
+        "SH" => (Some(Size::B2), true),
+        "SW" => (Some(Size::B4), true),
+        _ => (None, false),
+    }
+}
+
+/// Check that a data register suits the access size.
+fn check_data_reg(r: RegOp, size: Size, signed: bool, mnem: &str) -> Result<()> {
+    let ok = match size {
+        Size::B8 => r.wide,
+        Size::B4 => r.wide == signed,
+        _ => !r.wide || signed,
+    };
+    if ok { Ok(()) } else { Err(format!("{}: register {} does not match the access size", mnem, r)) }
 }
 
 fn parse_cond(s: &str) -> Result<Cond> {
@@ -281,22 +340,28 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
             want(&ops, 2, m)?;
             Instr::Cbz { rt: reg(0)?, nonzero: m == "CBNZ", target: label(labels, &ops[1])? }
         }
-        "LDR" | "LDAR" | "LDAPR" | "LDXR" | "LDAXR" => {
-            want(&ops, 2, m)?;
-            let kind = match m {
-                "LDAR" | "LDAXR" => LoadKind::Acquire,
-                "LDAPR" => LoadKind::AcquirePC,
-                _ => LoadKind::Plain,
-            };
-            Instr::Load { rt: reg(0)?, addr: parse_addr(&ops[1])?, kind, excl: m.contains('X') }
+        "LDP" | "LDNP" | "LDPSW" | "STP" | "STNP" => {
+            if ops.len() < 3 {
+                return Err(format!("{} expects at least 3 operands", m));
+            }
+            let (rt, rt2) = (reg(0)?, reg(1)?);
+            if rt.wide != rt2.wide {
+                return Err(format!("{}: registers must be the same width", m));
+            }
+            let addr = parse_mem_operand(&ops, 2, m)?;
+            match m {
+                "LDPSW" => {
+                    if !rt.wide {
+                        return Err("LDPSW needs X registers".into());
+                    }
+                    Instr::LoadPair { rt, rt2, addr, size: Size::B4, signed: true }
+                }
+                "LDP" | "LDNP" => Instr::LoadPair { rt, rt2, addr, size: Size::of(rt), signed: false },
+                _ => Instr::StorePair { rt, rt2, addr, size: Size::of(rt) },
+            }
         }
-        "STR" | "STLR" => {
-            want(&ops, 2, m)?;
-            Instr::Store { rt: reg(0)?, addr: parse_addr(&ops[1])?, release: m == "STLR" }
-        }
-        "STXR" | "STLXR" => {
-            want(&ops, 3, m)?;
-            Instr::StoreExcl { rs: reg(0)?, rt: reg(1)?, addr: parse_addr(&ops[2])?, release: m == "STLXR" }
+        _ if split_size_suffix(m).is_some_and(|(b, _)| LOADS.contains(&b) || STORES.contains(&b)) => {
+            parse_load_store(m, &ops)?
         }
         "DMB" | "DSB" => {
             want(&ops, 1, m)?;
@@ -311,34 +376,51 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
         }
         "ISB" => Instr::Barrier(Barrier::Isb),
         _ => {
-            // LSE atomics
+            // LSE atomics, with an optional B/H size suffix.
+            let (m, size) = match m.strip_suffix('B') {
+                Some(r) => (r, Some(Size::B1)),
+                None => match m.strip_suffix('H') {
+                    Some(r) => (r, Some(Size::B2)),
+                    None => (m, None),
+                },
+            };
+            let sized = |r: RegOp| -> Result<Size> {
+                match size {
+                    Some(_) if r.wide => Err(format!("{}: byte/halfword atomics take W registers", m)),
+                    Some(s) => Ok(s),
+                    None => Ok(Size::of(r)),
+                }
+            };
             if let Some((a, l)) = ordering_suffix(m, "CAS") {
                 want(&ops, 3, m)?;
-                return Ok(Instr::Cas { rs: reg(0)?, rt: reg(1)?, addr: parse_addr(&ops[2])?, acquire: a, release: l });
-            }
-            if let Some((a, l)) = ordering_suffix(m, "SWP") {
-                want(&ops, 3, m)?;
-                return Ok(Instr::Rmw {
-                    op: RmwOp::Swp,
-                    rs: reg(0)?,
+                let rs = reg(0)?;
+                return Ok(Instr::Cas {
+                    rs,
                     rt: reg(1)?,
                     addr: parse_addr(&ops[2])?,
+                    size: sized(rs)?,
                     acquire: a,
                     release: l,
                 });
             }
-            for (name, op) in RMW_OPS {
-                if let Some((a, l)) = ordering_suffix(m, &format!("LD{}", name)) {
+            let mut ops_list: Vec<(String, RmwOp)> = vec![("SWP".to_string(), RmwOp::Swp)];
+            ops_list.extend(RMW_OPS.iter().map(|(n, o)| (format!("LD{}", n), *o)));
+            for (name, op) in &ops_list {
+                if let Some((a, l)) = ordering_suffix(m, name) {
                     want(&ops, 3, m)?;
+                    let rs = reg(0)?;
                     return Ok(Instr::Rmw {
                         op: *op,
-                        rs: reg(0)?,
+                        rs,
                         rt: reg(1)?,
                         addr: parse_addr(&ops[2])?,
+                        size: sized(rs)?,
                         acquire: a,
                         release: l,
                     });
                 }
+            }
+            for (name, op) in RMW_OPS {
                 if let Some((false, l)) = ordering_suffix(m, &format!("ST{}", name)) {
                     want(&ops, 2, m)?;
                     let rs = reg(0)?;
@@ -347,6 +429,7 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
                         rs,
                         rt: RegOp { idx: ZR, wide: rs.wide },
                         addr: parse_addr(&ops[1])?,
+                        size: sized(rs)?,
                         acquire: false,
                         release: l,
                     });
@@ -356,6 +439,57 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
         }
     };
     Ok(ins)
+}
+
+const LOADS: &[&str] = &["LDR", "LDUR", "LDAR", "LDAPR", "LDXR", "LDAXR"];
+const STORES: &[&str] = &["STR", "STUR", "STLR", "STXR", "STLXR"];
+
+fn parse_load_store(m: &str, ops: &[String]) -> Result<Instr> {
+    let (base, suffix) = split_size_suffix(m).unwrap();
+    let (fixed, signed) = suffix_size(suffix);
+    if signed && !(base == "LDR" || base == "LDUR") {
+        return Err(format!("unsupported instruction '{}'", m));
+    }
+    let wb_ok = matches!(base, "LDR" | "STR");
+    let check_wb = |a: &Addr| -> Result<()> {
+        if a.writeback != Writeback::None && !wb_ok {
+            Err(format!("{}: writeback addressing not allowed", m))
+        } else if !matches!(base, "LDR" | "STR" | "LDUR" | "STUR") && a.offset != Offset::Imm(0) {
+            Err(format!("{}: only [Xn] addressing is allowed", m))
+        } else {
+            Ok(())
+        }
+    };
+    if base == "STXR" || base == "STLXR" {
+        if ops.len() != 3 {
+            return Err(format!("{} expects 3 operands", m));
+        }
+        let rs = parse_reg(&ops[0])?;
+        let rt = parse_reg(&ops[1])?;
+        let size = fixed.unwrap_or(Size::of(rt));
+        check_data_reg(rt, size, false, m)?;
+        let addr = parse_addr(&ops[2])?;
+        check_wb(&addr)?;
+        return Ok(Instr::StoreExcl { rs, rt, addr, size, release: base == "STLXR" });
+    }
+    if ops.len() < 2 {
+        return Err(format!("{} expects 2 operands", m));
+    }
+    let rt = parse_reg(&ops[0])?;
+    let size = fixed.unwrap_or(Size::of(rt));
+    check_data_reg(rt, size, signed, m)?;
+    let addr = parse_mem_operand(ops, 1, m)?;
+    check_wb(&addr)?;
+    Ok(if LOADS.contains(&base) {
+        let kind = match base {
+            "LDAR" | "LDAXR" => LoadKind::Acquire,
+            "LDAPR" => LoadKind::AcquirePC,
+            _ => LoadKind::Plain,
+        };
+        Instr::Load { rt, addr, size, signed, kind, excl: base.contains('X') }
+    } else {
+        Instr::Store { rt, addr, size, release: base == "STLR" }
+    })
 }
 
 /// A line of source, possibly with a leading label.
@@ -386,4 +520,50 @@ pub fn assemble(lines: &[String]) -> Result<Vec<Instr>> {
         }
     }
     body.iter().map(|l| parse_instr(l, &labels)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> Result<Instr> {
+        parse_instr(s, &HashMap::new())
+    }
+
+    #[test]
+    fn sized_loads_and_stores() {
+        let Instr::Load { size, signed, .. } = p("LDRSH X0,[X1]").unwrap() else { panic!() };
+        assert_eq!((size, signed), (Size::B2, true));
+        let Instr::Store { size, release, .. } = p("STLRB W0,[X1]").unwrap() else { panic!() };
+        assert_eq!((size, release), (Size::B1, true));
+        let Instr::StoreExcl { size, .. } = p("STLXRH W2,W0,[X1]").unwrap() else { panic!() };
+        assert_eq!(size, Size::B2);
+        let Instr::Rmw { size, acquire, release, .. } = p("LDADDALB W0,W1,[X2]").unwrap() else { panic!() };
+        assert_eq!((size, acquire, release), (Size::B1, true, true));
+        let Instr::Cas { size, .. } = p("CASH W0,W1,[X2]").unwrap() else { panic!() };
+        assert_eq!(size, Size::B2);
+    }
+
+    #[test]
+    fn writeback_forms() {
+        let Instr::Load { addr, .. } = p("LDR X0,[X1,#8]!").unwrap() else { panic!() };
+        assert_eq!((addr.offset, addr.writeback), (Offset::Imm(8), Writeback::Pre));
+        let Instr::StorePair { addr, .. } = p("STP X0,X1,[X2],#-16").unwrap() else { panic!() };
+        assert_eq!(addr.writeback, Writeback::Post(-16));
+    }
+
+    #[test]
+    fn rejects_bad_forms() {
+        for bad in [
+            "STRB X0,[X1]",
+            "LDRSW W0,[X1]",
+            "LDAR X0,[X1,#8]",
+            "LDAR X0,[X1],#8",
+            "LDP W0,X1,[X2]",
+            "LDADDB X0,X1,[X2]",
+            "LDR X0,[X1,X2]!",
+        ] {
+            assert!(p(bad).is_err(), "accepted {}", bad);
+        }
+    }
 }

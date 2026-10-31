@@ -38,3 +38,15 @@ MP+dmb.sy+swp          yes  no
 MP-spin                yes  no
 MP-spin-acq            no   no
 ALU                    yes  yes
+LDST                   yes  yes
+SCA-H                  no   no
+MP-bytes               yes  no
+MP-bytes+dmb.st        no   no
+bytes-merge            no   no
+CoRR-mixed             no   no
+MP-split-read          yes  no
+MP+dmb.sy+ldp          yes  no
+MP+stp+dmb.sy          yes  no
+MP-bytes+popl+poap     no   no
+LDADDB-counter         no   no
+IRIW-halfword          no   no

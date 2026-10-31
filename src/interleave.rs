@@ -7,7 +7,7 @@
 //! x86-like machine?", so that ARM-only outcomes can be singled out.
 
 use crate::core::{Core, MemOp, RV, Step, rmw_result};
-use crate::isa::Barrier;
+use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::Outcomes;
 use std::collections::{BTreeMap, HashMap};
@@ -18,34 +18,68 @@ pub enum Kind {
     Tso,
 }
 
+/// A buffered or committed store: address, size, value.
+type Write = (u64, Size, u64);
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Thread {
     core: Core,
-    buf: Vec<(u64, u64)>,
-    /// Exclusive monitor: the location of the last load-exclusive, if no
-    /// other thread has written it since.
-    mon: Option<u64>,
+    buf: Vec<Write>,
+    /// Exclusive monitor: the footprint of the last load-exclusive, if no
+    /// other thread has written to it since.
+    mon: Option<(u64, Size)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Global {
     threads: Vec<Thread>,
-    mem: BTreeMap<u64, u64>,
+    /// Bytes written so far (others hold their initial value).
+    mem: BTreeMap<u64, u8>,
+}
+
+fn overlaps(a: u64, sa: Size, b: u64, sb: Size) -> bool {
+    a < b + sb.bytes() && b < a + sa.bytes()
 }
 
 impl Global {
-    fn read(&self, tid: usize, a: u64, init: &BTreeMap<u64, u64>) -> u64 {
-        if let Some(&(_, v)) = self.threads[tid].buf.iter().rev().find(|(x, _)| *x == a) {
-            return v;
-        }
-        self.mem.get(&a).or_else(|| init.get(&a)).copied().unwrap_or(0)
+    fn mem_byte(&self, b: u64, test: &Test) -> u8 {
+        self.mem.get(&b).copied().unwrap_or_else(|| test.init_byte(b))
     }
 
-    fn commit(&mut self, tid: usize, a: u64, v: u64) {
-        self.mem.insert(a, v);
+    /// Read as seen by thread `tid`: each byte comes from the youngest
+    /// buffered store covering it, or from memory.
+    fn read(&self, tid: usize, a: u64, size: Size, test: &Test) -> u64 {
+        let mut v = 0u64;
+        for i in (0..size.bytes()).rev() {
+            let b = a + i;
+            let byte = self.threads[tid]
+                .buf
+                .iter()
+                .rev()
+                .find(|(wa, ws, _)| overlaps(*wa, *ws, b, Size::B1))
+                .map(|(wa, _, wv)| (wv >> (8 * (b - wa))) as u8)
+                .unwrap_or_else(|| self.mem_byte(b, test));
+            v = (v << 8) | byte as u64;
+        }
+        v
+    }
+
+    fn store(&mut self, tid: usize, kind: Kind, w: Write) {
+        match kind {
+            Kind::Tso => self.threads[tid].buf.push(w),
+            Kind::Sc => self.commit(tid, w),
+        }
+    }
+
+    fn commit(&mut self, tid: usize, (a, size, v): Write) {
+        for i in 0..size.bytes() {
+            self.mem.insert(a + i, (v >> (8 * i)) as u8);
+        }
         for (i, t) in self.threads.iter_mut().enumerate() {
-            if i != tid && t.mon == Some(a) {
-                t.mon = None;
+            if let Some((ma, ms)) = t.mon {
+                if i != tid && overlaps(a, size, ma, ms) {
+                    t.mon = None;
+                }
             }
         }
     }
@@ -61,7 +95,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             .enumerate()
             .map(|(i, _)| Thread { core: Core::new(test.init_regs[i]), buf: Vec::new(), mon: None })
             .collect(),
-        mem: test.init_mem.clone(),
+        mem: BTreeMap::new(),
     };
     // Visited states (step counters zeroed) -> per-thread step counts when
     // last explored. A state reached again with no thread having used fewer
@@ -88,8 +122,8 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             // Drain the oldest buffered store.
             if !th.buf.is_empty() {
                 let mut n = g.clone();
-                let (a, v) = n.threads[tid].buf.remove(0);
-                n.commit(tid, a, v);
+                let w = n.threads[tid].buf.remove(0);
+                n.commit(tid, w);
                 stack.push(n);
                 any = true;
             }
@@ -100,42 +134,55 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             }
             let mut n = g.clone();
             let buf_empty = n.threads[tid].buf.is_empty();
-            let step = n.threads[tid].core.step(&test.threads[tid]);
+            let prog = &test.threads[tid];
+            let step = n.threads[tid].core.step(prog);
             let ok = match step {
                 Step::Done => false,
                 Step::Local { .. } => true,
                 Step::Mem(op) => match op {
-                    MemOp::Load { addr, rt, size, excl, .. } => {
-                        let v = size.mask(n.read(tid, addr.val, &test.init_mem));
+                    MemOp::Load { addr, rt, size, signed, excl, .. } => {
+                        let v = size.extend(n.read(tid, addr.val, size, test), signed);
                         let t = &mut n.threads[tid];
                         t.core.set(rt, RV { val: v, view: 0 });
                         if excl {
-                            t.mon = Some(addr.val);
+                            t.mon = Some((addr.val, size));
                         }
-                        t.core.retire();
+                        t.core.retire(prog);
+                        true
+                    }
+                    MemOp::LoadPair { addr, rt, rt2, size, signed } => {
+                        // Both halves are read in one step.
+                        let v1 = size.extend(n.read(tid, addr.val, size, test), signed);
+                        let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test), signed);
+                        let t = &mut n.threads[tid];
+                        t.core.set(rt, RV { val: v1, view: 0 });
+                        t.core.set(rt2, RV { val: v2, view: 0 });
+                        t.core.retire(prog);
                         true
                     }
                     MemOp::Store { addr, data, size, .. } => {
-                        let v = size.mask(data.val);
-                        match kind {
-                            Kind::Tso => n.threads[tid].buf.push((addr.val, v)),
-                            Kind::Sc => n.commit(tid, addr.val, v),
-                        }
-                        n.threads[tid].core.retire();
+                        n.store(tid, kind, (addr.val, size, size.mask(data.val)));
+                        n.threads[tid].core.retire(prog);
+                        true
+                    }
+                    MemOp::StorePair { addr, data, data2, size } => {
+                        n.store(tid, kind, (addr.val, size, size.mask(data.val)));
+                        n.store(tid, kind, (addr.val + size.bytes(), size, size.mask(data2.val)));
+                        n.threads[tid].core.retire(prog);
                         true
                     }
                     MemOp::StoreExcl { addr, data, rs, size, .. } => {
                         if !buf_empty {
                             false
                         } else {
-                            let success = n.threads[tid].mon == Some(addr.val);
+                            let success = n.threads[tid].mon == Some((addr.val, size));
                             if success {
-                                n.commit(tid, addr.val, size.mask(data.val));
+                                n.commit(tid, (addr.val, size, size.mask(data.val)));
                             }
                             let t = &mut n.threads[tid];
                             t.mon = None;
                             t.core.set(rs, RV { val: if success { 0 } else { 1 }, view: 0 });
-                            t.core.retire();
+                            t.core.retire(prog);
                             true
                         }
                     }
@@ -143,13 +190,13 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         if !buf_empty {
                             false
                         } else {
-                            let old = size.mask(n.read(tid, addr.val, &test.init_mem));
+                            let old = n.read(tid, addr.val, size, test);
                             if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
-                                n.commit(tid, addr.val, new);
+                                n.commit(tid, (addr.val, size, new));
                             }
                             let t = &mut n.threads[tid];
                             t.core.set(rt, RV { val: old, view: 0 });
-                            t.core.retire();
+                            t.core.retire(prog);
                             true
                         }
                     }
@@ -157,7 +204,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         if b == Barrier::Full && !buf_empty {
                             false
                         } else {
-                            n.threads[tid].core.retire();
+                            n.threads[tid].core.retire(prog);
                             true
                         }
                     }
@@ -174,7 +221,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 .iter()
                 .map(|o| match *o {
                     Obs::Reg(t, r) => g.threads[t].core.regs[r as usize].val,
-                    Obs::Mem(a) => g.mem.get(&a).copied().unwrap_or(0),
+                    Obs::Mem(a) => test.loc_value(a, &|b| g.mem_byte(b, test)),
                 })
                 .collect();
             results.insert(state);

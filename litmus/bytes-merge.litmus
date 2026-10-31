@@ -1,0 +1,8 @@
+AArch64 bytes-merge
+"Byte writes to different bytes of a word both survive"
+{ uint16_t x; 0:X1=x; 1:X1=x; }
+ P0           | P1           ;
+ MOV W0,#1    | MOV W0,#1    ;
+ STRB W0,[X1] | ADD X2,X1,#1 ;
+              | STRB W0,[X2] ;
+exists (~x=257)

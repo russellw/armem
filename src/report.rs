@@ -50,6 +50,12 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
             writeln!(s, "{} (condition {}: {})", if ok { "Ok" } else { "No" }, c.quant, observation(o, test)).unwrap();
             writeln!(s, "Witnesses: Positive {} Negative {}", pos, neg).unwrap();
         }
+        if o.stats.memories > 0 {
+            writeln!(s, "Explored {} promise memories", o.stats.memories).unwrap();
+        }
+        if o.stats.states > 0 {
+            writeln!(s, "Explored {} states", o.stats.states).unwrap();
+        }
         if o.truncated {
             writeln!(s, "WARNING: some executions exceeded the fuel limit; results may be incomplete").unwrap();
         }

@@ -1,0 +1,25 @@
+AArch64 LDST
+"Single-threaded check of sized, signed, pair and writeback accesses"
+{ uint64_t buf; uint64_t buf2; uint8_t b; 0:X1=buf; 0:X10=buf2; 0:X20=b; }
+ P0                       ;
+ MOV X0,#0x8180           ;
+ STRH W0,[X1]             ;
+ LDRB W2,[X1]             ;
+ LDRSB X3,[X1,#1]         ;
+ LDRSH W4,[X1]            ;
+ LDR X5,[X1]              ;
+ MOV W6,#7                ;
+ MOV W7,#9                ;
+ STP W6,W7,[X10]          ;
+ LDR X8,[X10]             ;
+ LDP W11,W12,[X10]        ;
+ MOV X13,X10              ;
+ LDR W14,[X13],#4         ;
+ LDR W15,[X13]            ;
+ LDR W16,[X10,#4]!        ;
+ MOV W17,#200             ;
+ STRB W17,[X20]           ;
+ MOV W18,#100             ;
+ LDADDB W18,W19,[X20]     ;
+ LDURSB X21,[X20]         ;
+forall (0:X2=0x80 /\ 0:X3=-127 /\ 0:X4=0xffff8180 /\ 0:X5=0x8180 /\ 0:X8=0x900000007 /\ 0:X11=7 /\ 0:X12=9 /\ 0:X13=buf2+4 /\ 0:X14=7 /\ 0:X15=9 /\ 0:X16=9 /\ 0:X10=buf2+4 /\ 0:X19=200 /\ 0:X21=44 /\ b=44)

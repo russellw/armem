@@ -1,0 +1,6 @@
+AArch64 LDADDB-counter
+{ uint8_t x; 0:X1=x; 1:X1=x; }
+ P0                | P1                ;
+ MOV W0,#1         | MOV W0,#1         ;
+ LDADDB W0,W2,[X1] | LDADDB W0,W2,[X1] ;
+exists (~x=2)

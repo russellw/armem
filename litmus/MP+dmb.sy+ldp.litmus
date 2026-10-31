@@ -1,0 +1,9 @@
+AArch64 MP+dmb.sy+ldp
+"The two loads of an LDP are not ordered with each other"
+{ uint64_t buf; 0:X1=buf; 1:X1=buf; }
+ P0             | P1                ;
+ MOV W0,#1      | LDP W0,W2,[X1]    ;
+ STR W0,[X1,#4] |                   ;
+ DMB SY         |                   ;
+ STR W0,[X1]    |                   ;
+exists (1:X0=1 /\ 1:X2=0)

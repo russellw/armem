@@ -30,8 +30,13 @@ pub struct Core {
 /// A memory operation with its operands already evaluated.
 #[derive(Clone, Copy, Debug)]
 pub enum MemOp {
-    Load { addr: RV, rt: RegOp, size: Size, kind: LoadKind, excl: bool },
+    /// `signed`: sign-extend the value into `rt` (otherwise zero-extend).
+    Load { addr: RV, rt: RegOp, size: Size, signed: bool, kind: LoadKind, excl: bool },
     Store { addr: RV, data: RV, size: Size, release: bool },
+    /// Two independent loads, at `addr` and `addr + size`.
+    LoadPair { addr: RV, rt: RegOp, rt2: RegOp, size: Size, signed: bool },
+    /// Two independent stores, at `addr` and `addr + size`.
+    StorePair { addr: RV, data: RV, data2: RV, size: Size },
     StoreExcl { addr: RV, data: RV, rs: RegOp, size: Size, release: bool },
     /// Atomic read-modify-write. For CAS, `cmp` is Some(expected).
     Rmw { addr: RV, op: RmwOp, operand: RV, cmp: Option<RV>, rt: RegOp, size: Size, acquire: bool, release: bool },
@@ -85,8 +90,12 @@ impl Core {
         }
     }
 
+    /// The address accessed by `a`.
     pub fn addr(&self, a: &Addr) -> RV {
         let b = self.get(a.base);
+        if let Writeback::Post(_) = a.writeback {
+            return b;
+        }
         let (off, view) = match a.offset {
             Offset::Imm(i) => (i as u64, 0),
             Offset::Reg(r, e) => {
@@ -102,8 +111,27 @@ impl Core {
         RV { val: b.val.wrapping_add(off), view: join(b.view, view) }
     }
 
-    /// Advance past the current (memory) instruction.
-    pub fn retire(&mut self) {
+    /// Advance past the current (memory) instruction, performing any base
+    /// register writeback.
+    pub fn retire(&mut self, prog: &[Instr]) {
+        let addr = match prog[self.pc] {
+            Instr::Load { addr, .. }
+            | Instr::Store { addr, .. }
+            | Instr::LoadPair { addr, .. }
+            | Instr::StorePair { addr, .. } => Some(addr),
+            _ => None,
+        };
+        if let Some(a) = addr {
+            let b = self.get(a.base);
+            let new = match (a.writeback, a.offset) {
+                (Writeback::Pre, Offset::Imm(i)) => Some(b.val.wrapping_add(i as u64)),
+                (Writeback::Post(i), _) => Some(b.val.wrapping_add(i as u64)),
+                _ => None,
+            };
+            if let Some(v) = new {
+                self.set(a.base, RV { val: v, view: b.view });
+            }
+        }
         self.pc += 1;
         self.steps += 1;
     }
@@ -196,27 +224,27 @@ impl Core {
                     next = target;
                 }
             }
-            Instr::Load { rt, addr, kind, excl } => {
-                return Step::Mem(MemOp::Load { addr: self.addr(&addr), rt, size: Size::of(rt), kind, excl });
+            Instr::Load { rt, addr, size, signed, kind, excl } => {
+                return Step::Mem(MemOp::Load { addr: self.addr(&addr), rt, size, signed, kind, excl });
             }
-            Instr::Store { rt, addr, release } => {
-                return Step::Mem(MemOp::Store {
+            Instr::Store { rt, addr, size, release } => {
+                return Step::Mem(MemOp::Store { addr: self.addr(&addr), data: self.get(rt), size, release });
+            }
+            Instr::StoreExcl { rs, rt, addr, size, release } => {
+                return Step::Mem(MemOp::StoreExcl { addr: self.addr(&addr), data: self.get(rt), rs, size, release });
+            }
+            Instr::LoadPair { rt, rt2, addr, size, signed } => {
+                return Step::Mem(MemOp::LoadPair { addr: self.addr(&addr), rt, rt2, size, signed });
+            }
+            Instr::StorePair { rt, rt2, addr, size } => {
+                return Step::Mem(MemOp::StorePair {
                     addr: self.addr(&addr),
                     data: self.get(rt),
-                    size: Size::of(rt),
-                    release,
+                    data2: self.get(rt2),
+                    size,
                 });
             }
-            Instr::StoreExcl { rs, rt, addr, release } => {
-                return Step::Mem(MemOp::StoreExcl {
-                    addr: self.addr(&addr),
-                    data: self.get(rt),
-                    rs,
-                    size: Size::of(rt),
-                    release,
-                });
-            }
-            Instr::Rmw { op, rs, rt, addr, acquire, release } => {
+            Instr::Rmw { op, rs, rt, addr, size, acquire, release } => {
                 // ST<op> forms (rt = ZR) do not have acquire semantics.
                 return Step::Mem(MemOp::Rmw {
                     addr: self.addr(&addr),
@@ -224,19 +252,19 @@ impl Core {
                     operand: self.get(rs),
                     cmp: None,
                     rt,
-                    size: Size::of(rs),
+                    size,
                     acquire: acquire && rt.idx != ZR,
                     release,
                 });
             }
-            Instr::Cas { rs, rt, addr, acquire, release } => {
+            Instr::Cas { rs, rt, addr, size, acquire, release } => {
                 return Step::Mem(MemOp::Rmw {
                     addr: self.addr(&addr),
                     op: RmwOp::Swp,
                     operand: self.get(rt),
                     cmp: Some(self.get(rs)),
                     rt: rs,
-                    size: Size::of(rs),
+                    size,
                     acquire,
                     release,
                 });

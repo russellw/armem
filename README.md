@@ -60,8 +60,12 @@ AArch64 MP-spin
 exists (1:X2=0)
 ```
 
-* Init block: `N:Xr=value-or-symbol`, `sym=value`. Each named symbol gets an
-  address (`0x1000`, `0x1100`, ...). Its initial value is 0 unless given.
+* Init block: `N:Xr=value-or-symbol`, `[type] sym=value`. Each named
+  symbol gets an address (`0x1000`, `0x1100`, ...). Its initial value is 0
+  unless given. The optional C type (`uint8_t`, `int16_t`, `int`,
+  `uint32_t`, `int64_t`, `uint64_t`, pointers, ...) sets the size and
+  signedness used to read the location's final value. The default is a
+  signed 64-bit integer. Values may be written `sym+offset`.
 * Final section: optional `locations [...]`, then `exists`, `~exists` or
   `forall` with `/\`, `\/`, `~` and parentheses.
 * The reported state contains the registers and locations named in the
@@ -72,13 +76,22 @@ exists (1:X2=0)
 
 `MOV/MOVZ`, `ADD(S)`, `SUB(S)`, `AND(S)`, `ORR`, `EOR`, `LSL`, `LSR`, `ASR`,
 `MUL`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`, `CSET`, `B`, `B.cond`,
-`CBZ/CBNZ`, `LDR`, `STR`, `LDAR`, `LDAPR`, `STLR`, `LDXR`, `LDAXR`, `STXR`,
-`STLXR`, LSE atomics (`LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}`,
-`ST<op>`, `SWP`, `CAS`, each with `A`/`L`/`AL` variants), `DMB`
-(`SY/ISH/...`, `LD`, `ST` variants), `DSB` (treated as DMB), `ISB`, `NOP`.
+`CBZ/CBNZ`, `NOP`, and these memory accesses:
 
-Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`, and
-`[Xn,Wm,SXTW|UXTW #k]`.
+* loads/stores: `LDR`, `STR`, `LDUR`, `STUR`, with byte/halfword forms
+  (`LDRB`, `LDRH`, `STRB`, `STRH`) and sign-extending forms (`LDRSB`,
+  `LDRSH`, `LDRSW`)
+* pairs: `LDP`, `STP`, `LDNP`, `STNP`, `LDPSW`
+* ordered and exclusive: `LDAR`, `LDAPR`, `STLR`, `LDXR`, `LDAXR`, `STXR`,
+  `STLXR`, each with `B`/`H` forms
+* LSE atomics: `LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}`, `ST<op>`, `SWP`,
+  `CAS`, each with `A`/`L`/`AL` ordering and `B`/`H` size variants
+* barriers: `DMB` (`SY/ISH/...`, `LD`, `ST` variants), `DSB` (treated as
+  DMB), `ISB`
+
+Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
+`[Xn,Wm,SXTW|UXTW #k]`, pre-index `[Xn,#imm]!`, and post-index
+`[Xn],#imm` (writeback forms for `LDR`/`STR`/`LDP`/`STP`).
 
 ## How it works
 
@@ -97,7 +110,20 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`, and
      exactly its promises.
 
   In phase 2 the threads cannot influence each other, so the final states
-  are the product of the per-thread results.
+  are the product of the per-thread results. Candidate promises come from
+  a solo exploration of the thread under the same model. A
+  single-threaded test is run as SC, which is exact for a lone thread.
+* **Mixed sizes**: memory is byte-addressed. Each write message has a
+  footprint (address and size), and coherence and forwarding are tracked
+  per byte. An aligned access is single-copy atomic: an aligned read
+  takes effect at one point in the memory order, and each byte reads the
+  latest write covering it at that point. So it can combine bytes from
+  different writes, but never sees an aligned write torn. An unaligned
+  access behaves as independent byte accesses. `LDP`/`STP` are two
+  independent accesses with no ordering between them (ARMv8 without
+  FEAT_LSE2). This mixed-size extension is our own. The published
+  Promising-ARM model covers only same-size accesses, so this part has
+  not been checked against the axiomatic model.
 * **Reference models** (`src/interleave.rs`): SC and x86-TSO. These
   enumerate interleavings, with FIFO store buffers for TSO. A full `DMB`
   acts like `MFENCE`, and atomics act as locked operations. They run the
@@ -108,20 +134,20 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`, and
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 39 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 51 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
-and acquire/release) and lock and atomic examples. Their expected
+and acquire/release), lock and atomic examples, and mixed-size and pair
+tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering). Their expected
 ARMv8/TSO verdicts are in `litmus/expected.txt`, and `cargo test` checks
 them. The tests also check that every SC outcome is reachable under TSO and
 under ARM, and that results are deterministic.
 
 ## Limitations (current)
 
-* All accesses to a location must be the same size. A location holds one
-  64-bit value; W-register accesses read and write its low 32 bits as
-  the whole value. Mixed-size and overlapping accesses are not modeled.
-* No pre/post-indexed addressing, `LDP/STP`, `LDAR` byte/halfword forms,
-  or SIMD/FP.
+* No SIMD/FP, no exclusive pairs (`LDXP/STXP`), and no FEAT_LSE2
+  (16-byte single-copy-atomic `LDP/STP`).
+* The TSO and SC reference models perform both halves of `LDP`/`STP` in a
+  single step.
 * The status register written by `STXR` carries no dependency.
 * The search is exhaustive, so it suits small snippets. The number of
   promise orders grows quickly with the number of writes.
@@ -130,8 +156,8 @@ under ARM, and that results are deterministic.
 
 ## Roadmap
 
-1. More of the ISA: pair loads/stores, byte/halfword accesses with a
-   mixed-size memory model, pre/post-indexing, more ALU operations.
+1. More of the ISA: more ALU operations, exclusive pairs, SIMD/FP
+   loads/stores.
 2. A binary instruction decoder producing the same `isa::Instr`, so real
    compiled code can be loaded (ELF), starting with user-mode functions
    extracted from real programs.

@@ -12,7 +12,7 @@
 //! ```
 
 use crate::asm::{self, Result};
-use crate::isa::Instr;
+use crate::isa::{Instr, Size};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -25,6 +25,33 @@ pub const SYM_STRIDE: u64 = 0x100;
 pub enum Obs {
     Reg(usize, u8),
     Mem(u64),
+}
+
+/// The type of a named location, which determines how its final value
+/// is read: `size` bytes, little-endian, zero- or sign-extended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocType {
+    pub size: Size,
+    pub signed: bool,
+}
+
+pub const DEFAULT_LOC_TYPE: LocType = LocType { size: Size::B8, signed: true };
+
+fn parse_type(words: &[&str]) -> Result<LocType> {
+    let t = words.join(" ");
+    let (size, signed) = match t.as_str() {
+        "int8_t" | "char" | "signed char" => (Size::B1, true),
+        "uint8_t" | "unsigned char" => (Size::B1, false),
+        "int16_t" | "short" => (Size::B2, true),
+        "uint16_t" | "unsigned short" => (Size::B2, false),
+        "int" | "int32_t" => (Size::B4, true),
+        "uint32_t" | "unsigned" | "unsigned int" => (Size::B4, false),
+        "int64_t" | "long" | "intptr_t" => (Size::B8, true),
+        "uint64_t" | "unsigned long" | "uintptr_t" => (Size::B8, false),
+        _ if t.ends_with('*') => (Size::B8, false),
+        _ => return Err(format!("unsupported type '{}'", t)),
+    };
+    Ok(LocType { size, signed })
 }
 
 #[derive(Clone, Debug)]
@@ -55,7 +82,10 @@ pub struct Test {
     pub name: String,
     pub threads: Vec<Vec<Instr>>,
     pub init_regs: Vec<[u64; 31]>,
-    pub init_mem: BTreeMap<u64, u64>,
+    /// Initial memory contents, byte by byte (absent bytes are 0).
+    pub init_mem: BTreeMap<u64, u8>,
+    /// Declared types of named locations (default: signed 64-bit).
+    pub loc_types: BTreeMap<u64, LocType>,
     pub symbols: Vec<(String, u64)>,
     pub locations: Vec<Obs>,
     pub condition: Option<Condition>,
@@ -91,6 +121,25 @@ impl Prop {
 }
 
 impl Test {
+    pub fn loc_type(&self, addr: u64) -> LocType {
+        self.loc_types.get(&addr).copied().unwrap_or(DEFAULT_LOC_TYPE)
+    }
+
+    pub fn init_byte(&self, b: u64) -> u8 {
+        self.init_mem.get(&b).copied().unwrap_or(0)
+    }
+
+    /// Value of the location at `addr` (read according to its type), given
+    /// a function returning the final value of each byte.
+    pub fn loc_value(&self, addr: u64, byte: &dyn Fn(u64) -> u8) -> u64 {
+        let ty = self.loc_type(addr);
+        let mut v = 0u64;
+        for i in (0..ty.size.bytes()).rev() {
+            v = (v << 8) | byte(addr + i) as u64;
+        }
+        ty.size.extend(v, ty.signed)
+    }
+
     pub fn symbol_name(&self, addr: u64) -> Option<&str> {
         self.symbols.iter().find(|(_, a)| *a == addr).map(|(n, _)| n.as_str())
     }
@@ -155,6 +204,10 @@ impl Symbols {
         let s = s.trim();
         if s.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
             Ok(asm::parse_int(s)? as u64)
+        } else if let Some((sym, off)) = s.split_once('+') {
+            // symbol+offset
+            let base = self.value(sym)?;
+            Ok(base.wrapping_add(asm::parse_int(off)? as u64))
         } else if is_ident(s) {
             Ok(self.get(s))
         } else {
@@ -254,6 +307,7 @@ pub fn parse(src: &str) -> Result<Test> {
     let mut syms = Symbols { syms: Vec::new() };
     let mut reg_inits: Vec<(usize, u8, u64)> = Vec::new();
     let mut init_mem = BTreeMap::new();
+    let mut loc_types = BTreeMap::new();
     for stmt in init_text.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -263,25 +317,45 @@ pub fn parse(src: &str) -> Result<Test> {
             Some((l, r)) => (l.trim(), Some(r.trim())),
             None => (stmt, None),
         };
-        // Drop C-like type prefixes such as "int", "uint64_t", "int64_t*".
-        let lhs = lhs.split_whitespace().last().unwrap_or("").trim_start_matches('*');
-        if let Some((t, r)) = parse_thread_reg(lhs) {
+        // An optional C-like type precedes the name: "uint8_t x", "int *p".
+        let lhs = lhs.replace('*', " * ");
+        let words: Vec<&str> = lhs.split_whitespace().collect();
+        let Some((&name, ty_words)) = words.split_last() else {
+            return Err(format!("bad init statement '{}'", stmt));
+        };
+        if let Some((t, r)) = parse_thread_reg(name) {
             let v = match rhs {
                 Some(r) => syms.value(r)?,
                 None => 0,
             };
             reg_inits.push((t, r, v));
         } else {
-            let lname = lhs.trim_start_matches('[').trim_end_matches(']');
+            let lname = name.trim_start_matches('[').trim_end_matches(']');
             if !is_ident(lname) {
                 return Err(format!("bad init statement '{}'", stmt));
             }
             let a = syms.get(lname);
+            let ty = if ty_words.is_empty() {
+                loc_types.get(&a).copied().unwrap_or(DEFAULT_LOC_TYPE)
+            } else {
+                let mut tw: Vec<&str> = ty_words.to_vec();
+                // "int *" -> "int*"
+                if tw.last() == Some(&"*") {
+                    tw.pop();
+                    let joined = format!("{}*", tw.join(" "));
+                    parse_type(&[joined.as_str()])?
+                } else {
+                    parse_type(&tw)?
+                }
+            };
+            loc_types.insert(a, ty);
             let v = match rhs {
                 Some(r) => syms.value(r)?,
                 None => 0,
             };
-            init_mem.insert(a, v);
+            for i in 0..ty.size.bytes() {
+                init_mem.insert(a + i, (v >> (8 * i)) as u8);
+            }
         }
     }
 
@@ -346,7 +420,10 @@ pub fn parse(src: &str) -> Result<Test> {
         init_regs[t][r as usize] = v;
     }
 
-    let (locations, condition) = parse_final(&rest, &mut syms)?;
+    let (locations, mut condition) = parse_final(&rest, &mut syms)?;
+    if let Some(c) = &mut condition {
+        normalize(&mut c.prop, &loc_types);
+    }
     let mut mentioned = locations.clone();
     if let Some(c) = &condition {
         c.prop.observables(&mut mentioned);
@@ -358,11 +435,24 @@ pub fn parse(src: &str) -> Result<Test> {
             }
         }
     }
-    for (_, a) in &syms.syms {
-        init_mem.entry(*a).or_insert(0);
-    }
+    Ok(Test { name, threads, init_regs, init_mem, loc_types, symbols: syms.syms, locations, condition })
+}
 
-    Ok(Test { name, threads, init_regs, init_mem, symbols: syms.syms, locations, condition })
+/// Bring constants compared with memory locations into the location's
+/// representation (so that `x=-1` and `x=255` both match an 0xff byte).
+fn normalize(p: &mut Prop, types: &BTreeMap<u64, LocType>) {
+    match p {
+        Prop::Eq(Obs::Mem(a), v) => {
+            let ty = types.get(a).copied().unwrap_or(DEFAULT_LOC_TYPE);
+            *v = ty.size.extend(*v, ty.signed);
+        }
+        Prop::Not(q) => normalize(q, types),
+        Prop::And(a, b) | Prop::Or(a, b) => {
+            normalize(a, types);
+            normalize(b, types)
+        }
+        _ => {}
+    }
 }
 
 fn tokenize(s: &str) -> Vec<String> {
@@ -387,7 +477,7 @@ fn tokenize(s: &str) -> Vec<String> {
             i += 1;
         } else {
             let st = i;
-            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || "_:.-".contains(cs[i])) {
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || "_:.-+".contains(cs[i])) {
                 i += 1;
             }
             if i == st {

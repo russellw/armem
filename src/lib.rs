@@ -2,7 +2,7 @@
 //! ARMv8 hardware memory model.
 //!
 //! The emulator is fully deterministic: it does not use host threads, and
-//! it explores *all* behaviours a program may exhibit under the selected
+//! it explores *all* behaviors a program may exhibit under the selected
 //! memory model (bounded by a per-thread instruction budget, the "fuel").
 
 pub mod asm;

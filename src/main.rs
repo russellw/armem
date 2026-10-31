@@ -4,7 +4,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage: armem [options] FILE.litmus...
 
-Explores every behaviour of a litmus test under the ARMv8 memory model and
+Explores every behavior of a litmus test under the ARMv8 memory model and
 compares it with x86-TSO, flagging outcomes that only ARM allows.
 
 options:

@@ -6,13 +6,13 @@
 //! 1-based position in the list (0 denotes the initial value of every
 //! location). Each thread keeps *views* (timestamps) that bound which
 //! messages it may still read and where its writes may be placed.
-//! Out-of-order writes are modelled by *promises*: a thread may append a
-//! write to memory early, provided it can later fulfil it (certification).
+//! Out-of-order writes are modeled by *promises*: a thread may append a
+//! write to memory early, provided it can later fulfill it (certification).
 //!
 //! Exploration uses the promise-first strategy: in phase 1 threads make
 //! promises (each one certified by a solo run of the promising thread);
 //! in phase 2, with memory fixed, every thread runs independently and must
-//! fulfil exactly its promises. Every behaviour of the model is reachable
+//! fulfill exactly its promises. Every behavior of the model is reachable
 //! this way, and in phase 2 the threads cannot affect each other, so the
 //! final states are simply the product of each thread's final states.
 
@@ -99,7 +99,7 @@ enum Mode {
     /// Over-approximate the writes the thread might promise: reads may see
     /// any value written to the location, every write is a new message.
     Collect,
-    /// Search for a run that fulfils all outstanding promises; new writes
+    /// Search for a run that fulfills all outstanding promises; new writes
     /// may be appended to (a local copy of) memory.
     Certify,
     /// Run to completion fulfilling all promises, with no new writes.
@@ -255,7 +255,7 @@ impl<'a> Solo<'a> {
             Some((from, others_only)) => self.atomic(ext, loc, from, t, others_only),
             None => true,
         };
-        // Fulfil an outstanding promise.
+        // Fulfill an outstanding promise.
         for &t in &st.promises {
             let m = self.msg(ext, t);
             if m.loc == loc && m.val == val && vpre < t && st.coh(loc) < t && ok_atomic(t) {

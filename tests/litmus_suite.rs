@@ -53,7 +53,7 @@ fn every_test_has_an_expectation() {
     }
 }
 
-/// Every SC behaviour must be possible under TSO and under ARM.
+/// Every SC behavior must be possible under TSO and under ARM.
 #[test]
 fn sc_is_contained_in_weaker_models() {
     for (name, _, _) in expectations() {

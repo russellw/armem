@@ -90,7 +90,7 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`, and
   dependencies are tracked exactly, false dependencies included (e.g.
   `EOR W4,W0,W0`), as the architecture requires. Out-of-order writes are
   *promises*. A thread may only make a promise if it can certify it,
-  i.e. show that running alone it can fulfil it later.
+  i.e. show that running alone it can fulfill it later.
   Exploration is *promise-first*:
   1. enumerate every sequence of certified promises (memory states);
   2. for each one, run every thread alone to completion, fulfilling
@@ -102,7 +102,7 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`, and
   enumerate interleavings, with FIFO store buffers for TSO. A full `DMB`
   acts like `MFENCE`, and atomics act as locked operations. They run the
   same ARM program under an x86-like ordering, so any outcome they cannot
-  produce is an *ARM-only* behaviour.
+  produce is an *ARM-only* behavior.
 * **Fuel** bounds the instructions per thread per execution, so loops
   terminate. A state that recurs with no more fuel used is pruned, so
   spin loops cost almost nothing. If any execution runs out of fuel, the
@@ -119,7 +119,7 @@ under ARM, and that results are deterministic.
 
 * All accesses to a location must be the same size. A location holds one
   64-bit value; W-register accesses read and write its low 32 bits as
-  the whole value. Mixed-size and overlapping accesses are not modelled.
+  the whole value. Mixed-size and overlapping accesses are not modeled.
 * No pre/post-indexed addressing, `LDP/STP`, `LDAR` byte/halfword forms,
   or SIMD/FP.
 * The status register written by `STXR` carries no dependency.
@@ -137,8 +137,8 @@ under ARM, and that results are deterministic.
    extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
-   and prioritising reads that disagree with what TSO would return.
+   and prioritizing reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core
-   virtual machine and search for ARM-only behaviours.
+   virtual machine and search for ARM-only behaviors.

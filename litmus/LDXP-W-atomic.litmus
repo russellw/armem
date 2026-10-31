@@ -1,0 +1,9 @@
+AArch64 LDXP-W-atomic
+"A W-register LDXP is a single-copy-atomic 64-bit read"
+{ 0:X1=x; 1:X1=x; }
+ P0               | P1              ;
+ MOV X0,#1        | LDXP W2,W3,[X1] ;
+ LSL X2,X0,#32    |                 ;
+ ORR X0,X0,X2     |                 ;
+ STR X0,[X1]      |                 ;
+exists (1:X2=1 /\ 1:X3=0 \/ 1:X2=0 /\ 1:X3=1)

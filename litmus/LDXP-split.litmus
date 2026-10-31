@@ -1,0 +1,22 @@
+AArch64 LDXP-split
+"Single-threaded check of exclusive pair values and status"
+{ uint64_t x; uint64_t y; 0:X1=x; 0:X10=y; }
+ P0                   ;
+ MOV X0,#1            ;
+ MOV X8,#2            ;
+ LSL X8,X8,#32        ;
+ ORR X0,X0,X8         ;
+ STR X0,[X1]          ;
+ LDXP W2,W3,[X1]      ;
+ MOV W4,#5            ;
+ MOV W5,#6            ;
+ STXP W6,W4,W5,[X1]   ;
+ LDR X7,[X1]          ;
+ MOV X11,#7           ;
+ MOV X12,#8           ;
+ STP X11,X12,[X10]    ;
+ LDAXP X13,X14,[X10]  ;
+ STLXP W15,X14,X13,[X10] ;
+ LDP X16,X17,[X10]    ;
+ STXP W18,X11,X12,[X10] ;
+forall (0:X2=1 /\ 0:X3=2 /\ 0:X6=0 /\ 0:X7=0x600000005 /\ 0:X13=7 /\ 0:X14=8 /\ 0:X15=0 /\ 0:X16=8 /\ 0:X17=7 /\ 0:X18=1)

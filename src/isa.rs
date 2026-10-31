@@ -34,6 +34,8 @@ pub enum Size {
     B2,
     B4,
     B8,
+    /// Only used for the 16-byte footprint of an X-register exclusive pair.
+    B16,
 }
 
 impl Size {
@@ -43,6 +45,7 @@ impl Size {
             Size::B2 => 2,
             Size::B4 => 4,
             Size::B8 => 8,
+            Size::B16 => 16,
         }
     }
     pub fn from_bytes(n: u64) -> Option<Size> {
@@ -51,19 +54,20 @@ impl Size {
             2 => Size::B2,
             4 => Size::B4,
             8 => Size::B8,
+            16 => Size::B16,
             _ => return None,
         })
     }
     pub fn mask(self, v: u64) -> u64 {
         match self {
-            Size::B8 => v,
+            Size::B8 | Size::B16 => v,
             s => v & ((1u64 << (8 * s.bytes())) - 1),
         }
     }
     /// Zero- or sign-extend a `self`-sized value to 64 bits.
     pub fn extend(self, v: u64, signed: bool) -> u64 {
         let v = self.mask(v);
-        if !signed || self == Size::B8 {
+        if !signed || self >= Size::B8 {
             return v;
         }
         let shift = 64 - 8 * self.bytes();
@@ -205,6 +209,10 @@ pub enum Instr {
     Store { rt: RegOp, addr: Addr, size: Size, release: bool },
     /// STXR* / STLXR*
     StoreExcl { rs: RegOp, rt: RegOp, addr: Addr, size: Size, release: bool },
+    /// LDXP / LDAXP: exclusive load of a register pair.
+    LoadExclPair { rt: RegOp, rt2: RegOp, addr: Addr, acquire: bool },
+    /// STXP / STLXP: exclusive store of a register pair; status in `rs`.
+    StoreExclPair { rs: RegOp, rt: RegOp, rt2: RegOp, addr: Addr, release: bool },
     /// LDP / LDNP / LDPSW: two independent loads from consecutive addresses.
     LoadPair { rt: RegOp, rt2: RegOp, addr: Addr, size: Size, signed: bool },
     /// STP / STNP: two independent stores to consecutive addresses.

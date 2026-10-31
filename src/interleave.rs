@@ -6,7 +6,7 @@
 //! They answer the question "could this outcome also have happened on an
 //! x86-like machine?", so that ARM-only outcomes can be singled out.
 
-use crate::core::{Core, MemOp, RV, Step, rmw_result};
+use crate::core::{Core, MemOp, RV, Step, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::Outcomes;
@@ -19,7 +19,7 @@ pub enum Kind {
 }
 
 /// A buffered or committed store: address, size, value.
-type Write = (u64, Size, u64);
+type Write = (u64, Size, u128);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Thread {
@@ -48,8 +48,8 @@ impl Global {
 
     /// Read as seen by thread `tid`: each byte comes from the youngest
     /// buffered store covering it, or from memory.
-    fn read(&self, tid: usize, a: u64, size: Size, test: &Test) -> u64 {
-        let mut v = 0u64;
+    fn read(&self, tid: usize, a: u64, size: Size, test: &Test) -> u128 {
+        let mut v = 0u128;
         for i in (0..size.bytes()).rev() {
             let b = a + i;
             let byte = self.threads[tid]
@@ -59,7 +59,7 @@ impl Global {
                 .find(|(wa, ws, _)| overlaps(*wa, *ws, b, Size::B1))
                 .map(|(wa, _, wv)| (wv >> (8 * (b - wa))) as u8)
                 .unwrap_or_else(|| self.mem_byte(b, test));
-            v = (v << 8) | byte as u64;
+            v = (v << 8) | byte as u128;
         }
         v
     }
@@ -141,7 +141,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 Step::Local { .. } => true,
                 Step::Mem(op) => match op {
                     MemOp::Load { addr, rt, size, signed, excl, .. } => {
-                        let v = size.extend(n.read(tid, addr.val, size, test), signed);
+                        let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
                         let t = &mut n.threads[tid];
                         t.core.set(rt, RV { val: v, view: 0 });
                         if excl {
@@ -150,10 +150,36 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         t.core.retire(prog);
                         true
                     }
+                    MemOp::LoadExclPair { addr, rt, rt2, size, .. } => {
+                        let total = size.double();
+                        let (lo, hi) = split_pair(n.read(tid, addr.val, total, test), size);
+                        let t = &mut n.threads[tid];
+                        t.core.set(rt, RV { val: lo, view: 0 });
+                        t.core.set(rt2, RV { val: hi, view: 0 });
+                        t.mon = Some((addr.val, total));
+                        t.core.retire(prog);
+                        true
+                    }
+                    MemOp::StoreExclPair { addr, data, data2, rs, size, .. } => {
+                        if !buf_empty {
+                            false
+                        } else {
+                            let total = size.double();
+                            let success = n.threads[tid].mon == Some((addr.val, total));
+                            if success {
+                                n.commit(tid, (addr.val, total, pair_value(data.val, data2.val, size)));
+                            }
+                            let t = &mut n.threads[tid];
+                            t.mon = None;
+                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, view: 0 });
+                            t.core.retire(prog);
+                            true
+                        }
+                    }
                     MemOp::LoadPair { addr, rt, rt2, size, signed } => {
                         // Both halves are read in one step.
-                        let v1 = size.extend(n.read(tid, addr.val, size, test), signed);
-                        let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test), signed);
+                        let v1 = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
+                        let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test) as u64, signed);
                         let t = &mut n.threads[tid];
                         t.core.set(rt, RV { val: v1, view: 0 });
                         t.core.set(rt2, RV { val: v2, view: 0 });
@@ -161,13 +187,13 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         true
                     }
                     MemOp::Store { addr, data, size, .. } => {
-                        n.store(tid, kind, (addr.val, size, size.mask(data.val)));
+                        n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
                         n.threads[tid].core.retire(prog);
                         true
                     }
                     MemOp::StorePair { addr, data, data2, size } => {
-                        n.store(tid, kind, (addr.val, size, size.mask(data.val)));
-                        n.store(tid, kind, (addr.val + size.bytes(), size, size.mask(data2.val)));
+                        n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
+                        n.store(tid, kind, (addr.val + size.bytes(), size, size.mask(data2.val) as u128));
                         n.threads[tid].core.retire(prog);
                         true
                     }
@@ -177,7 +203,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         } else {
                             let success = n.threads[tid].mon == Some((addr.val, size));
                             if success {
-                                n.commit(tid, (addr.val, size, size.mask(data.val)));
+                                n.commit(tid, (addr.val, size, size.mask(data.val) as u128));
                             }
                             let t = &mut n.threads[tid];
                             t.mon = None;
@@ -190,9 +216,9 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         if !buf_empty {
                             false
                         } else {
-                            let old = n.read(tid, addr.val, size, test);
+                            let old = n.read(tid, addr.val, size, test) as u64;
                             if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
-                                n.commit(tid, (addr.val, size, new));
+                                n.commit(tid, (addr.val, size, new as u128));
                             }
                             let t = &mut n.threads[tid];
                             t.core.set(rt, RV { val: old, view: 0 });

@@ -50,3 +50,8 @@ MP+stp+dmb.sy          yes  no
 MP-bytes+popl+poap     no   no
 LDADDB-counter         no   no
 IRIW-halfword          no   no
+LDXP-STXP-counter      no   no
+LDXP-torn              yes  no
+LDXP-STXP-read         no   no
+LDXP-W-atomic          no   no
+LDXP-split             yes  yes

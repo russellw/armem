@@ -340,6 +340,30 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
             want(&ops, 2, m)?;
             Instr::Cbz { rt: reg(0)?, nonzero: m == "CBNZ", target: label(labels, &ops[1])? }
         }
+        "LDXP" | "LDAXP" => {
+            want(&ops, 3, m)?;
+            let (rt, rt2) = (reg(0)?, reg(1)?);
+            if rt.wide != rt2.wide {
+                return Err(format!("{}: registers must be the same width", m));
+            }
+            let addr = parse_addr(&ops[2])?;
+            if addr.offset != Offset::Imm(0) || addr.writeback != Writeback::None {
+                return Err(format!("{}: only [Xn] addressing is allowed", m));
+            }
+            Instr::LoadExclPair { rt, rt2, addr, acquire: m == "LDAXP" }
+        }
+        "STXP" | "STLXP" => {
+            want(&ops, 4, m)?;
+            let (rs, rt, rt2) = (reg(0)?, reg(1)?, reg(2)?);
+            if rt.wide != rt2.wide || rs.wide {
+                return Err(format!("{}: bad register widths", m));
+            }
+            let addr = parse_addr(&ops[3])?;
+            if addr.offset != Offset::Imm(0) || addr.writeback != Writeback::None {
+                return Err(format!("{}: only [Xn] addressing is allowed", m));
+            }
+            Instr::StoreExclPair { rs, rt, rt2, addr, release: m == "STLXP" }
+        }
         "LDP" | "LDNP" | "LDPSW" | "STP" | "STNP" => {
             if ops.len() < 3 {
                 return Err(format!("{} expects at least 3 operands", m));
@@ -545,6 +569,14 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_pairs() {
+        let Instr::LoadExclPair { acquire, .. } = p("LDAXP X0,X1,[X2]").unwrap() else { panic!() };
+        assert!(acquire);
+        let Instr::StoreExclPair { release, .. } = p("STLXP W3,W0,W1,[X2]").unwrap() else { panic!() };
+        assert!(release);
+    }
+
+    #[test]
     fn writeback_forms() {
         let Instr::Load { addr, .. } = p("LDR X0,[X1,#8]!").unwrap() else { panic!() };
         assert_eq!((addr.offset, addr.writeback), (Offset::Imm(8), Writeback::Pre));
@@ -562,6 +594,9 @@ mod tests {
             "LDP W0,X1,[X2]",
             "LDADDB X0,X1,[X2]",
             "LDR X0,[X1,X2]!",
+            "LDXP W0,X1,[X2]",
+            "STXP X0,X1,X2,[X3]",
+            "LDXP X0,X1,[X2,#16]",
         ] {
             assert!(p(bad).is_err(), "accepted {}", bad);
         }

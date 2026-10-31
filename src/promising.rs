@@ -25,7 +25,7 @@
 //! independent byte reads. (This mixed-size extension is ours; it is not
 //! part of the published Promising-ARM model.)
 
-use crate::core::{Core, MemOp, RV, Step, View, rmw_result};
+use crate::core::{Core, MemOp, RV, Step, View, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Instr, LoadKind, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::{Outcomes, Projection};
@@ -35,7 +35,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub struct Msg {
     pub addr: u64,
     pub size: Size,
-    pub val: u64,
+    /// Little-endian contents (up to 16 bytes).
+    pub val: u128,
     pub tid: usize,
 }
 
@@ -126,13 +127,13 @@ enum Mode {
 /// Outcome of one way of performing a read.
 struct ReadResult {
     state: TState,
-    val: u64,
+    val: u128,
     srcs: Vec<View>,
     vpost: View,
 }
 
 /// A candidate write to promise: (address, size, value).
-type Candidate = (u64, Size, u64);
+type Candidate = (u64, Size, u128);
 
 /// Exhaustive exploration of one thread running alone against a memory.
 struct Solo<'a> {
@@ -214,45 +215,47 @@ impl<'a> Solo<'a> {
     }
 
     /// Perform a read of `size` bytes at `addr.val`; one result per allowed
-    /// choice of source writes.
-    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: LoadKind, size: Size) -> Vec<ReadResult> {
+    /// choice of source writes. The read consists of single-copy-atomic
+    /// pieces of `granule` bytes (or single bytes, where a piece is not
+    /// aligned), each of which takes effect at its own point.
+    fn do_read(&self, st: &TState, ext: &[Msg], addr: RV, kind: LoadKind, size: Size, granule: u64) -> Vec<ReadResult> {
         let a = addr.val;
         let n = size.bytes();
         let mut vpre = addr.view.max(st.v_rnew);
         if kind == LoadKind::Acquire {
             vpre = vpre.max(st.v_rel);
         }
-        let combos: Vec<Vec<View>> = if a % n == 0 {
-            let bound = (a..a + n).map(|b| st.coh(b)).fold(vpre, View::max);
-            self.atomic_read_choices(ext, a, n, bound)
-        } else {
-            // Unaligned: each byte is an independent single-copy-atomic access.
-            let mut combos: Vec<Vec<View>> = vec![Vec::new()];
-            for b in a..a + n {
-                let choices = self.atomic_read_choices(ext, b, 1, vpre.max(st.coh(b)));
-                combos = combos
-                    .iter()
-                    .flat_map(|c| {
-                        choices.iter().map(move |t| {
-                            let mut c2 = c.clone();
-                            c2.push(t[0]);
-                            c2
-                        })
-                    })
-                    .collect();
-            }
-            combos
+        let piece = |p: u64, len: u64| {
+            let bound = (p..p + len).map(|b| st.coh(b)).fold(vpre, View::max);
+            self.atomic_read_choices(ext, p, len, bound)
         };
+        let mut combos: Vec<Vec<View>> = vec![Vec::new()];
+        let mut p = a;
+        while p < a + n {
+            let len = if p % granule == 0 { granule.min(a + n - p) } else { 1 };
+            let choices = piece(p, len);
+            combos = combos
+                .iter()
+                .flat_map(|c| {
+                    choices.iter().map(move |t| {
+                        let mut c2 = c.clone();
+                        c2.extend_from_slice(t);
+                        c2
+                    })
+                })
+                .collect();
+            p += len;
+        }
 
         let mut out = Vec::new();
         // Reading one of our own unfulfilled promises makes it unfulfillable
         // (coherence would then require it to be later than itself).
         for srcs in combos.into_iter().filter(|c| !c.iter().any(|t| st.promises.contains(t))) {
-            let mut val = 0u64;
+            let mut val = 0u128;
             let mut rview = 0;
             for (i, &t) in srcs.iter().enumerate().rev() {
                 let b = a + i as u64;
-                val = (val << 8) | self.byte_value(ext, b, t) as u64;
+                val = (val << 8) | self.byte_value(ext, b, t) as u128;
                 let v = match st.fwd.get(&b) {
                     Some(f) if f.ts == t && !(f.xcl && kind == LoadKind::Acquire) => f.view,
                     _ => t,
@@ -298,7 +301,7 @@ impl<'a> Solo<'a> {
         ext: &[Msg],
         addr: RV,
         size: Size,
-        val: u64,
+        val: u128,
         data_view: View,
         release: bool,
         xcl: bool,
@@ -397,9 +400,9 @@ impl<'a> Solo<'a> {
                 out.push((s, ext.to_vec()));
             }
             MemOp::Load { addr, rt, size, signed, kind, excl } => {
-                for r in self.do_read(&st, ext, addr, kind, size) {
+                for r in self.do_read(&st, ext, addr, kind, size, size.bytes()) {
                     let mut s = r.state;
-                    s.core.set(rt, RV { val: size.extend(r.val, signed), view: r.vpost });
+                    s.core.set(rt, RV { val: size.extend(r.val as u64, signed), view: r.vpost });
                     if excl {
                         s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs });
                     }
@@ -407,30 +410,70 @@ impl<'a> Solo<'a> {
                     out.push((s, ext.to_vec()));
                 }
             }
+            MemOp::LoadExclPair { addr, rt, rt2, size, acquire } => {
+                // A W pair is one 8-byte single-copy-atomic read; an X pair
+                // is atomic only per 8-byte half (a successful STXP is what
+                // guarantees the two halves were consistent).
+                let kind = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
+                let total = size.double();
+                let granule = total.bytes().min(8);
+                for r in self.do_read(&st, ext, addr, kind, total, granule) {
+                    let mut s = r.state;
+                    let (lo, hi) = split_pair(r.val, size);
+                    s.core.set(rt, RV { val: lo, view: r.vpost });
+                    s.core.set(rt2, RV { val: hi, view: r.vpost });
+                    s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs });
+                    s.core.retire(prog);
+                    out.push((s, ext.to_vec()));
+                }
+            }
+            MemOp::StoreExclPair { addr, data, data2, rs, size, release } => {
+                let total = size.double();
+                let mut f = st.clone();
+                f.xcl = None;
+                f.core.set(rs, RV { val: 1, view: 0 });
+                f.core.retire(prog);
+                out.push((f, ext.to_vec()));
+                if let Some(m) = &st.xcl {
+                    if m.addr == addr.val && m.size == total {
+                        let srcs = m.srcs.clone();
+                        let val = pair_value(data.val, data2.val, size);
+                        let dview = data.view.max(data2.view);
+                        for (mut s, e) in
+                            self.do_write(&st, ext, addr, total, val, dview, release, true, Some((&srcs[..], true)))
+                        {
+                            s.xcl = None;
+                            s.core.set(rs, RV { val: 0, view: 0 });
+                            s.core.retire(prog);
+                            out.push((s, e));
+                        }
+                    }
+                }
+            }
             MemOp::LoadPair { addr, rt, rt2, size, signed } => {
                 // Two independent reads: the second does not depend on the first.
                 let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
-                for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size) {
-                    for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size) {
+                for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size, size.bytes()) {
+                    for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size, size.bytes()) {
                         let mut s = r2.state;
-                        s.core.set(rt, RV { val: size.extend(r1.val, signed), view: r1.vpost });
-                        s.core.set(rt2, RV { val: size.extend(r2.val, signed), view: r2.vpost });
+                        s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), view: r1.vpost });
+                        s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), view: r2.vpost });
                         s.core.retire(prog);
                         out.push((s, ext.to_vec()));
                     }
                 }
             }
             MemOp::Store { addr, data, size, release } => {
-                for (mut s, e) in self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, release, false, None) {
+                for (mut s, e) in self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release, false, None) {
                     s.core.retire(prog);
                     out.push((s, e));
                 }
             }
             MemOp::StorePair { addr, data, data2, size } => {
                 let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
-                for (s1, e1) in self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, false, false, None) {
+                for (s1, e1) in self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, false, false, None) {
                     for (mut s, e) in
-                        self.do_write(&s1, &e1, addr2, size, size.mask(data2.val), data2.view, false, false, None)
+                        self.do_write(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2.view, false, false, None)
                     {
                         s.core.retire(prog);
                         out.push((s, e));
@@ -449,7 +492,7 @@ impl<'a> Solo<'a> {
                         let srcs = m.srcs.clone();
                         let atomic = Some((&srcs[..], true));
                         for (mut s, e) in
-                            self.do_write(&st, ext, addr, size, size.mask(data.val), data.view, release, true, atomic)
+                            self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release, true, atomic)
                         {
                             s.xcl = None;
                             s.core.set(rs, RV { val: 0, view: 0 });
@@ -461,9 +504,10 @@ impl<'a> Solo<'a> {
             }
             MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release } => {
                 let kind = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
-                for r in self.do_read(&st, ext, addr, kind, size) {
-                    let reg = RV { val: r.val, view: r.vpost };
-                    match rmw_result(op, r.val, operand.val, cmp.map(|c| c.val), size) {
+                for r in self.do_read(&st, ext, addr, kind, size, size.bytes()) {
+                    let old = r.val as u64;
+                    let reg = RV { val: old, view: r.vpost };
+                    match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
                         None => {
                             let mut s = r.state;
                             s.core.set(rt, reg);
@@ -473,7 +517,7 @@ impl<'a> Solo<'a> {
                         Some(new) => {
                             let dview = r.vpost.max(operand.view).max(cmp.map_or(0, |c| c.view));
                             let atomic = Some((&r.srcs[..], false));
-                            for (mut s, e) in self.do_write(&r.state, ext, addr, size, new, dview, release, false, atomic) {
+                            for (mut s, e) in self.do_write(&r.state, ext, addr, size, new as u128, dview, release, false, atomic) {
                                 s.core.set(rt, reg);
                                 s.core.retire(prog);
                                 out.push((s, e));

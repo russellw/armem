@@ -65,7 +65,8 @@ exists (1:X2=0)
   unless given. The optional C type (`uint8_t`, `int16_t`, `int`,
   `uint32_t`, `int64_t`, `uint64_t`, pointers, ...) sets the size and
   signedness used to read the location's final value. The default is a
-  signed 64-bit integer. Values may be written `sym+offset`.
+  signed 64-bit integer. Values may be written `sym+offset`, and
+  conditions may refer to `[sym+offset]`.
 * Final section: optional `locations [...]`, then `exists`, `~exists` or
   `forall` with `/\`, `\/`, `~` and parentheses.
 * The reported state contains the registers and locations named in the
@@ -84,6 +85,7 @@ exists (1:X2=0)
 * pairs: `LDP`, `STP`, `LDNP`, `STNP`, `LDPSW`
 * ordered and exclusive: `LDAR`, `LDAPR`, `STLR`, `LDXR`, `LDAXR`, `STXR`,
   `STLXR`, each with `B`/`H` forms
+* exclusive pairs: `LDXP`, `LDAXP`, `STXP`, `STLXP` (W or X registers)
 * LSE atomics: `LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}`, `ST<op>`, `SWP`,
   `CAS`, each with `A`/`L`/`AL` ordering and `B`/`H` size variants
 * barriers: `DMB` (`SY/ISH/...`, `LD`, `ST` variants), `DSB` (treated as
@@ -121,7 +123,11 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   different writes, but never sees an aligned write torn. An unaligned
   access behaves as independent byte accesses. `LDP`/`STP` are two
   independent accesses with no ordering between them (ARMv8 without
-  FEAT_LSE2). This mixed-size extension is our own. The published
+  FEAT_LSE2). A W-register `LDXP` is one single-copy-atomic 8-byte
+  read. An X-register `LDXP` is atomic only per 8-byte half, so it can
+  return a torn 128-bit value. Only a successful `STXP` of the pair
+  guarantees the halves were consistent, as on real hardware. `STXP` is
+  one 8- or 16-byte write. This mixed-size extension is our own. The published
   Promising-ARM model covers only same-size accesses, so this part has
   not been checked against the axiomatic model.
 * **Reference models** (`src/interleave.rs`): SC and x86-TSO. These
@@ -134,18 +140,18 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 51 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 56 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
-tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering). Their expected
+tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering), and
+exclusive pairs. Their expected
 ARMv8/TSO verdicts are in `litmus/expected.txt`, and `cargo test` checks
 them. The tests also check that every SC outcome is reachable under TSO and
 under ARM, and that results are deterministic.
 
 ## Limitations (current)
 
-* No SIMD/FP, no exclusive pairs (`LDXP/STXP`), and no FEAT_LSE2
-  (16-byte single-copy-atomic `LDP/STP`).
+* No SIMD/FP, and no FEAT_LSE2 (16-byte single-copy-atomic `LDP/STP`).
 * The TSO and SC reference models perform both halves of `LDP`/`STP` in a
   single step.
 * The status register written by `STXR` carries no dependency.
@@ -156,8 +162,7 @@ under ARM, and that results are deterministic.
 
 ## Roadmap
 
-1. More of the ISA: more ALU operations, exclusive pairs, SIMD/FP
-   loads/stores.
+1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
 2. A binary instruction decoder producing the same `isa::Instr`, so real
    compiled code can be loaded (ELF), starting with user-mode functions
    extracted from real programs.

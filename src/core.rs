@@ -33,6 +33,12 @@ pub enum MemOp {
     /// `signed`: sign-extend the value into `rt` (otherwise zero-extend).
     Load { addr: RV, rt: RegOp, size: Size, signed: bool, kind: LoadKind, excl: bool },
     Store { addr: RV, data: RV, size: Size, release: bool },
+    /// Exclusive pair load: `size` is the element size. A W pair is one
+    /// 8-byte single-copy-atomic access; an X pair is a 16-byte access that
+    /// is only single-copy atomic per 8-byte half.
+    LoadExclPair { addr: RV, rt: RegOp, rt2: RegOp, size: Size, acquire: bool },
+    /// Exclusive pair store: one write of `2 * size` bytes.
+    StoreExclPair { addr: RV, data: RV, data2: RV, rs: RegOp, size: Size, release: bool },
     /// Two independent loads, at `addr` and `addr + size`.
     LoadPair { addr: RV, rt: RegOp, rt2: RegOp, size: Size, signed: bool },
     /// Two independent stores, at `addr` and `addr + size`.
@@ -233,6 +239,19 @@ impl Core {
             Instr::StoreExcl { rs, rt, addr, size, release } => {
                 return Step::Mem(MemOp::StoreExcl { addr: self.addr(&addr), data: self.get(rt), rs, size, release });
             }
+            Instr::LoadExclPair { rt, rt2, addr, acquire } => {
+                return Step::Mem(MemOp::LoadExclPair { addr: self.addr(&addr), rt, rt2, size: Size::of(rt), acquire });
+            }
+            Instr::StoreExclPair { rs, rt, rt2, addr, release } => {
+                return Step::Mem(MemOp::StoreExclPair {
+                    addr: self.addr(&addr),
+                    data: self.get(rt),
+                    data2: self.get(rt2),
+                    rs,
+                    size: Size::of(rt),
+                    release,
+                });
+            }
             Instr::LoadPair { rt, rt2, addr, size, signed } => {
                 return Step::Mem(MemOp::LoadPair { addr: self.addr(&addr), rt, rt2, size, signed });
             }
@@ -275,6 +294,23 @@ impl Core {
         self.steps += 1;
         Step::Local { ctrl }
     }
+}
+
+impl Size {
+    /// The size of two elements of this size.
+    pub fn double(self) -> Size {
+        Size::from_bytes(2 * self.bytes()).expect("pair too large")
+    }
+}
+
+/// Combine two elements of `size` bytes into one little-endian value.
+pub fn pair_value(lo: u64, hi: u64, size: Size) -> u128 {
+    size.mask(lo) as u128 | (size.mask(hi) as u128) << (8 * size.bytes())
+}
+
+/// Split a little-endian value into two elements of `size` bytes.
+pub fn split_pair(v: u128, size: Size) -> (u64, u64) {
+    (size.mask(v as u64), size.mask((v >> (8 * size.bytes())) as u64))
 }
 
 /// Compute the value an RMW stores, or None if a CAS comparison fails.

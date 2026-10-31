@@ -149,7 +149,10 @@ impl Test {
             Obs::Reg(t, r) => format!("{}:X{}", t, r),
             Obs::Mem(a) => match self.symbol_name(a) {
                 Some(n) => n.to_string(),
-                None => format!("[{:#x}]", a),
+                None => match self.symbols.iter().filter(|(_, sa)| *sa <= a).max_by_key(|(_, sa)| *sa) {
+                    Some((n, sa)) if a - sa < SYM_STRIDE => format!("[{}+{}]", n, a - sa),
+                    _ => format!("[{:#x}]", a),
+                },
             },
         }
     }
@@ -514,9 +517,10 @@ impl CondParser<'_> {
     fn obs(&mut self) -> Result<Obs> {
         let t = self.next()?;
         if t == "[" {
+            // [sym] or [sym+offset]
             let n = self.next()?;
             self.expect("]")?;
-            return Ok(Obs::Mem(self.syms.get(&n)));
+            return Ok(Obs::Mem(self.syms.value(&n)?));
         }
         if let Some((th, r)) = parse_thread_reg(&t) {
             return Ok(Obs::Reg(th, r));

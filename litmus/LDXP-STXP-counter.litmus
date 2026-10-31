@@ -1,0 +1,11 @@
+AArch64 LDXP-STXP-counter
+"128-bit atomic increment of both halves with an LDXP/STXP retry loop"
+{ 0:X1=x; 1:X1=x; }
+ P0                  | P1                  ;
+ L0:                 | L1:                 ;
+ LDXP X2,X3,[X1]     | LDXP X2,X3,[X1]     ;
+ ADD X2,X2,#1        | ADD X2,X2,#1        ;
+ ADD X3,X3,#1        | ADD X3,X3,#1        ;
+ STXP W4,X2,X3,[X1]  | STXP W4,X2,X3,[X1]  ;
+ CBNZ W4,L0          | CBNZ W4,L1          ;
+exists (~(x=2 /\ [x+8]=2))

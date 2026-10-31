@@ -1,0 +1,7 @@
+AArch64 LDP-X-misaligned
+"A pair that is not 16-byte aligned is never 128-bit atomic"
+{ 0:X1=x; 1:X1=x; }
+ P0               | P1               ;
+ MOV X0,#1        | LDP X2,X3,[X1,#8];
+ STP X0,X0,[X1,#8]|                  ;
+exists (1:X2=1 /\ 1:X3=0 \/ 1:X2=0 /\ 1:X3=1)

@@ -11,12 +11,14 @@ options:
   -m, --model LIST   comma-separated models: arm, tso, sc (default: arm,tso)
   -f, --fuel N       max instructions per thread per execution (default: 200)
   -s, --summary      print one line per test instead of full reports
+      --lse2         model FEAT_LSE2 (16-byte atomic LDP/STP, atomic
+                     unaligned accesses within a 16-byte block)
   -h, --help         show this help
 ";
 
 fn main() -> ExitCode {
     let mut models = vec![Model::Arm, Model::Tso];
-    let mut fuel = 200;
+    let mut opts = armem::Options::default();
     let mut summary = false;
     let mut files = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -27,6 +29,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-s" | "--summary" => summary = true,
+            "--lse2" => opts.lse2 = true,
             "-m" | "--model" => {
                 let Some(v) = args.next() else {
                     eprintln!("--model needs an argument");
@@ -46,7 +49,7 @@ fn main() -> ExitCode {
                 }
             }
             "-f" | "--fuel" => match args.next().and_then(|v| v.parse().ok()) {
-                Some(n) => fuel = n,
+                Some(n) => opts.fuel = n,
                 None => {
                     eprintln!("--fuel needs a number");
                     return ExitCode::from(2);
@@ -81,7 +84,7 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        let results: Vec<_> = models.iter().map(|&m| (m, run(&test, m, fuel))).collect();
+        let results: Vec<_> = models.iter().map(|&m| (m, run(&test, m, &opts))).collect();
         if summary {
             println!("{}", report::summary(&test, &results));
         } else {

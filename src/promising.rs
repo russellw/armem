@@ -28,6 +28,7 @@
 use crate::core::{Core, MemOp, RV, Step, View, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Instr, LoadKind, Size};
 use crate::litmus::{Obs, Test};
+use crate::Options;
 use crate::outcome::{Outcomes, Projection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -142,6 +143,7 @@ struct Solo<'a> {
     tid: usize,
     base: Vec<Msg>,
     fuel: u32,
+    lse2: bool,
     mode: Mode,
     /// Visited states (with the step counter zeroed) -> fewest steps seen.
     visited: HashMap<(TState, Vec<Msg>), u32>,
@@ -152,17 +154,38 @@ struct Solo<'a> {
     truncated: bool,
 }
 
+/// Split an access of `n` bytes at `a` into single-copy-atomic pieces of
+/// (up to) `granule` bytes. A piece that is not aligned to `granule` is
+/// split into bytes, unless FEAT_LSE2 applies and it stays within an
+/// aligned 16-byte block.
+fn pieces(a: u64, n: u64, granule: u64, lse2: bool) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut p = a;
+    while p < a + n {
+        let len = granule.min(a + n - p);
+        if p % granule == 0 || (lse2 && p / 16 == (p + len - 1) / 16) {
+            out.push((p, len));
+            p += len;
+        } else {
+            out.push((p, 1));
+            p += 1;
+        }
+    }
+    out
+}
+
 /// A successor state, with any messages newly appended to memory.
 type Succ = (TState, Vec<Msg>);
 
 impl<'a> Solo<'a> {
-    fn new(test: &'a Test, cfg: &Config, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
+    fn new(test: &'a Test, cfg: &Options, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
         Solo {
             test,
             prog: &test.threads[tid],
             tid,
             base,
             fuel: cfg.fuel,
+            lse2: cfg.lse2,
             mode,
             visited: HashMap::new(),
             candidates: BTreeSet::new(),
@@ -225,15 +248,10 @@ impl<'a> Solo<'a> {
         if kind == LoadKind::Acquire {
             vpre = vpre.max(st.v_rel);
         }
-        let piece = |p: u64, len: u64| {
-            let bound = (p..p + len).map(|b| st.coh(b)).fold(vpre, View::max);
-            self.atomic_read_choices(ext, p, len, bound)
-        };
         let mut combos: Vec<Vec<View>> = vec![Vec::new()];
-        let mut p = a;
-        while p < a + n {
-            let len = if p % granule == 0 { granule.min(a + n - p) } else { 1 };
-            let choices = piece(p, len);
+        for (p, len) in pieces(a, n, granule, self.lse2) {
+            let bound = (p..p + len).map(|b| st.coh(b)).fold(vpre, View::max);
+            let choices = self.atomic_read_choices(ext, p, len, bound);
             combos = combos
                 .iter()
                 .flat_map(|c| {
@@ -244,7 +262,6 @@ impl<'a> Solo<'a> {
                     })
                 })
                 .collect();
-            p += len;
         }
 
         let mut out = Vec::new();
@@ -356,6 +373,35 @@ impl<'a> Solo<'a> {
         out
     }
 
+    /// A plain or release store, split into single-copy-atomic pieces (each
+    /// one a separate write message).
+    #[allow(clippy::too_many_arguments)]
+    fn do_store(
+        &mut self,
+        st: &TState,
+        ext: &[Msg],
+        addr: RV,
+        size: Size,
+        val: u128,
+        data_view: View,
+        release: bool,
+    ) -> Vec<Succ> {
+        let a = addr.val;
+        let mut states: Vec<Succ> = vec![(st.clone(), ext.to_vec())];
+        for (p, len) in pieces(a, size.bytes(), size.bytes(), self.lse2) {
+            let psize = Size::from_bytes(len).expect("piece size");
+            let shifted = val >> (8 * (p - a));
+            let pval = if len >= 16 { shifted } else { shifted & ((1u128 << (8 * len)) - 1) };
+            let paddr = RV { val: p, view: addr.view };
+            let mut next = Vec::new();
+            for (s, e) in states {
+                next.extend(self.do_write(&s, &e, paddr, psize, pval, data_view, release, false, None));
+            }
+            states = next;
+        }
+        states
+    }
+
     fn successors(&mut self, st: &TState, ext: &[Msg]) -> Vec<Succ> {
         let mut s = st.clone();
         match s.core.step(self.prog) {
@@ -451,33 +497,54 @@ impl<'a> Solo<'a> {
                 }
             }
             MemOp::LoadPair { addr, rt, rt2, size, signed } => {
-                // Two independent reads: the second does not depend on the first.
-                let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
-                for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size, size.bytes()) {
-                    for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size, size.bytes()) {
-                        let mut s = r2.state;
-                        s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), view: r1.vpost });
-                        s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), view: r2.vpost });
+                let total = size.double();
+                if self.lse2 && addr.val % total.bytes() == 0 {
+                    // FEAT_LSE2: an aligned pair is one single-copy-atomic read.
+                    for r in self.do_read(&st, ext, addr, LoadKind::Plain, total, total.bytes()) {
+                        let mut s = r.state;
+                        let (lo, hi) = split_pair(r.val, size);
+                        s.core.set(rt, RV { val: size.extend(lo, signed), view: r.vpost });
+                        s.core.set(rt2, RV { val: size.extend(hi, signed), view: r.vpost });
                         s.core.retire(prog);
                         out.push((s, ext.to_vec()));
+                    }
+                } else {
+                    // Two independent reads: the second does not depend on the first.
+                    let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
+                    for r1 in self.do_read(&st, ext, addr, LoadKind::Plain, size, size.bytes()) {
+                        for r2 in self.do_read(&r1.state, ext, addr2, LoadKind::Plain, size, size.bytes()) {
+                            let mut s = r2.state;
+                            s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), view: r1.vpost });
+                            s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), view: r2.vpost });
+                            s.core.retire(prog);
+                            out.push((s, ext.to_vec()));
+                        }
                     }
                 }
             }
             MemOp::Store { addr, data, size, release } => {
-                for (mut s, e) in self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release, false, None) {
+                for (mut s, e) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data.view, release) {
                     s.core.retire(prog);
                     out.push((s, e));
                 }
             }
             MemOp::StorePair { addr, data, data2, size } => {
-                let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
-                for (s1, e1) in self.do_write(&st, ext, addr, size, size.mask(data.val) as u128, data.view, false, false, None) {
-                    for (mut s, e) in
-                        self.do_write(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2.view, false, false, None)
-                    {
-                        s.core.retire(prog);
-                        out.push((s, e));
+                let total = size.double();
+                let states = if self.lse2 && addr.val % total.bytes() == 0 {
+                    // FEAT_LSE2: an aligned pair is one single-copy-atomic write.
+                    let val = pair_value(data.val, data2.val, size);
+                    self.do_store(&st, ext, addr, total, val, data.view.max(data2.view), false)
+                } else {
+                    let addr2 = RV { val: addr.val + size.bytes(), view: addr.view };
+                    let mut states = Vec::new();
+                    for (s1, e1) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data.view, false) {
+                        states.extend(self.do_store(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2.view, false));
                     }
+                    states
+                };
+                for (mut s, e) in states {
+                    s.core.retire(prog);
+                    out.push((s, e));
                 }
             }
             MemOp::StoreExcl { addr, data, rs, size, release } => {
@@ -558,11 +625,7 @@ impl<'a> Solo<'a> {
     }
 }
 
-pub struct Config {
-    pub fuel: u32,
-}
-
-pub fn explore(test: &Test, cfg: &Config) -> Outcomes {
+pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
     let n = test.threads.len();
     if n == 1 {
         // A lone thread sees its own accesses in program order: its behaviors

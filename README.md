@@ -27,6 +27,7 @@ cargo build --release
 ./target/release/armem litmus/MP.litmus            # full report, ARM vs TSO
 ./target/release/armem -s litmus/*.litmus          # one line per test
 ./target/release/armem -m arm,sc,tso -f 500 FILE   # choose models / fuel
+./target/release/armem --lse2 FILE                 # assume FEAT_LSE2 hardware
 cargo test --release                               # check the litmus suite
 ```
 
@@ -121,13 +122,20 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   takes effect at one point in the memory order, and each byte reads the
   latest write covering it at that point. So it can combine bytes from
   different writes, but never sees an aligned write torn. An unaligned
-  access behaves as independent byte accesses. `LDP`/`STP` are two
-  independent accesses with no ordering between them (ARMv8 without
-  FEAT_LSE2). A W-register `LDXP` is one single-copy-atomic 8-byte
+  access behaves as independent byte accesses (an unaligned store is
+  split into separate byte writes). `LDP`/`STP` are two independent
+  accesses with no ordering between them. A W-register `LDXP` is one single-copy-atomic 8-byte
   read. An X-register `LDXP` is atomic only per 8-byte half, so it can
   return a torn 128-bit value. Only a successful `STXP` of the pair
   guarantees the halves were consistent, as on real hardware. `STXP` is
-  one 8- or 16-byte write. This mixed-size extension is our own. The published
+  one 8- or 16-byte write.
+* **FEAT_LSE2** (`--lse2`, off by default, i.e. base ARMv8.0): an
+  `LDP`/`STP` of X registers aligned to 16 bytes, or of W registers
+  aligned to 8 bytes, becomes one single-copy-atomic access. Any other
+  non-exclusive access that stays within an aligned 16-byte block is
+  single-copy atomic even if unaligned. Running a test with and without
+  `--lse2` shows whether code relies on LSE2 atomicity.
+  This mixed-size and LSE2 modeling is our own extension. The published
   Promising-ARM model covers only same-size accesses, so this part has
   not been checked against the axiomatic model.
 * **Reference models** (`src/interleave.rs`): SC and x86-TSO. These
@@ -140,20 +148,22 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 56 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 61 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
-tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering), and
-exclusive pairs. Their expected
-ARMv8/TSO verdicts are in `litmus/expected.txt`, and `cargo test` checks
-them. The tests also check that every SC outcome is reachable under TSO and
+tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
+exclusive pairs, and FEAT_LSE2 atomicity. Their expected ARMv8/TSO
+verdicts are in `litmus/expected.txt` (one line per test and option set;
+an optional `lse2` column runs the test with `--lse2`), and `cargo test`
+checks them. The tests also check that every SC outcome is reachable under TSO and
 under ARM, and that results are deterministic.
 
 ## Limitations (current)
 
-* No SIMD/FP, and no FEAT_LSE2 (16-byte single-copy-atomic `LDP/STP`).
-* The TSO and SC reference models perform both halves of `LDP`/`STP` in a
-  single step.
+* No SIMD/FP.
+* The TSO and SC reference models read both halves of an `LDP` in a
+  single step. They perform an `STP` as two consecutive stores, and
+  ignore `--lse2`.
 * The status register written by `STXR` carries no dependency.
 * The search is exhaustive, so it suits small snippets. The number of
   promise orders grows quickly with the number of writes.

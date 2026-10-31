@@ -5,13 +5,21 @@ use std::path::Path;
 
 const FUEL: u32 = 200;
 
+/// One line of `litmus/expected.txt`.
+struct Expectation {
+    name: String,
+    arm: bool,
+    tso: bool,
+    opts: armem::Options,
+}
+
 fn load(name: &str) -> litmus::Test {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("litmus").join(format!("{}.litmus", name));
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
     litmus::parse(&src).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
 }
 
-fn expectations() -> Vec<(String, bool, bool)> {
+fn expectations() -> Vec<Expectation> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("litmus/expected.txt");
     std::fs::read_to_string(path)
         .unwrap()
@@ -19,7 +27,14 @@ fn expectations() -> Vec<(String, bool, bool)> {
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            (f[0].to_string(), f[1] == "yes", f[2] == "yes")
+            let mut opts = armem::Options { fuel: FUEL, lse2: false };
+            for o in &f[3..] {
+                match *o {
+                    "lse2" => opts.lse2 = true,
+                    _ => panic!("unknown option '{}' in expected.txt", o),
+                }
+            }
+            Expectation { name: f[0].to_string(), arm: f[1] == "yes", tso: f[2] == "yes", opts }
         })
         .collect()
 }
@@ -27,14 +42,15 @@ fn expectations() -> Vec<(String, bool, bool)> {
 #[test]
 fn expected_verdicts() {
     let mut failures = Vec::new();
-    for (name, arm, tso) in expectations() {
+    for Expectation { name, arm, tso, opts } in expectations() {
         let t = load(&name);
+        let label = if opts.lse2 { format!("{} [lse2]", name) } else { name.clone() };
         for (model, want) in [(Model::Arm, arm), (Model::Tso, tso)] {
-            let o = run(&t, model, FUEL);
-            assert!(!o.truncated, "{} ({}) ran out of fuel", name, model.name());
+            let o = run(&t, model, &opts);
+            assert!(!o.truncated, "{} ({}) ran out of fuel", label, model.name());
             let got = o.observed(&t).expect("test has a condition");
             if got != want {
-                failures.push(format!("{} under {}: expected {}, got {}", name, model.name(), want, got));
+                failures.push(format!("{} under {}: expected {}, got {}", label, model.name(), want, got));
             }
         }
     }
@@ -43,7 +59,7 @@ fn expected_verdicts() {
 
 #[test]
 fn every_test_has_an_expectation() {
-    let names: Vec<String> = expectations().into_iter().map(|e| e.0).collect();
+    let names: Vec<String> = expectations().into_iter().map(|e| e.name).collect();
     for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("litmus")).unwrap() {
         let p = e.unwrap().path();
         if p.extension().is_some_and(|x| x == "litmus") {
@@ -56,11 +72,11 @@ fn every_test_has_an_expectation() {
 /// Every SC behavior must be possible under TSO and under ARM.
 #[test]
 fn sc_is_contained_in_weaker_models() {
-    for (name, _, _) in expectations() {
+    for Expectation { name, opts, .. } in expectations() {
         let t = load(&name);
-        let sc = run(&t, Model::Sc, FUEL);
+        let sc = run(&t, Model::Sc, &opts);
         for m in [Model::Tso, Model::Arm] {
-            let o = run(&t, m, FUEL);
+            let o = run(&t, m, &opts);
             for s in sc.states.keys() {
                 assert!(
                     o.states.contains_key(s),
@@ -79,8 +95,9 @@ fn sc_is_contained_in_weaker_models() {
 fn deterministic() {
     for name in ["IRIW", "spinlock-norelease", "PPOCA"] {
         let t = load(&name);
-        let a = run(&t, Model::Arm, FUEL);
-        let b = run(&t, Model::Arm, FUEL);
+        let opts = armem::Options { fuel: FUEL, lse2: false };
+        let a = run(&t, Model::Arm, &opts);
+        let b = run(&t, Model::Arm, &opts);
         assert_eq!(a.states, b.states);
     }
 }

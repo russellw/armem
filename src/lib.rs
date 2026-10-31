@@ -33,10 +33,27 @@ impl Model {
     }
 }
 
-pub fn run(test: &litmus::Test, model: Model, fuel: u32) -> Outcomes {
+/// Exploration options.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Maximum instructions per thread per execution.
+    pub fuel: u32,
+    /// Model FEAT_LSE2: 16-byte-aligned LDP/STP of X registers (8-byte-aligned
+    /// for W registers) are single-copy atomic, and so is any other
+    /// non-exclusive access that stays within an aligned 16-byte block.
+    pub lse2: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { fuel: 200, lse2: false }
+    }
+}
+
+pub fn run(test: &litmus::Test, model: Model, opts: &Options) -> Outcomes {
     match model {
-        Model::Arm => promising::explore(test, &promising::Config { fuel }),
-        Model::Tso => interleave::explore(test, interleave::Kind::Tso, fuel),
-        Model::Sc => interleave::explore(test, interleave::Kind::Sc, fuel),
+        Model::Arm => promising::explore(test, opts),
+        Model::Tso => interleave::explore(test, interleave::Kind::Tso, opts.fuel),
+        Model::Sc => interleave::explore(test, interleave::Kind::Sc, opts.fuel),
     }
 }

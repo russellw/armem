@@ -1,0 +1,7 @@
+AArch64 unaligned-cross-block
+"An unaligned access crossing a 16-byte boundary is never atomic"
+{ 0:X1=x; 1:X1=x; }
+ P0              | P1              ;
+ MOV X0,#-1      | LDR X2,[X1,#12] ;
+ STR X0,[X1,#12] |                 ;
+exists (~1:X2=0 /\ ~1:X2=-1)

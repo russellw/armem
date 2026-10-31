@@ -1,4 +1,5 @@
-# test                 ARM-condition-observable  TSO-condition-observable
+# test                 ARM-condition-observable  TSO-condition-observable  [options]
+# Options: lse2 = run with FEAT_LSE2. A test may be listed with and without options.
 MP                     yes  no
 MP+dmb.sy+addr         no   no
 MP+dmbs                no   no
@@ -55,3 +56,15 @@ LDXP-torn              yes  no
 LDXP-STXP-read         no   no
 LDXP-W-atomic          no   no
 LDXP-split             yes  yes
+LDP-X-torn             yes  yes
+LDP-X-torn             no   yes  lse2
+LDP-W-torn             yes  yes
+LDP-W-torn             no   yes  lse2
+LDP-X-misaligned       yes  yes
+LDP-X-misaligned       yes  yes  lse2
+unaligned-in-block     yes  no
+unaligned-in-block     no   no   lse2
+unaligned-cross-block  yes  no
+unaligned-cross-block  yes  no   lse2
+MP+dmb.sy+ldp          no   no   lse2
+MP+stp+dmb.sy          no   no   lse2

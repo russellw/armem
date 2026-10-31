@@ -1,0 +1,7 @@
+AArch64 unaligned-in-block
+"An unaligned access within a 16-byte block is atomic only with FEAT_LSE2"
+{ 0:X1=x; 1:X1=x; }
+ P0              | P1              ;
+ MOV X0,#-1      | LDR X2,[X1,#4]  ;
+ STR X0,[X1,#4]  |                 ;
+exists (~1:X2=0 /\ ~1:X2=-1)

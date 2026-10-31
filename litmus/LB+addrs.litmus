@@ -1,0 +1,8 @@
+AArch64 LB+addrs
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0                  | P1                  ;
+ LDR W0,[X1]         | LDR W0,[X1]         ;
+ EOR W4,W0,W0        | EOR W4,W0,W0        ;
+ MOV W2,#1           | MOV W2,#1           ;
+ STR W2,[X3,W4,SXTW] | STR W2,[X3,W4,SXTW] ;
+exists (0:X0=1 /\ 1:X0=1)

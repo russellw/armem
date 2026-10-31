@@ -1,0 +1,24 @@
+AArch64 ALU
+"Single-threaded sanity check of arithmetic, flags and branches"
+{ 0:X1=x; }
+ P0                 ;
+ MOV X0,#5          ;
+ SUBS X2,X0,#7      ;
+ B.LT L0            ;
+ MOV X3,#99         ;
+ L0:                ;
+ CSET W4,LT         ;
+ CMP W0,#5          ;
+ CSEL X5,X0,X2,EQ   ;
+ LSL X6,X0,#4       ;
+ MOV W7,#-1         ;
+ ADD W7,W7,#2       ;
+ MOV X8,#3          ;
+ STR X8,[X1,#0]     ;
+ LDR X9,[X1]        ;
+ MUL X9,X9,X0       ;
+ CMP X2,#0          ;
+ B.HI L1            ;
+ MOV X10,#1         ;
+ L1:                ;
+forall (0:X2=-2 /\ 0:X3=0 /\ 0:X4=1 /\ 0:X5=5 /\ 0:X6=80 /\ 0:X7=1 /\ 0:X9=15 /\ 0:X10=0 /\ x=3)

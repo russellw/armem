@@ -1,0 +1,8 @@
+AArch64 LLSC-nonatomic
+"Bug: plain load/store increment loses updates (on every model)"
+{ 0:X1=x; 1:X1=x; }
+ P0           | P1           ;
+ LDR W0,[X1]  | LDR W0,[X1]  ;
+ ADD W0,W0,#1 | ADD W0,W0,#1 ;
+ STR W0,[X1]  | STR W0,[X1]  ;
+exists (x=1)

@@ -1,0 +1,10 @@
+AArch64 LLSC-counter
+"Atomic increment with an LDXR/STXR retry loop never loses updates"
+{ 0:X1=x; 1:X1=x; }
+ P0              | P1              ;
+ L0:             | L1:             ;
+ LDXR W0,[X1]    | LDXR W0,[X1]    ;
+ ADD W0,W0,#1    | ADD W0,W0,#1    ;
+ STXR W2,W0,[X1] | STXR W2,W0,[X1] ;
+ CBNZ W2,L0      | CBNZ W2,L1      ;
+exists (~x=2)

@@ -1,0 +1,7 @@
+AArch64 LDADD-counter
+"Atomic increments never lose updates"
+{ 0:X1=x; 1:X1=x; }
+ P0               | P1               ;
+ MOV W0,#1        | MOV W0,#1        ;
+ LDADD W0,W2,[X1] | LDADD W0,W2,[X1] ;
+exists (~x=2)

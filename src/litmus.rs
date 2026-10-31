@@ -1,0 +1,522 @@
+//! Parser for herd-style AArch64 litmus tests.
+//!
+//! ```text
+//! AArch64 MP
+//! { 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+//!  P0          | P1          ;
+//!  MOV W0,#1   | LDR W0,[X1] ;
+//!  STR W0,[X1] | LDR W2,[X3] ;
+//!  MOV W2,#1   |             ;
+//!  STR W2,[X3] |             ;
+//! exists (1:X0=1 /\ 1:X2=0)
+//! ```
+
+use crate::asm::{self, Result};
+use crate::isa::Instr;
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// Base address of the first named location; each further one is `SYM_STRIDE` higher.
+pub const SYM_BASE: u64 = 0x1000;
+pub const SYM_STRIDE: u64 = 0x100;
+
+/// Something observable in a final state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Obs {
+    Reg(usize, u8),
+    Mem(u64),
+}
+
+#[derive(Clone, Debug)]
+pub enum Prop {
+    True,
+    False,
+    Eq(Obs, u64),
+    Not(Box<Prop>),
+    And(Box<Prop>, Box<Prop>),
+    Or(Box<Prop>, Box<Prop>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quant {
+    Exists,
+    NotExists,
+    Forall,
+}
+
+#[derive(Clone, Debug)]
+pub struct Condition {
+    pub quant: Quant,
+    pub prop: Prop,
+}
+
+#[derive(Clone, Debug)]
+pub struct Test {
+    pub name: String,
+    pub threads: Vec<Vec<Instr>>,
+    pub init_regs: Vec<[u64; 31]>,
+    pub init_mem: BTreeMap<u64, u64>,
+    pub symbols: Vec<(String, u64)>,
+    pub locations: Vec<Obs>,
+    pub condition: Option<Condition>,
+}
+
+impl Prop {
+    pub fn eval(&self, get: &dyn Fn(Obs) -> u64) -> bool {
+        match self {
+            Prop::True => true,
+            Prop::False => false,
+            Prop::Eq(o, v) => get(*o) == *v,
+            Prop::Not(p) => !p.eval(get),
+            Prop::And(a, b) => a.eval(get) && b.eval(get),
+            Prop::Or(a, b) => a.eval(get) || b.eval(get),
+        }
+    }
+
+    pub fn observables(&self, out: &mut Vec<Obs>) {
+        match self {
+            Prop::True | Prop::False => {}
+            Prop::Eq(o, _) => {
+                if !out.contains(o) {
+                    out.push(*o)
+                }
+            }
+            Prop::Not(p) => p.observables(out),
+            Prop::And(a, b) | Prop::Or(a, b) => {
+                a.observables(out);
+                b.observables(out)
+            }
+        }
+    }
+}
+
+impl Test {
+    pub fn symbol_name(&self, addr: u64) -> Option<&str> {
+        self.symbols.iter().find(|(_, a)| *a == addr).map(|(n, _)| n.as_str())
+    }
+
+    pub fn obs_name(&self, o: Obs) -> String {
+        match o {
+            Obs::Reg(t, r) => format!("{}:X{}", t, r),
+            Obs::Mem(a) => match self.symbol_name(a) {
+                Some(n) => n.to_string(),
+                None => format!("[{:#x}]", a),
+            },
+        }
+    }
+
+    pub fn value_name(&self, v: u64) -> String {
+        match self.symbol_name(v) {
+            Some(n) => n.to_string(),
+            None => format!("{}", v as i64),
+        }
+    }
+
+    /// The observables reported in final states: the `locations` clause
+    /// plus everything the condition mentions (or, without either, all
+    /// named memory locations).
+    pub fn observables(&self) -> Vec<Obs> {
+        let mut out = self.locations.clone();
+        if let Some(c) = &self.condition {
+            c.prop.observables(&mut out);
+        }
+        if out.is_empty() {
+            out = self.symbols.iter().map(|(_, a)| Obs::Mem(*a)).collect();
+        }
+        out
+    }
+}
+
+impl fmt::Display for Quant {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Quant::Exists => "exists",
+            Quant::NotExists => "~exists",
+            Quant::Forall => "forall",
+        })
+    }
+}
+
+struct Symbols {
+    syms: Vec<(String, u64)>,
+}
+
+impl Symbols {
+    fn get(&mut self, name: &str) -> u64 {
+        if let Some((_, a)) = self.syms.iter().find(|(n, _)| n == name) {
+            return *a;
+        }
+        let a = SYM_BASE + SYM_STRIDE * self.syms.len() as u64;
+        self.syms.push((name.to_string(), a));
+        a
+    }
+
+    fn value(&mut self, s: &str) -> Result<u64> {
+        let s = s.trim();
+        if s.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+            Ok(asm::parse_int(s)? as u64)
+        } else if is_ident(s) {
+            Ok(self.get(s))
+        } else {
+            Err(format!("bad value '{}'", s))
+        }
+    }
+}
+
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().unwrap().is_ascii_alphabetic()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// Parse `N:Xr` / `N:Wr`.
+fn parse_thread_reg(s: &str) -> Option<(usize, u8)> {
+    let (t, r) = s.trim().split_once(':')?;
+    let t: usize = t.trim().parse().ok()?;
+    let r = asm::parse_reg(r).ok()?;
+    if r.idx > 30 {
+        return None;
+    }
+    Some((t, r.idx))
+}
+
+fn strip_comments(src: &str) -> String {
+    // Remove (* ... *) comments and // line comments.
+    let mut out = String::new();
+    let mut rest = src;
+    while let Some(i) = rest.find("(*") {
+        out.push_str(&rest[..i]);
+        match rest[i..].find("*)") {
+            Some(j) => rest = &rest[i + j + 2..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out.lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn parse(src: &str) -> Result<Test> {
+    let src = strip_comments(src);
+    let mut lines = src.lines().peekable();
+
+    // Header: "AArch64 NAME"
+    let header = loop {
+        match lines.next() {
+            Some(l) if l.trim().is_empty() => continue,
+            Some(l) => break l.trim().to_string(),
+            None => return Err("empty test".into()),
+        }
+    };
+    let mut hw = header.split_whitespace();
+    let arch = hw.next().unwrap_or("");
+    if !arch.eq_ignore_ascii_case("AArch64") {
+        return Err(format!("unsupported architecture '{}' (expected AArch64)", arch));
+    }
+    let name = hw.next().unwrap_or("unnamed").to_string();
+
+    // Skip metadata until the init block.
+    let mut init_text = String::new();
+    let mut found = false;
+    for l in lines.by_ref() {
+        if let Some(i) = l.find('{') {
+            let after = &l[i + 1..];
+            if let Some(j) = after.find('}') {
+                init_text.push_str(&after[..j]);
+                found = true;
+                break;
+            }
+            init_text.push_str(after);
+            init_text.push('\n');
+            for l2 in lines.by_ref() {
+                if let Some(j) = l2.find('}') {
+                    init_text.push_str(&l2[..j]);
+                    found = true;
+                    break;
+                }
+                init_text.push_str(l2);
+                init_text.push('\n');
+            }
+            break;
+        }
+    }
+    if !found {
+        return Err("missing init block { ... }".into());
+    }
+
+    let mut syms = Symbols { syms: Vec::new() };
+    let mut reg_inits: Vec<(usize, u8, u64)> = Vec::new();
+    let mut init_mem = BTreeMap::new();
+    for stmt in init_text.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let (lhs, rhs) = match stmt.split_once('=') {
+            Some((l, r)) => (l.trim(), Some(r.trim())),
+            None => (stmt, None),
+        };
+        // Drop C-like type prefixes such as "int", "uint64_t", "int64_t*".
+        let lhs = lhs.split_whitespace().last().unwrap_or("").trim_start_matches('*');
+        if let Some((t, r)) = parse_thread_reg(lhs) {
+            let v = match rhs {
+                Some(r) => syms.value(r)?,
+                None => 0,
+            };
+            reg_inits.push((t, r, v));
+        } else {
+            let lname = lhs.trim_start_matches('[').trim_end_matches(']');
+            if !is_ident(lname) {
+                return Err(format!("bad init statement '{}'", stmt));
+            }
+            let a = syms.get(lname);
+            let v = match rhs {
+                Some(r) => syms.value(r)?,
+                None => 0,
+            };
+            init_mem.insert(a, v);
+        }
+    }
+
+    // Thread header "P0 | P1 ;"
+    let thead = loop {
+        match lines.next() {
+            Some(l) if l.trim().is_empty() => continue,
+            Some(l) => break l.to_string(),
+            None => return Err("missing thread header".into()),
+        }
+    };
+    let cols: Vec<String> = thead.trim().trim_end_matches(';').split('|').map(|c| c.trim().to_string()).collect();
+    for (i, c) in cols.iter().enumerate() {
+        if !c.eq_ignore_ascii_case(&format!("P{}", i)) {
+            return Err(format!("bad thread header '{}'", thead.trim()));
+        }
+    }
+    let n = cols.len();
+    let mut code: Vec<Vec<String>> = vec![Vec::new(); n];
+
+    // Code lines until the final section.
+    let mut rest = String::new();
+    while let Some(l) = lines.next() {
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if ["exists", "~exists", "forall", "locations", "filter", "~ exists"]
+            .iter()
+            .any(|k| lower.starts_with(k))
+        {
+            rest.push_str(l);
+            rest.push('\n');
+            for l2 in lines.by_ref() {
+                rest.push_str(l2);
+                rest.push('\n');
+            }
+            break;
+        }
+        let t = t.strip_suffix(';').unwrap_or(t);
+        let cells: Vec<&str> = t.split('|').collect();
+        if cells.len() > n {
+            return Err(format!("too many columns in line '{}'", l.trim()));
+        }
+        for (i, c) in cells.iter().enumerate() {
+            if !c.trim().is_empty() {
+                code[i].push(c.trim().to_string());
+            }
+        }
+    }
+
+    let mut threads = Vec::new();
+    for (i, c) in code.iter().enumerate() {
+        threads.push(asm::assemble(c).map_err(|e| format!("P{}: {}", i, e))?);
+    }
+    let mut init_regs = vec![[0u64; 31]; n];
+    for (t, r, v) in reg_inits {
+        if t >= n {
+            return Err(format!("init refers to nonexistent thread {}", t));
+        }
+        init_regs[t][r as usize] = v;
+    }
+
+    let (locations, condition) = parse_final(&rest, &mut syms)?;
+    let mut mentioned = locations.clone();
+    if let Some(c) = &condition {
+        c.prop.observables(&mut mentioned);
+    }
+    for o in mentioned {
+        if let Obs::Reg(t, _) = o {
+            if t >= n {
+                return Err(format!("final condition refers to nonexistent thread {}", t));
+            }
+        }
+    }
+    for (_, a) in &syms.syms {
+        init_mem.entry(*a).or_insert(0);
+    }
+
+    Ok(Test { name, threads, init_regs, init_mem, symbols: syms.syms, locations, condition })
+}
+
+fn tokenize(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let cs: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && cs.get(i + 1) == Some(&'\\') {
+            toks.push("/\\".into());
+            i += 2;
+        } else if c == '\\' && cs.get(i + 1) == Some(&'/') {
+            toks.push("\\/".into());
+            i += 2;
+        } else if c == '=' && cs.get(i + 1) == Some(&'=') {
+            toks.push("=".into());
+            i += 2;
+        } else if "()[]~=;".contains(c) {
+            toks.push(c.to_string());
+            i += 1;
+        } else {
+            let st = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || "_:.-".contains(cs[i])) {
+                i += 1;
+            }
+            if i == st {
+                toks.push(c.to_string());
+                i += 1;
+            } else {
+                toks.push(cs[st..i].iter().collect());
+            }
+        }
+    }
+    toks
+}
+
+struct CondParser<'a> {
+    toks: Vec<String>,
+    pos: usize,
+    syms: &'a mut Symbols,
+}
+
+impl CondParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.toks.get(self.pos).map(|s| s.as_str())
+    }
+    fn next(&mut self) -> Result<String> {
+        let t = self.toks.get(self.pos).cloned().ok_or("unexpected end of condition")?;
+        self.pos += 1;
+        Ok(t)
+    }
+    fn expect(&mut self, t: &str) -> Result<()> {
+        let n = self.next()?;
+        if n != t { Err(format!("expected '{}', got '{}'", t, n)) } else { Ok(()) }
+    }
+
+    fn obs(&mut self) -> Result<Obs> {
+        let t = self.next()?;
+        if t == "[" {
+            let n = self.next()?;
+            self.expect("]")?;
+            return Ok(Obs::Mem(self.syms.get(&n)));
+        }
+        if let Some((th, r)) = parse_thread_reg(&t) {
+            return Ok(Obs::Reg(th, r));
+        }
+        if is_ident(&t) {
+            return Ok(Obs::Mem(self.syms.get(&t)));
+        }
+        Err(format!("bad observable '{}'", t))
+    }
+
+    fn or(&mut self) -> Result<Prop> {
+        let mut p = self.and()?;
+        while self.peek() == Some("\\/") {
+            self.pos += 1;
+            p = Prop::Or(Box::new(p), Box::new(self.and()?));
+        }
+        Ok(p)
+    }
+    fn and(&mut self) -> Result<Prop> {
+        let mut p = self.unary()?;
+        while self.peek() == Some("/\\") {
+            self.pos += 1;
+            p = Prop::And(Box::new(p), Box::new(self.unary()?));
+        }
+        Ok(p)
+    }
+    fn unary(&mut self) -> Result<Prop> {
+        match self.peek() {
+            Some("~") | Some("not") => {
+                self.pos += 1;
+                Ok(Prop::Not(Box::new(self.unary()?)))
+            }
+            Some("(") => {
+                self.pos += 1;
+                let p = self.or()?;
+                self.expect(")")?;
+                Ok(p)
+            }
+            Some("true") => {
+                self.pos += 1;
+                Ok(Prop::True)
+            }
+            Some("false") => {
+                self.pos += 1;
+                Ok(Prop::False)
+            }
+            _ => {
+                let o = self.obs()?;
+                self.expect("=")?;
+                let v = self.next()?;
+                Ok(Prop::Eq(o, self.syms.value(&v)?))
+            }
+        }
+    }
+}
+
+fn parse_final(s: &str, syms: &mut Symbols) -> Result<(Vec<Obs>, Option<Condition>)> {
+    let mut p = CondParser { toks: tokenize(s), pos: 0, syms };
+    let mut locations = Vec::new();
+    let mut condition = None;
+    while let Some(t) = p.peek().map(|s| s.to_string()) {
+        match t.as_str() {
+            "locations" => {
+                p.pos += 1;
+                p.expect("[")?;
+                while p.peek() != Some("]") {
+                    if p.peek() == Some(";") {
+                        p.pos += 1;
+                        continue;
+                    }
+                    let o = p.obs()?;
+                    locations.push(o);
+                }
+                p.pos += 1;
+            }
+            "exists" | "forall" | "~" => {
+                let quant = if t == "~" {
+                    p.pos += 1;
+                    p.expect("exists")?;
+                    Quant::NotExists
+                } else {
+                    p.pos += 1;
+                    if t == "exists" { Quant::Exists } else { Quant::Forall }
+                };
+                let prop = p.or()?;
+                condition = Some(Condition { quant, prop });
+            }
+            "filter" => return Err("filter clauses are not supported".into()),
+            _ => return Err(format!("unexpected '{}' in final section", t)),
+        }
+    }
+    Ok((locations, condition))
+}

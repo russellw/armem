@@ -1,0 +1,15 @@
+AArch64 spinlock-correct
+"Two threads increment a counter inside an LDAXR/STXR spinlock released with STLR"
+{ 0:X1=lock; 0:X3=c; 1:X1=lock; 1:X3=c; }
+ P0                | P1                ;
+ MOV W5,#1         | MOV W5,#1         ;
+ L0:               | L1:               ;
+ LDAXR W0,[X1]     | LDAXR W0,[X1]     ;
+ CBNZ W0,L0        | CBNZ W0,L1        ;
+ STXR W6,W5,[X1]   | STXR W6,W5,[X1]   ;
+ CBNZ W6,L0        | CBNZ W6,L1        ;
+ LDR W2,[X3]       | LDR W2,[X3]       ;
+ ADD W2,W2,#1      | ADD W2,W2,#1      ;
+ STR W2,[X3]       | STR W2,[X3]       ;
+ STLR WZR,[X1]     | STLR WZR,[X1]     ;
+exists (~c=2)

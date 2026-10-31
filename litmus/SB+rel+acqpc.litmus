@@ -1,0 +1,8 @@
+AArch64 SB+rel+acqpc
+"STLR followed by LDAPR is not ordered (RCpc)"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0            | P1            ;
+ MOV W0,#1     | MOV W0,#1     ;
+ STLR W0,[X1]  | STLR W0,[X1]  ;
+ LDAPR W2,[X3] | LDAPR W2,[X3] ;
+exists (0:X2=0 /\ 1:X2=0)

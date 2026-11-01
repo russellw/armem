@@ -6,9 +6,10 @@
 //! including an unallocated or UNPREDICTABLE one, is an error rather
 //! than a guess.
 //!
-//! Where the architecture uses register number 31 as the stack pointer
-//! (base registers, and the destination and first source of `ADD`/`SUB`
-//! immediate), decoding fails, because the emulator does not model SP yet.
+//! Register number 31 is the zero register or the stack pointer, depending
+//! on the operand: base registers, the destination and first source of
+//! `ADD`/`SUB` (immediate and extended register), and the destination of
+//! a logical immediate are SP.
 //!
 //! `ADR` and `ADRP` compute an address from the PC, so they decode only when
 //! the code's load address is known (`decode_at`, `decode_program_at`), and
@@ -45,8 +46,8 @@ fn zr(i: u32, wide: bool) -> RegOp {
 }
 
 /// A register field in which 31 means SP.
-fn sp(i: u32, wide: bool) -> Result<RegOp> {
-    if i == 31 { Err("uses SP, which is not modeled yet".into()) } else { Ok(zr(i, wide)) }
+fn sp(i: u32, wide: bool) -> RegOp {
+    RegOp { idx: if i == 31 { SP } else { i as u8 }, wide }
 }
 
 fn unsupported<T>() -> Result<T> {
@@ -208,9 +209,9 @@ fn data_imm(w: u32) -> Result<Instr> {
         0b010 => {
             let flags = bit(w, 29);
             let imm = (bits(w, 21, 10) as u64) << if bit(w, 22) { 12 } else { 0 };
-            let rd = if flags { zr(rd, wide) } else { sp(rd, wide)? };
+            let rd = if flags { zr(rd, wide) } else { sp(rd, wide) };
             let op = if bit(w, 30) { AluOp::Sub } else { AluOp::Add };
-            Ok(Instr::Alu { op, rd, rn: sp(rn, wide)?, op2: Operand::Imm(imm), flags })
+            Ok(Instr::Alu { op, rd, rn: sp(rn, wide), op2: Operand::Imm(imm), flags })
         }
         // Logical (immediate)
         0b100 => {
@@ -218,7 +219,7 @@ fn data_imm(w: u32) -> Result<Instr> {
             let Some(imm) = bitmask_imm(bit(w, 22), bits(w, 21, 16), bits(w, 15, 10), wide) else {
                 return unsupported();
             };
-            let rd = if opc == 0b11 { zr(rd, wide) } else { sp(rd, wide)? };
+            let rd = if opc == 0b11 { zr(rd, wide) } else { sp(rd, wide) };
             let rn = zr(rn, wide);
             let op = [AluOp::And, AluOp::Orr, AluOp::Eor, AluOp::And][opc as usize];
             if op == AluOp::Orr && rn.idx == ZR {
@@ -360,8 +361,8 @@ fn data_reg(w: u32) -> Result<Instr> {
             0b011 | 0b111 => Extend::Lsl(amt as u8),
             _ => return unsupported(),
         };
-        let rd = if flags { zr(rd, wide) } else { sp(rd, wide)? };
-        return Ok(Instr::Alu { op, rd, rn: sp(rn, wide)?, op2: Operand::RegExt(rm, ext), flags });
+        let rd = if flags { zr(rd, wide) } else { sp(rd, wide) };
+        return Ok(Instr::Alu { op, rd, rn: sp(rn, wide), op2: Operand::RegExt(rm, ext), flags });
     }
     // Data-processing (2 source): LSLV, LSRV, ASRV.
     if bits(w, 30, 21) == 0b0011010110 {
@@ -408,8 +409,14 @@ fn size_field(s: u32) -> Size {
     [Size::B1, Size::B2, Size::B4, Size::B8][s as usize]
 }
 
-fn plain_addr(rn: u32) -> Result<Addr> {
-    Ok(Addr { base: sp(rn, true)?, offset: Offset::Imm(0), writeback: Writeback::None })
+fn plain_addr(rn: u32) -> Addr {
+    Addr { base: sp(rn, true), offset: Offset::Imm(0), writeback: Writeback::None }
+}
+
+/// Is base register `rn` (in which 31 is SP) the same as data register
+/// `rt` (in which 31 is the zero register)?
+fn same_base(rt: u32, rn: u32) -> bool {
+    rt == rn && rn != 31
 }
 
 fn load_store(w: u32) -> Result<Instr> {
@@ -425,7 +432,7 @@ fn load_store(w: u32) -> Result<Instr> {
             let size = bits(w, 31, 30);
             if bits(w, 25, 24) == 0b01 {
                 let off = (bits(w, 21, 10) as i64) << size;
-                let addr = Addr { base: sp(rn, true)?, offset: Offset::Imm(off), writeback: Writeback::None };
+                let addr = Addr { base: sp(rn, true), offset: Offset::Imm(off), writeback: Writeback::None };
                 return single(w, addr);
             }
             if bits(w, 25, 24) != 0 {
@@ -433,14 +440,14 @@ fn load_store(w: u32) -> Result<Instr> {
             }
             if !bit(w, 21) {
                 let imm = sext(bits(w, 20, 12), 9);
-                let base = sp(rn, true)?;
+                let base = sp(rn, true);
                 let addr = match bits(w, 11, 10) {
                     0b00 => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::None },
                     0b01 => Addr { base, offset: Offset::Imm(0), writeback: Writeback::Post(imm) },
                     0b11 => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::Pre },
                     _ => return unsupported(), // LDTR/STTR
                 };
-                if addr.writeback != Writeback::None && rt == rn {
+                if addr.writeback != Writeback::None && same_base(rt, rn) {
                     return unpredictable();
                 }
                 return single(w, addr);
@@ -456,7 +463,7 @@ fn load_store(w: u32) -> Result<Instr> {
                         _ => return unsupported(),
                     };
                     let rm = zr(bits(w, 20, 16), option & 1 == 1);
-                    let addr = Addr { base: sp(rn, true)?, offset: Offset::Reg(rm, ext), writeback: Writeback::None };
+                    let addr = Addr { base: sp(rn, true), offset: Offset::Reg(rm, ext), writeback: Writeback::None };
                     single(w, addr)
                 }
                 0b00 => atomic(w),
@@ -495,7 +502,7 @@ fn atomic(w: u32) -> Result<Instr> {
     let wide = size == 3;
     let (acquire, release) = (bit(w, 23), bit(w, 22));
     let (rs, rt) = (zr(bits(w, 20, 16), wide), zr(bits(w, 4, 0), wide));
-    let addr = plain_addr(bits(w, 9, 5))?;
+    let addr = plain_addr(bits(w, 9, 5));
     let size = size_field(size);
     let opc = bits(w, 14, 12);
     let op = if !bit(w, 15) {
@@ -517,7 +524,7 @@ fn exclusive_ordered(w: u32) -> Result<Instr> {
     let size = bits(w, 31, 30);
     let (o2, l, o1, o0) = (bit(w, 23), bit(w, 22), bit(w, 21), bit(w, 15));
     let (rs, rt2, rn, rt) = (bits(w, 20, 16), bits(w, 14, 10), bits(w, 9, 5), bits(w, 4, 0));
-    let addr = plain_addr(rn)?;
+    let addr = plain_addr(rn);
     let wide = size == 3;
     let sz = size_field(size);
     match (o2, o1) {
@@ -533,7 +540,7 @@ fn exclusive_ordered(w: u32) -> Result<Instr> {
                 let kind = if o0 { LoadKind::Acquire } else { LoadKind::Plain };
                 Ok(Instr::Load { rt: zr(rt, wide), addr, size: sz, signed: false, kind, excl: true })
             } else {
-                if rs == rt || rs == rn {
+                if rs == rt || same_base(rs, rn) {
                     return unpredictable();
                 }
                 Ok(Instr::StoreExcl { rs: zr(rs, false), rt: zr(rt, wide), addr, size: sz, release: o0 })
@@ -555,7 +562,7 @@ fn exclusive_ordered(w: u32) -> Result<Instr> {
                 }
                 Ok(Instr::LoadExclPair { rt: rt1, rt2, addr, acquire: o0 })
             } else {
-                if rs == rt || rs == rt2.idx as u32 || rs == rn {
+                if rs == rt || rs == rt2.idx as u32 || same_base(rs, rn) {
                     return unpredictable();
                 }
                 Ok(Instr::StoreExclPair { rs: zr(rs, false), rt: rt1, rt2, addr, release: o0 })
@@ -598,13 +605,13 @@ fn pair(w: u32) -> Result<Instr> {
         _ => return unsupported(),
     };
     let imm = sext(bits(w, 21, 15), 7) << if opc == 0b10 { 3 } else { 2 };
-    let base = sp(rn, true)?;
+    let base = sp(rn, true);
     let addr = match mode {
         0b00 | 0b10 => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::None },
         0b01 => Addr { base, offset: Offset::Imm(0), writeback: Writeback::Post(imm) },
         _ => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::Pre },
     };
-    if (load && rt == rt2) || (addr.writeback != Writeback::None && (rt == rn || rt2 == rn)) {
+    if (load && rt == rt2) || (addr.writeback != Writeback::None && (same_base(rt, rn) || same_base(rt2, rn))) {
         return unpredictable();
     }
     let (rt, rt2) = (zr(rt, wide), zr(rt2, wide));
@@ -674,10 +681,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sp() {
-        // ldr x0, [sp]; add sp, sp, #16; stp x29, x30, [sp, #-16]!
-        for w in [0xf940_03e0u32, 0x9100_43ff, 0xa9bf_7bfd] {
-            assert!(decode(w, 0).unwrap_err().contains("SP"), "{:#x}", w);
+    fn stack_pointer() {
+        let x = |i| RegOp { idx: i, wide: true };
+        let sp = x(SP);
+        // Encodings from llvm-mc.
+        let cases = [
+            // ldr x0, [sp]
+            (0xf940_03e0u32, Instr::Load { rt: x(0), addr: Addr { base: sp, offset: Offset::Imm(0), writeback: Writeback::None }, size: Size::B8, signed: false, kind: LoadKind::Plain, excl: false }),
+            // add sp, sp, #16
+            (0x9100_43ff, Instr::Alu { op: AluOp::Add, rd: sp, rn: sp, op2: Operand::Imm(16), flags: false }),
+            // stp x29, x30, [sp, #-16]!
+            (0xa9bf_7bfd, Instr::StorePair { rt: x(29), rt2: x(30), addr: Addr { base: sp, offset: Offset::Imm(-16), writeback: Writeback::Pre }, size: Size::B8 }),
+            // mov x29, sp
+            (0x9100_03fd, Instr::Alu { op: AluOp::Add, rd: x(29), rn: sp, op2: Operand::Imm(0), flags: false }),
+            // cmp sp, #16 (the destination is XZR)
+            (0xf100_43ff, Instr::Alu { op: AluOp::Sub, rd: x(ZR), rn: sp, op2: Operand::Imm(16), flags: true }),
+            // ldr xzr, [sp], #8: XZR and SP are different registers
+            (0xf840_87ff, Instr::Load { rt: x(ZR), addr: Addr { base: sp, offset: Offset::Imm(0), writeback: Writeback::Post(8) }, size: Size::B8, signed: false, kind: LoadKind::Plain, excl: false }),
+        ];
+        for (w, want) in cases {
+            assert_eq!(decode(w, 0), Ok(want), "{:#x}", w);
         }
+        // ldr x0, [x0], #8 is UNPREDICTABLE.
+        assert!(decode(0xf840_8400, 0).unwrap_err().contains("UNPREDICTABLE"));
     }
 }

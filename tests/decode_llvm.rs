@@ -43,6 +43,10 @@ fn tool(suffix: &str, name: &str) -> Command {
 fn normalize(i: Instr) -> Instr {
     let op2 = |o: Operand| match o {
         Operand::RegExt(r, Extend::Lsl(0)) => Operand::Reg(r),
+        // UXTW of a W register is a plain shift (LLVM prints it as LSL when
+        // SP is an operand).
+        Operand::RegExt(r, Extend::Uxtw(0)) if !r.wide => Operand::Reg(r),
+        Operand::RegExt(r, Extend::Uxtw(s)) if !r.wide => Operand::RegExt(r, Extend::Lsl(s)),
         o => o,
     };
     match i {

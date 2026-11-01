@@ -7,7 +7,8 @@
 use std::fmt;
 
 /// A general-purpose register operand. `idx` 0..=30 are X0..X30,
-/// 31 is the zero register (XZR/WZR). `wide` selects X (64-bit) vs W (32-bit).
+/// 31 is the zero register (XZR/WZR) and 32 the stack pointer (SP/WSP).
+/// `wide` selects X (64-bit) vs W (32-bit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RegOp {
     pub idx: u8,
@@ -15,11 +16,14 @@ pub struct RegOp {
 }
 
 pub const ZR: u8 = 31;
+pub const SP: u8 = 32;
 
 impl fmt::Display for RegOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let p = if self.wide { 'X' } else { 'W' };
-        if self.idx == ZR {
+        if self.idx == SP {
+            write!(f, "{}", if self.wide { "SP" } else { "WSP" })
+        } else if self.idx == ZR {
             write!(f, "{}ZR", p)
         } else {
             write!(f, "{}{}", p, self.idx)
@@ -272,8 +276,8 @@ impl RmwOp {
 }
 
 impl Instr {
-    /// The general-purpose registers (0..=30) the instruction writes,
-    /// including base register writeback.
+    /// The registers (0..=30, or `SP`) the instruction writes, including
+    /// base register writeback.
     pub fn writes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut reg = |r: RegOp| {

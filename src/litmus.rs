@@ -531,13 +531,23 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
     }
 
     let (locations, mut condition) = parse_final(&rest, &mut syms)?;
-    for (n, a) in &syms.syms {
-        if syms.preloaded.contains_key(n) {
+    let (stack_lo, stack_hi) = crate::core::stack_area(n);
+    for (name, a) in &syms.syms {
+        if syms.preloaded.contains_key(name) {
             continue;
         }
         if let Some(r) = init_mem.overlapping(*a, SYM_STRIDE) {
-            return Err(format!("location '{}' at {:#x} would overlap preloaded {} at {:#x}", n, a, r.origin, r.addr));
+            return Err(format!("location '{}' at {:#x} would overlap preloaded {} at {:#x}", name, a, r.origin, r.addr));
         }
+        if *a < stack_hi && a + SYM_STRIDE > stack_lo {
+            return Err(format!("location '{}' at {:#x} would overlap the stacks", name, a));
+        }
+    }
+    if let Some(r) = init_mem.overlapping(stack_lo, stack_hi - stack_lo) {
+        return Err(format!(
+            "preloaded {} at {:#x} overlaps the stacks at {:#x}..{:#x}",
+            r.origin, r.addr, stack_lo, stack_hi
+        ));
     }
     if let Some(c) = &mut condition {
         normalize(&mut c.prop, &loc_types);

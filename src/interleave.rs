@@ -93,7 +93,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             .threads
             .iter()
             .enumerate()
-            .map(|(i, _)| Thread { core: Core::new(test.init_regs[i]), buf: Vec::new(), mon: None })
+            .map(|(i, _)| Thread { core: Core::new(test.init_regs[i], i, test.threads.len()), buf: Vec::new(), mon: None })
             .collect(),
         mem: BTreeMap::new(),
     };
@@ -139,6 +139,12 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             let ok = match step {
                 Step::Done => false,
                 Step::Local { .. } => true,
+                Step::Fault(e) => {
+                    // The execution cannot complete.
+                    results.faults.insert(format!("P{}: {}", tid, e));
+                    stuck = true;
+                    false
+                }
                 Step::Mem(op) => match op {
                     MemOp::Load { addr, rt, size, signed, excl, .. } => {
                         let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);

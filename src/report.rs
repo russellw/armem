@@ -59,6 +59,9 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
         if o.truncated {
             writeln!(s, "WARNING: some executions exceeded the fuel limit; results may be incomplete").unwrap();
         }
+        for f in &o.faults {
+            writeln!(s, "FAULT: {}", f).unwrap();
+        }
         writeln!(s).unwrap();
     }
     if let Some(line) = comparison(test, results) {
@@ -93,6 +96,9 @@ pub fn summary(test: &Test, results: &[(Model, Outcomes)]) -> String {
         write!(s, " {}:{:<9}", m.name(), observation(o, test)).unwrap();
         if o.truncated {
             s.push_str("(trunc)");
+        }
+        if !o.faults.is_empty() {
+            s.push_str("(fault)");
         }
     }
     if let (Some((_, a)), Some((_, r))) = (

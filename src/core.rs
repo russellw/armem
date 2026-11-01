@@ -5,6 +5,7 @@
 //! dependencies; the reference models (SC/TSO) simply ignore them.
 
 use crate::isa::*;
+use std::collections::BTreeMap;
 
 /// A timestamp/view. 0 is the initial state of memory.
 pub type View = u32;
@@ -34,11 +35,111 @@ impl RV {
     }
 }
 
+/// Start of the stack area. It holds `threads + 2` slots of `STACK_SIZE`
+/// bytes: thread `i`'s stack is slot `i + 1`, and the first and last slots
+/// are guards.
+pub const STACK_AREA: u64 = 0x7f00_0000_0000;
+pub const STACK_SIZE: u64 = 0x10_0000;
+
+/// The stack area of a test with `threads` threads: `[start, end)`.
+pub fn stack_area(threads: usize) -> (u64, u64) {
+    (STACK_AREA, STACK_AREA + (threads as u64 + 2) * STACK_SIZE)
+}
+
+/// Thread `tid`'s stack: `[lo, hi)`. Its initial SP is `hi`.
+pub fn stack_range(tid: usize) -> (u64, u64) {
+    let lo = STACK_AREA + (tid as u64 + 1) * STACK_SIZE;
+    (lo, lo + STACK_SIZE)
+}
+
+/// A thread's stack, which is private to the thread.
+///
+/// Plain loads and stores within it are performed by the core itself,
+/// without the memory model: no other thread can observe them, so they
+/// need no place in the order of memory writes. This keeps compiled code's
+/// stack traffic from multiplying the states the models explore. A load
+/// reads the thread's latest store to each byte (or 0) and, as when a
+/// load is satisfied by forwarding from a store, takes on the store's
+/// address and data dependencies (Arm's `(addr | data); rfi`).
+///
+/// It is a fault for a thread to access the stack area outside its own
+/// stack (another thread's stack, a guard slot, or across the edge of its
+/// own), or to access its stack with an exclusive, atomic, acquire or
+/// release instruction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Stack {
+    pub lo: u64,
+    pub hi: u64,
+    /// The whole stack area.
+    pub area: (u64, u64),
+    /// Bytes stored so far, with the views of the store (as in `RV`).
+    bytes: BTreeMap<u64, (u8, View, View)>,
+}
+
+/// Where an access goes.
+enum Place {
+    Memory,
+    Stack,
+    Fault(String),
+}
+
+impl Stack {
+    pub fn new(tid: usize, threads: usize) -> Stack {
+        let (lo, hi) = stack_range(tid);
+        Stack { lo, hi, area: stack_area(threads), bytes: BTreeMap::new() }
+    }
+
+    /// Classify an access of `len` bytes at `a`. `plain`: a load or store
+    /// with no exclusive, atomic or ordering semantics.
+    fn place(&self, a: u64, len: u64, plain: bool) -> Place {
+        let Some(end) = a.checked_add(len) else {
+            return Place::Memory;
+        };
+        if a >= self.lo && end <= self.hi {
+            if plain {
+                return Place::Stack;
+            }
+            return Place::Fault(format!(
+                "exclusive, atomic, acquire or release access to its stack at {:#x}, which is not supported",
+                a
+            ));
+        }
+        if a < self.area.1 && end > self.area.0 {
+            return Place::Fault(format!(
+                "{}-byte access at {:#x} is outside its stack {:#x}..{:#x} (a stack overflow, or another thread's stack)",
+                len, a, self.lo, self.hi
+            ));
+        }
+        Place::Memory
+    }
+
+    /// Read `n` bytes at `a` (within the stack), with the dependencies
+    /// of the stores they come from.
+    fn read(&self, a: u64, n: u64) -> (u64, View, View) {
+        let (mut val, mut view, mut pick) = (0u64, 0, 0);
+        for b in (a..a + n).rev() {
+            let (v, w, p) = self.bytes.get(&b).copied().unwrap_or((0, 0, 0));
+            val = val << 8 | v as u64;
+            view = view.max(w);
+            pick = pick.max(p);
+        }
+        (val, view, pick)
+    }
+
+    fn write(&mut self, a: u64, n: u64, val: u64, view: View, pick: View) {
+        for i in 0..n {
+            self.bytes.insert(a + i, ((val >> (8 * i)) as u8, view, pick));
+        }
+    }
+}
+
 /// Architectural state of a thread that is independent of the memory model.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Core {
     pub pc: usize,
     pub regs: [RV; 31],
+    pub sp: RV,
+    pub stack: Stack,
     /// NZCV flags in bits 3..0 of `val`.
     pub flags: RV,
     /// Number of instructions executed (bounded by the fuel limit).
@@ -83,9 +184,12 @@ pub enum MemOp {
 pub enum Step {
     /// The thread has finished.
     Done,
-    /// A local instruction was executed. `ctrl` is the (pick) view of a
-    /// branch condition, if the instruction was a conditional branch.
+    /// A local instruction was executed. `ctrl` is a (pick) view that later
+    /// writes must be ordered after: that of a conditional branch's
+    /// condition, or of the address of a stack access.
     Local { ctrl: Option<View> },
+    /// The thread cannot continue: the message says why.
+    Fault(String),
     /// The next instruction needs the memory model. The pc has not been
     /// advanced; the model must call `Core::retire` after performing it.
     Mem(MemOp),
@@ -101,27 +205,33 @@ fn extend(v: u64, e: Extend) -> u64 {
 }
 
 impl Core {
-    pub fn new(regs: [u64; 31]) -> Core {
+    /// Thread `tid` of `threads`, with its stack pointer at the top of its
+    /// (empty) stack.
+    pub fn new(regs: [u64; 31], tid: usize, threads: usize) -> Core {
         let mut r = [RV::default(); 31];
         for (i, v) in regs.iter().enumerate() {
             r[i].val = *v;
         }
-        Core { pc: 0, regs: r, flags: RV::default(), steps: 0 }
+        let stack = Stack::new(tid, threads);
+        Core { pc: 0, regs: r, sp: RV::imm(stack.hi), stack, flags: RV::default(), steps: 0 }
     }
 
     pub fn get(&self, r: RegOp) -> RV {
-        if r.idx == ZR {
-            return RV::default();
-        }
-        let v = self.regs[r.idx as usize];
+        let v = match r.idx {
+            ZR => return RV::default(),
+            SP => self.sp,
+            i => self.regs[i as usize],
+        };
         RV { val: Size::of(r).mask(v.val), ..v }
     }
 
     pub fn set(&mut self, r: RegOp, v: RV) {
-        if r.idx == ZR {
-            return;
+        let v = RV { val: Size::of(r).mask(v.val), ..v };
+        match r.idx {
+            ZR => {}
+            SP => self.sp = v,
+            i => self.regs[i as usize] = v,
         }
-        self.regs[r.idx as usize] = RV { val: Size::of(r).mask(v.val), ..v };
     }
 
     fn operand(&self, o: Operand, wide: bool) -> RV {
@@ -151,29 +261,92 @@ impl Core {
         RV::joined(b.val.wrapping_add(off.val), b, off)
     }
 
+    /// Perform the base register writeback of `a`, if any.
+    fn writeback(&mut self, a: Addr) {
+        let b = self.get(a.base);
+        let new = match (a.writeback, a.offset) {
+            (Writeback::Pre, Offset::Imm(i)) => Some(b.val.wrapping_add(i as u64)),
+            (Writeback::Post(i), _) => Some(b.val.wrapping_add(i as u64)),
+            _ => None,
+        };
+        if let Some(v) = new {
+            self.set(a.base, RV { val: v, ..b });
+        }
+    }
+
     /// Advance past the current (memory) instruction, performing any base
     /// register writeback.
     pub fn retire(&mut self, prog: &[Instr]) {
-        let addr = match prog[self.pc] {
+        match prog[self.pc] {
             Instr::Load { addr, .. }
             | Instr::Store { addr, .. }
             | Instr::LoadPair { addr, .. }
-            | Instr::StorePair { addr, .. } => Some(addr),
-            _ => None,
-        };
-        if let Some(a) = addr {
-            let b = self.get(a.base);
-            let new = match (a.writeback, a.offset) {
-                (Writeback::Pre, Offset::Imm(i)) => Some(b.val.wrapping_add(i as u64)),
-                (Writeback::Post(i), _) => Some(b.val.wrapping_add(i as u64)),
-                _ => None,
-            };
-            if let Some(v) = new {
-                self.set(a.base, RV { val: v, ..b });
-            }
+            | Instr::StorePair { addr, .. } => self.writeback(addr),
+            _ => {}
         }
         self.pc += 1;
         self.steps += 1;
+    }
+
+    /// Load `size` bytes at `a + off` from the stack.
+    fn stack_load(&self, a: RV, off: u64, size: Size, signed: bool) -> RV {
+        let (v, view, pick) = self.stack.read(a.val + off, size.bytes());
+        let view = view.max(a.view);
+        RV { val: size.extend(v, signed), view, pick: pick.max(a.pick).max(view) }
+    }
+
+    /// Store `size` bytes of `data` at `a + off` on the stack.
+    fn stack_store(&mut self, a: RV, off: u64, size: Size, data: RV) {
+        self.stack.write(a.val + off, size.bytes(), data.val, a.view.max(data.view), a.pick.max(data.pick));
+    }
+
+    /// Execute a plain load or store that is within the thread's stack, or
+    /// return what to do instead: `Some(step)` for an access to memory (or
+    /// a fault).
+    fn stack_access(&mut self, ins: Instr) -> Option<Step> {
+        let (addr, len, plain) = match ins {
+            Instr::Load { addr, size, kind, excl, .. } => (addr, size.bytes(), kind == LoadKind::Plain && !excl),
+            Instr::Store { addr, size, release, .. } => (addr, size.bytes(), !release),
+            Instr::LoadPair { addr, size, .. } | Instr::StorePair { addr, size, .. } => (addr, 2 * size.bytes(), true),
+            Instr::StoreExcl { addr, size, .. } | Instr::Rmw { addr, size, .. } | Instr::Cas { addr, size, .. } => {
+                (addr, size.bytes(), false)
+            }
+            Instr::LoadExclPair { addr, rt, .. } | Instr::StoreExclPair { addr, rt, .. } => {
+                (addr, 2 * Size::of(rt).bytes(), false)
+            }
+            _ => return None,
+        };
+        let a = self.addr(&addr);
+        match self.stack.place(a.val, len, plain) {
+            Place::Memory => return None,
+            Place::Fault(e) => return Some(Step::Fault(e)),
+            Place::Stack => {}
+        }
+        match ins {
+            Instr::Load { rt, size, signed, .. } => {
+                let v = self.stack_load(a, 0, size, signed);
+                self.set(rt, v);
+            }
+            Instr::Store { rt, size, .. } => {
+                let d = self.get(rt);
+                self.stack_store(a, 0, size, d);
+            }
+            Instr::LoadPair { rt, rt2, size, signed, .. } => {
+                let (v1, v2) = (self.stack_load(a, 0, size, signed), self.stack_load(a, size.bytes(), size, signed));
+                self.set(rt, v1);
+                self.set(rt2, v2);
+            }
+            Instr::StorePair { rt, rt2, size, .. } => {
+                let (d1, d2) = (self.get(rt), self.get(rt2));
+                self.stack_store(a, 0, size, d1);
+                self.stack_store(a, size.bytes(), size, d2);
+            }
+            _ => unreachable!("only plain accesses go to the stack"),
+        }
+        self.writeback(addr);
+        self.pc += 1;
+        self.steps += 1;
+        Some(Step::Local { ctrl: Some(a.pick) })
     }
 
     /// Execute the next instruction if it is local, or describe the memory
@@ -182,6 +355,9 @@ impl Core {
         let Some(ins) = prog.get(self.pc) else {
             return Step::Done;
         };
+        if let Some(step) = self.stack_access(*ins) {
+            return step;
+        }
         let mut ctrl = None;
         let mut next = self.pc + 1;
         match *ins {

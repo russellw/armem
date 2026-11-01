@@ -429,9 +429,9 @@ long calls_out(long x) { extern long ext(long); return ext(x) + weak_fn(x) + tls
         assert!(elf.function("ext").unwrap_err().contains("not a function"), "{}", tag);
         assert!(elf.function("tls_var").unwrap_err().contains("not a function"), "{}", tag);
         // Without relocations, a function is extracted; decoding then
-        // stops at the first unsupported instruction (RET, or SP at -O0).
+        // stops at RET, which only a thread may contain.
         let err = elf.decode_function("hidden_fn").unwrap_err();
-        assert!(err.contains("unsupported") || err.contains("SP"), "{}: {}", tag, err);
+        assert!(err.contains("unsupported"), "{}: {}", tag, err);
         cc = clang(&suffix).unwrap();
     }
 }

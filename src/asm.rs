@@ -33,9 +33,21 @@ fn split_operands(s: &str) -> Vec<String> {
     out
 }
 
+/// Parse a general-purpose register or the zero register (not SP).
 pub fn parse_reg(s: &str) -> Result<RegOp> {
+    let r = parse_reg_sp(s)?;
+    if r.idx == SP {
+        return Err(format!("SP is not allowed here: '{}'", s.trim()));
+    }
+    Ok(r)
+}
+
+/// Parse a general-purpose register, the zero register or SP.
+pub fn parse_reg_sp(s: &str) -> Result<RegOp> {
     let u = s.trim().to_ascii_uppercase();
     match u.as_str() {
+        "SP" => return Ok(RegOp { idx: SP, wide: true }),
+        "WSP" => return Ok(RegOp { idx: SP, wide: false }),
         "XZR" => return Ok(RegOp { idx: ZR, wide: true }),
         "WZR" => return Ok(RegOp { idx: ZR, wide: false }),
         _ => {}
@@ -131,7 +143,7 @@ fn parse_addr(s: &str) -> Result<Addr> {
         .and_then(|x| x.strip_suffix(']'))
         .ok_or_else(|| format!("bad address '{}'", s))?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
-    let base = parse_reg(parts[0])?;
+    let base = parse_reg_sp(parts[0])?;
     if base.idx == ZR {
         return Err(format!("base register cannot be XZR: '{}'", s));
     }
@@ -322,12 +334,18 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         return Ok(Instr::BCond { cond: parse_cond(c)?, target: label(labels, &ops[0])? });
     }
 
+    // SP may be the first source of ADD/SUB, and the destination of ADD/SUB
+    // and of AND/ORR/EOR with an immediate, unless they set the flags.
     let alu = |op: AluOp, flags: bool| -> Result<Instr> {
         if !(3..=4).contains(&ops.len()) {
             return Err(format!("{} expects 3 or 4 operands, got {}", m, ops.len()));
         }
         let op2 = parse_op2(&ops[2..], m)?;
-        Ok(Instr::Alu { op, rd: reg(0)?, rn: reg(1)?, op2, flags })
+        let add_sub = matches!(op, AluOp::Add | AluOp::Sub);
+        let logical_imm = matches!(op, AluOp::And | AluOp::Orr | AluOp::Eor) && matches!(op2, Operand::Imm(_));
+        let rd = if !flags && (add_sub || logical_imm) { parse_reg_sp(&ops[0])? } else { reg(0)? };
+        let rn = if add_sub { parse_reg_sp(&ops[1])? } else { reg(1)? };
+        Ok(Instr::Alu { op, rd, rn, op2, flags })
     };
 
     let ins = match m {
@@ -352,11 +370,21 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         }
         "MOV" => {
             want(&ops, 2, m)?;
-            let rd = reg(0)?;
+            let rd = parse_reg_sp(&ops[0])?;
             if ops[1].starts_with('#') {
                 Instr::MovImm { rd, imm: Size::of(rd).mask(parse_imm(&ops[1])? as u64) }
             } else {
-                Instr::MovReg { rd, rn: reg(1)? }
+                let rn = parse_reg_sp(&ops[1])?;
+                if rd.idx == SP || rn.idx == SP {
+                    // An alias of ADD (immediate), as the zero register is not
+                    // allowed with SP.
+                    if rd.idx == ZR || rn.idx == ZR {
+                        return Err(format!("MOV: cannot move between SP and the zero register: '{}'", line));
+                    }
+                    Instr::Alu { op: AluOp::Add, rd, rn, op2: Operand::Imm(0), flags: false }
+                } else {
+                    Instr::MovReg { rd, rn }
+                }
             }
         }
         "SXTW" => {
@@ -395,7 +423,7 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
             if !(2..=3).contains(&ops.len()) {
                 return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
             }
-            let rn = reg(0)?;
+            let rn = if m == "TST" { reg(0)? } else { parse_reg_sp(&ops[0])? };
             let op = match m {
                 "CMP" => AluOp::Sub,
                 "CMN" => AluOp::Add,

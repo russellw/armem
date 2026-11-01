@@ -297,7 +297,7 @@ int reader_acq(void) { while (!__atomic_load_n(&flag, __ATOMIC_ACQUIRE)) {} retu
 "#;
 
 /// Compiled C: relaxed message passing goes wrong on ARM only, and
-/// release/acquire fixes it.
+/// release/acquire fixes it. At -O0 the functions keep values on the stack.
 #[test]
 fn compiled_functions_as_threads() {
     let Some(mc) = llvm_mc() else { return };
@@ -306,25 +306,28 @@ fn compiled_functions_as_threads() {
         eprintln!("skipping: {} not found", clang);
         return;
     }
-    let (c, o) = (scratch("mp.c"), scratch("mp.o"));
+    let c = scratch("mp.c");
     std::fs::write(&c, C_MP).unwrap();
-    let out = Command::new(&clang)
-        .args(["--target=aarch64-linux-gnu", "-O2", "-fno-pic", "-c", "-o"])
-        .arg(&o)
-        .arg(&c)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let check = |header: &str, arm_only: bool| {
-        let test = scratch("mp-c.litmus");
-        std::fs::write(&test, format!("AArch64 MP-c\n{{ }}\n {} ;\nexists (1:X0=0)\n", header)).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_armem")).arg("--elf").arg(&o).arg(&test).output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
+    for opt in ["-O2", "-O0"] {
+        let o = scratch(&format!("mp{}.o", opt));
+        let out = Command::new(&clang)
+            .args(["--target=aarch64-linux-gnu", opt, "-fno-pic", "-c", "-o"])
+            .arg(&o)
+            .arg(&c)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(text.contains("reachable on ARM only"), arm_only, "{}:\n{}", header, text);
-        assert!(!text.contains("fuel"), "{}", text);
-    };
-    check("P0 = writer | P1 = reader", true);
-    check("P0 = writer_rel | P1 = reader_acq", false);
-    check("P0 = writer_rel | P1 = reader", true);
+        let check = |header: &str, arm_only: bool| {
+            let test = scratch("mp-c.litmus");
+            std::fs::write(&test, format!("AArch64 MP-c\n{{ }}\n {} ;\nexists (1:X0=0)\n", header)).unwrap();
+            let out = Command::new(env!("CARGO_BIN_EXE_armem")).arg("--elf").arg(&o).arg(&test).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(text.contains("reachable on ARM only"), arm_only, "{} {}:\n{}", opt, header, text);
+            assert!(!text.contains("fuel") && !text.contains("FAULT"), "{}", text);
+        };
+        check("P0 = writer | P1 = reader", true);
+        check("P0 = writer_rel | P1 = reader_acq", false);
+        check("P0 = writer_rel | P1 = reader", true);
+    }
 }

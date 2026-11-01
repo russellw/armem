@@ -103,6 +103,12 @@ Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
 `[Xn,Wm,SXTW|UXTW #k]`, pre-index `[Xn,#imm]!`, and post-index
 `[Xn],#imm` (writeback forms for `LDR`/`STR`/`LDP`/`STP`).
 
+The stack pointer `SP` (`WSP`) can be used where the architecture allows
+it: as a base register, as the first source of `ADD`/`SUB`/`ADDS`/`SUBS`
+and `CMP`/`CMN`, as the destination of `ADD`/`SUB` and of
+`AND`/`ORR`/`EOR` with an immediate, and in `MOV` to or from SP (an alias of
+`ADD #0`). See [Stacks](#stacks).
+
 Register combinations that the architecture makes CONSTRAINED
 UNPREDICTABLE are rejected: for example, a writeback base register that is
 also the data register, or an `STXR` status register that is also the data
@@ -115,9 +121,8 @@ assembly parser produces (`decode::decode_program` for a block of
 little-endian code). It covers exactly the instructions listed above.
 Anything else, including UNPREDICTABLE encodings, is an error. This is
 the first step toward running compiled code (see [Roadmap](#roadmap)).
-Instructions that use SP (register 31 as a base register, or in
-`ADD`/`SUB` immediate) are not supported yet, because the emulator has
-no stack pointer. `ADR` and `ADRP` are decoded when the code's load
+Register 31 is decoded as SP or the zero register, depending on the
+operand. `ADR` and `ADRP` are decoded when the code's load
 address is known (`decode::decode_program_at`), as a `MOV` of the
 address they compute.
 
@@ -207,9 +212,10 @@ ARM only. With `__ATOMIC_RELEASE` / `__ATOMIC_ACQUIRE` it cannot.
 Calls are not supported yet, so a `RET` in the function returns from the
 thread and ends it. That is only right while X30 holds the thread's
 return address, so a function that writes X30, or returns through
-another register, is rejected. The function must use only supported
-instructions. In particular it must not use SP, which rules out most
-code compiled at `-O0` and functions that need a stack frame.
+another register, is rejected. This rules out functions that save and
+restore X30 (non-leaf functions). The function must use only supported
+instructions. It can use the stack, so leaf functions compiled at `-O0`
+work. `tests/preload.rs` runs the example above at `-O0` and `-O2`.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -243,6 +249,38 @@ is installed:
   ignores a non-ones should-be-one `Rt2` field in `STXR`, which armem
   rejects. A run of 1.2 million words (409,568 decoded) found no other
   differences.
+
+### Stacks
+
+Each thread has its own 1 MiB stack, and SP starts at its top. Thread
+`i`'s stack is `[0x7f0000000000 + (i+1) * 0x100000, ... + 0x100000)`. The
+stack area also has an unused guard slot below the first stack and above
+the last. A preloaded image or a test location that overlaps the stack
+area is an error. A stack is initially zero.
+
+A stack is private to its thread, so plain loads and stores within it
+are not given to the memory model. The core performs them directly: a
+load reads the thread's latest store to each byte. The value keeps the
+address and data dependencies of the store, as a load that is forwarded
+a store's value does in Arm's model (`(addr | data); rfi` orders it). The
+address of a stack access still orders later writes (Arm's
+`addr; po; [W]`). No other thread can see these accesses, so this
+changes no outcome. It keeps compiled code's spills and stack frames
+from multiplying the states the models explore. `tests/stack.rs` checks
+this: each test runs again with its stacks replaced by ordinary memory
+locations that only one thread uses, and every model must give the same
+final states.
+
+An execution *faults* when a thread:
+* accesses the stack area outside its own stack (a stack overflow, a
+  guard slot, or another thread's stack, for example through a pointer
+  it was given), or
+* accesses its stack with an exclusive, atomic, acquire or release
+  instruction.
+
+A faulting execution has no final state. The report lists each fault,
+with the thread (`FAULT: P1: 8-byte access at 0x7f00001ffff8 is outside
+its stack ...`), and the one-line summary marks the model with `(fault)`.
 
 ## How it works
 
@@ -369,6 +407,9 @@ lets a lone `LDXP` be torn.
   ignore `--lse2`.
 * The status register written by `STXR` carries no dependency (as in
   Arm's model).
+* Stacks are private: a thread cannot access another thread's stack
+  (that is reported as a fault), and stack memory cannot be used for
+  atomics.
 * The search is exhaustive, so it suits small snippets. The number of
   promise orders grows quickly with the number of writes.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
@@ -380,8 +421,9 @@ lets a lone `LDXP` be torn.
 2. Run real compiled code: the binary decoder, an ELF loader and
    static relocation are done, and a loaded image can be a test's initial
    memory (see [Machine code](#machine-code)); tests can run ELF functions as
-   threads (`P0 = name`); next come SP and a stack, calls and returns, and the
-   instructions compilers commonly emit (`MOVK`, `TBZ`, `UBFX`, ...),
+   threads (`P0 = name`), with SP and a private stack per thread; next
+   come calls and returns, and the instructions compilers commonly emit
+   (`MOVK`, `TBZ`, `UBFX`, ...),
    starting with user-mode functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,

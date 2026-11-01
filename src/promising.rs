@@ -115,9 +115,9 @@ struct TState {
 }
 
 impl TState {
-    fn new(regs: [u64; 31]) -> TState {
+    fn new(regs: [u64; 31], tid: usize, threads: usize) -> TState {
         TState {
-            core: Core::new(regs),
+            core: Core::new(regs, tid, threads),
             v_rold: 0,
             v_rold_p: 0,
             v_rnoret: 0,
@@ -209,6 +209,8 @@ struct Solo<'a> {
     final_regs: &'a [u8],
     certified: bool,
     truncated: bool,
+    /// Faults reached (in `Final` mode, with every promise fulfilled).
+    faults: BTreeSet<String>,
 }
 
 /// Split an access of `n` bytes at `a` into single-copy-atomic pieces of
@@ -255,6 +257,7 @@ impl<'a> Solo<'a> {
             final_regs: &proj.thread_regs[tid],
             certified: false,
             truncated: false,
+            faults: BTreeSet::new(),
         }
     }
 
@@ -565,6 +568,14 @@ impl<'a> Solo<'a> {
                 vec![(s, ext.to_vec())]
             }
             Step::Mem(op) => self.mem_successors(s, ext, op),
+            // A fault ends the execution. It is real if the thread's promises
+            // are fulfilled, since the other threads' promises are certified.
+            Step::Fault(e) => {
+                if self.mode == Mode::Final && s.promises.is_empty() {
+                    self.faults.insert(format!("P{}: {}", self.tid, e));
+                }
+                vec![]
+            }
         }
     }
 
@@ -805,7 +816,7 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
 
     let solo = |tid: usize, mem: &[Msg], mode: Mode| Solo::new(test, cfg, &proj, tid, mem.to_vec(), mode);
     let start = |tid: usize, mem: &[Msg]| {
-        let mut st = TState::new(test.init_regs[tid]);
+        let mut st = TState::new(test.init_regs[tid], tid, n);
         st.promises = (1..=mem.len() as View).filter(|&t| mem[t as usize - 1].tid == tid).collect();
         st
     };
@@ -822,6 +833,7 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
             let mut s = solo(tid, &mem, Mode::Final);
             s.run(start(tid, &mem));
             results.truncated |= s.truncated;
+            results.faults.extend(std::mem::take(&mut s.faults));
             per_thread.push(s.finals);
         }
         if per_thread.iter().all(|f| !f.is_empty()) {

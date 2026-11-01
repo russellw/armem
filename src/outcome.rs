@@ -72,12 +72,16 @@ pub struct Outcomes {
     pub states: BTreeMap<Vec<u64>, u64>,
     /// Some path was cut off by the fuel limit, so the set may be incomplete.
     pub truncated: bool,
+    /// Faults that some execution reaches (such as an access outside the
+    /// thread's stack), each prefixed with the thread. Such an execution
+    /// has no final state.
+    pub faults: BTreeSet<String>,
     pub stats: Stats,
 }
 
 impl Outcomes {
     pub fn new(obs: Vec<Obs>) -> Outcomes {
-        Outcomes { obs, states: BTreeMap::new(), truncated: false, stats: Stats::default() }
+        Outcomes { obs, states: BTreeMap::new(), truncated: false, faults: BTreeSet::new(), stats: Stats::default() }
     }
 
     pub fn insert(&mut self, state: Vec<u64>) {

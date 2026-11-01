@@ -1,3 +1,5 @@
+use armem::elf::Elf;
+use armem::image::{Image, LoadOptions};
 use armem::{Model, litmus, report, run};
 use std::process::ExitCode;
 
@@ -13,6 +15,11 @@ options:
   -s, --summary      print one line per test instead of full reports
       --lse2         model FEAT_LSE2 (16-byte atomic LDP/STP, atomic
                      unaligned accesses within a 16-byte block)
+      --elf FILE     start from the memory of an AArch64 ELF file (an
+                     object file is relocated first); its global variables
+                     can be named in the tests
+      --elf-base N   where an object file's sections are placed
+                     (default: 0x10000)
   -h, --help         show this help
 ";
 
@@ -21,6 +28,8 @@ fn main() -> ExitCode {
     let mut opts = armem::Options::default();
     let mut summary = false;
     let mut files = Vec::new();
+    let mut elf_file = None;
+    let mut load = LoadOptions::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -48,6 +57,20 @@ fn main() -> ExitCode {
                     });
                 }
             }
+            "--elf" => match args.next() {
+                Some(f) => elf_file = Some(f),
+                None => {
+                    eprintln!("--elf needs a file");
+                    return ExitCode::from(2);
+                }
+            },
+            "--elf-base" => match args.next().and_then(|v| litmus_int(&v)) {
+                Some(n) => load.base = n,
+                None => {
+                    eprintln!("--elf-base needs an address");
+                    return ExitCode::from(2);
+                }
+            },
             "-f" | "--fuel" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) => opts.fuel = n,
                 None => {
@@ -66,6 +89,16 @@ fn main() -> ExitCode {
         eprint!("{}", USAGE);
         return ExitCode::from(2);
     }
+    let preload = match &elf_file {
+        None => litmus::Preload::default(),
+        Some(f) => match load_elf(f, &load) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}: {}", f, e);
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     let mut failed = false;
     for f in &files {
         let src = match std::fs::read_to_string(f) {
@@ -76,7 +109,7 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        let test = match litmus::parse(&src) {
+        let test = match litmus::parse_with(&src, &preload) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("{}: {}", f, e);
@@ -92,4 +125,14 @@ fn main() -> ExitCode {
         }
     }
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn litmus_int(s: &str) -> Option<u64> {
+    armem::asm::parse_int(s).ok().and_then(|v| u64::try_from(v).ok())
+}
+
+fn load_elf(path: &str, opts: &LoadOptions) -> Result<litmus::Preload, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let elf = Elf::parse(&data)?;
+    Image::load(&elf, opts)?.preload()
 }

@@ -28,6 +28,7 @@ cargo build --release
 ./target/release/armem -s litmus/*.litmus          # one line per test
 ./target/release/armem -m arm,sc,tso -f 500 FILE   # choose models / fuel
 ./target/release/armem --lse2 FILE                 # assume FEAT_LSE2 hardware
+./target/release/armem --elf data.o FILE           # start from an ELF file's memory
 cargo test --release                               # check the litmus suite
 ```
 
@@ -157,6 +158,28 @@ PC-relative ones, and the next instruction for branches. Any other
 relocation (TLS, for example) is an error. A linked executable or
 shared object is loaded from its `PT_LOAD` segments. Its dynamic
 relocations are not applied yet.
+
+### Starting from an ELF file's memory
+
+`--elf FILE` loads an ELF file (relocating an object file, placed at
+`--elf-base`, default `0x10000`) and uses its memory as every test's
+initial memory. The file's data symbols (objects and common symbols)
+become named locations, so a test can use them like its own:
+
+```
+AArch64 MP-elf
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+...
+```
+
+Values come from the file. A pointer initialized to `&y` holds y's
+address and is reported as `y`. A symbol of 1, 2, 4 or 8 bytes is read
+as a signed integer of that size. In the init block, `x=5` overrides the
+file's value, and a declaration without a value (`uint8_t x`) only
+changes the type. Other names get fresh locations, which must not
+overlap the file's memory. In the library this is `Image::preload` and
+`litmus::parse_with`. Memory permissions are not enforced: a store to
+read-only data or code succeeds.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -325,9 +348,9 @@ lets a lone `LDXP` be torn.
 
 1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
 2. Run real compiled code: the binary decoder, an ELF loader and
-   static relocation are done (see [Machine code](#machine-code)); next
-   come using a loaded image as initial memory, a way for tests to name
-   ELF functions as threads, SP and a stack, calls and returns, and the
+   static relocation are done, and a loaded image can be a test's initial
+   memory (see [Machine code](#machine-code)); next come a way for tests
+   to name ELF functions as threads, SP and a stack, calls and returns, and the
    instructions compilers commonly emit (`MOVK`, `TBZ`, `UBFX`, ...),
    starting with user-mode functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random

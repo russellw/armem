@@ -13,6 +13,7 @@ pub mod image;
 pub mod interleave;
 pub mod isa;
 pub mod litmus;
+pub mod memory;
 pub mod outcome;
 pub mod promising;
 pub mod report;

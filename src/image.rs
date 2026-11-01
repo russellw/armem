@@ -18,6 +18,9 @@
 //! applied yet.
 
 use crate::elf::*;
+use crate::isa::Size;
+use crate::litmus::{DEFAULT_LOC_TYPE, LocType, PreSym, Preload, is_ident};
+use crate::memory::{InitMem, Region};
 use std::collections::BTreeMap;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -490,6 +493,41 @@ impl<'e, 'a> Image<'e, 'a> {
         let addr = base + r.start;
         let code = self.read(addr, r.end - r.start).ok_or_else(|| format!("function '{}' is not in loaded memory", name))?;
         Ok(Function { name: name.to_string(), section: r.section, load_addr: Some(addr), code })
+    }
+
+    /// The image as initial memory for a test, with its data symbols
+    /// (objects and common symbols) as named locations. A symbol's type is
+    /// a signed integer of its size if that is 1, 2, 4 or 8 bytes, else the
+    /// default (signed 64-bit). Names that are not identifiers, or that
+    /// more than one symbol has, are left out.
+    pub fn preload(&self) -> Result<Preload> {
+        let regions = self
+            .chunks
+            .iter()
+            .map(|c| Region { addr: c.addr, bytes: c.bytes.as_slice().into(), writable: c.writable, origin: c.origin.clone() })
+            .collect();
+        let mem = InitMem::from_regions(regions)?;
+        let mut count: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in &self.elf.symbols {
+            *count.entry(&s.name).or_default() += 1;
+        }
+        let mut symbols: Vec<PreSym> = self
+            .elf
+            .symbols
+            .iter()
+            .zip(&self.symbol_addrs)
+            .filter(|(s, a)| a.is_some() && matches!(s.kind, SymKind::Object | SymKind::Common))
+            .filter(|(s, _)| count[s.name.as_str()] == 1 && is_ident(&s.name))
+            .map(|(s, a)| {
+                let ty = match Size::from_bytes(s.size) {
+                    Some(size) if size <= Size::B8 => LocType { size, signed: true },
+                    _ => DEFAULT_LOC_TYPE,
+                };
+                PreSym { name: s.name.clone(), addr: a.unwrap(), size: s.size, ty }
+            })
+            .collect();
+        symbols.sort_by_key(|p| p.addr);
+        Ok(Preload { mem, symbols })
     }
 
     /// Decode the loaded code of the function called `name`.

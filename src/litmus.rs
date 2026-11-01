@@ -13,6 +13,7 @@
 
 use crate::asm::{self, Result};
 use crate::isa::{Instr, Size};
+use crate::memory::InitMem;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -84,8 +85,8 @@ pub struct Test {
     /// Source lines of each thread's code (labels included).
     pub code: Vec<Vec<String>>,
     pub init_regs: Vec<[u64; 31]>,
-    /// Initial memory contents, byte by byte (absent bytes are 0).
-    pub init_mem: BTreeMap<u64, u8>,
+    /// Initial memory contents (absent bytes are 0).
+    pub init_mem: InitMem,
     /// Declared types of named locations (default: signed 64-bit).
     pub loc_types: BTreeMap<u64, LocType>,
     pub symbols: Vec<(String, u64)>,
@@ -130,7 +131,7 @@ impl Test {
     }
 
     pub fn init_byte(&self, b: u64) -> u8 {
-        self.init_mem.get(&b).copied().unwrap_or(0)
+        self.init_mem.byte(b)
     }
 
     /// Value of the location at `addr` (read according to its type), given
@@ -199,10 +200,33 @@ impl fmt::Display for Quant {
     }
 }
 
+/// A named location that exists before the test is parsed, such as a
+/// global variable of a loaded ELF image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreSym {
+    pub name: String,
+    pub addr: u64,
+    /// Size in bytes (0 if unknown).
+    pub size: u64,
+    pub ty: LocType,
+}
+
+/// Initial memory and named locations to parse a test against
+/// (see `parse_with`).
+#[derive(Clone, Debug, Default)]
+pub struct Preload {
+    pub mem: InitMem,
+    pub symbols: Vec<PreSym>,
+}
+
 struct Symbols {
     syms: Vec<(String, u64)>,
     /// Arrays: base address -> (element size in bytes, element count).
     arrays: BTreeMap<u64, (u64, u64)>,
+    /// Locations the test names that are not preloaded get addresses
+    /// `SYM_BASE + SYM_STRIDE * k`, for k = 0, 1, ...
+    allocated: u64,
+    preloaded: BTreeMap<String, usize>,
 }
 
 impl Symbols {
@@ -210,7 +234,8 @@ impl Symbols {
         if let Some((_, a)) = self.syms.iter().find(|(n, _)| n == name) {
             return *a;
         }
-        let a = SYM_BASE + SYM_STRIDE * self.syms.len() as u64;
+        let a = SYM_BASE + SYM_STRIDE * self.allocated;
+        self.allocated += 1;
         self.syms.push((name.to_string(), a));
         a
     }
@@ -231,7 +256,7 @@ impl Symbols {
     }
 }
 
-fn is_ident(s: &str) -> bool {
+pub fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars().next().unwrap().is_ascii_alphabetic()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
@@ -272,6 +297,15 @@ fn strip_comments(src: &str) -> String {
 }
 
 pub fn parse(src: &str) -> Result<Test> {
+    parse_with(src, &Preload::default())
+}
+
+/// Parse a test whose initial memory starts as `pre.mem`, and in which the
+/// names of `pre.symbols` refer to those locations. In the init block,
+/// `name=value` overrides a preloaded location's initial value, and a
+/// declaration without a value (`uint8_t name`) only sets its type. Other
+/// names get fresh locations, which must not overlap preloaded memory.
+pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
     let src = strip_comments(src);
     let mut lines = src.lines().peekable();
 
@@ -319,10 +353,17 @@ pub fn parse(src: &str) -> Result<Test> {
         return Err("missing init block { ... }".into());
     }
 
-    let mut syms = Symbols { syms: Vec::new(), arrays: BTreeMap::new() };
+    let mut syms = Symbols { syms: Vec::new(), arrays: BTreeMap::new(), allocated: 0, preloaded: BTreeMap::new() };
     let mut reg_inits: Vec<(usize, u8, u64)> = Vec::new();
-    let mut init_mem = BTreeMap::new();
+    let mut init_mem = pre.mem.clone();
     let mut loc_types = BTreeMap::new();
+    for (i, p) in pre.symbols.iter().enumerate() {
+        if !is_ident(&p.name) || syms.preloaded.insert(p.name.clone(), i).is_some() {
+            return Err(format!("bad or duplicate preloaded symbol name '{}'", p.name));
+        }
+        syms.syms.push((p.name.clone(), p.addr));
+        loc_types.insert(p.addr, p.ty);
+    }
     for stmt in init_text.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
@@ -371,10 +412,16 @@ pub fn parse(src: &str) -> Result<Test> {
                     parse_type(&tw)?
                 }
             };
+            let pre_sym = syms.preloaded.get(lname).map(|&i| &pre.symbols[i]);
             if let Some(count) = count {
                 let elem = ty.size.bytes();
-                if count == 0 || elem * count > SYM_STRIDE {
-                    return Err(format!("array '{}' must have 1..={} bytes", lname, SYM_STRIDE));
+                let room = match pre_sym {
+                    Some(p) if p.size > 0 => p.size,
+                    Some(_) => u64::MAX,
+                    None => SYM_STRIDE,
+                };
+                if count == 0 || elem.saturating_mul(count) > room {
+                    return Err(format!("array '{}' must have 1..={} bytes", lname, room));
                 }
                 if rhs.is_some() {
                     return Err(format!("array '{}' cannot be initialized", lname));
@@ -388,11 +435,10 @@ pub fn parse(src: &str) -> Result<Test> {
             loc_types.insert(a, ty);
             let v = match rhs {
                 Some(r) => syms.value(r)?,
+                None if pre_sym.is_some() => continue, // keep the preloaded value
                 None => 0,
             };
-            for i in 0..ty.size.bytes() {
-                init_mem.insert(a + i, (v >> (8 * i)) as u8);
-            }
+            init_mem.set(a, v, ty.size.bytes());
         }
     }
 
@@ -458,6 +504,14 @@ pub fn parse(src: &str) -> Result<Test> {
     }
 
     let (locations, mut condition) = parse_final(&rest, &mut syms)?;
+    for (n, a) in &syms.syms {
+        if syms.preloaded.contains_key(n) {
+            continue;
+        }
+        if let Some(r) = init_mem.overlapping(*a, SYM_STRIDE) {
+            return Err(format!("location '{}' at {:#x} would overlap preloaded {} at {:#x}", n, a, r.origin, r.addr));
+        }
+    }
     if let Some(c) = &mut condition {
         normalize(&mut c.prop, &loc_types);
     }

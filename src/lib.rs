@@ -8,6 +8,7 @@
 pub mod asm;
 pub mod core;
 pub mod decode;
+pub mod elf;
 pub mod interleave;
 pub mod isa;
 pub mod litmus;

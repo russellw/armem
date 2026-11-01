@@ -118,6 +118,32 @@ Instructions that use SP (register 31 as a base register, or in
 `ADD`/`SUB` immediate) are not supported yet, because the emulator has
 no stack pointer.
 
+### ELF files
+
+`src/elf.rs` reads 64-bit little-endian AArch64 ELF files: relocatable
+objects (`.o`), executables and shared objects. It has no dependencies.
+It exposes the sections, loadable segments, symbol table and
+relocations, and `Elf::function(name)` / `Elf::decode_function(name)`
+extract a function's code by symbol name (using the symbol's size) and
+decode it. Branches must stay inside the function. Every offset and size
+in the file is checked, so a malformed file gives an error, not a panic.
+
+A function is rejected, rather than decoded wrongly, when:
+* in an object file, an instruction in it still needs a relocation
+  (a call, or the address of a global, is a placeholder until link
+  time); relocations are not applied yet;
+* it contains data, such as a literal pool, marked by a `$d` mapping
+  symbol.
+
+`tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
+`llvm-readobj` are installed: every litmus thread is assembled into an
+object file as a function, and extracting and decoding it must give the
+parsed program. The sections, symbols and relocations armem reads must
+match `llvm-readobj` for assembled objects, for `clang` output (`-O2`,
+and `-O0 -g` with per-function sections), and for an object with more
+than 0xff00 sections (extended section numbering). No AArch64 linker is
+assumed, so executables are covered only by unit tests.
+
 `tests/decode_llvm.rs` checks the decoder against LLVM, when `llvm-mc`
 is installed:
 * every thread in `litmus/` is assembled with `llvm-mc`, and decoding it
@@ -265,8 +291,10 @@ lets a lone `LDXP` be torn.
 ## Roadmap
 
 1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
-2. Run real compiled code: the binary decoder is done (see
-   [Machine code](#machine-code)); next come an ELF loader, SP and a stack,
+2. Run real compiled code: the binary decoder and a first ELF
+   loader are done (see [Machine code](#machine-code)); next come
+   applying relocations, loading data segments as initial memory, a way
+   for tests to name ELF functions as threads, SP and a stack,
    calls and returns, and the instructions compilers commonly emit
    (`ADRP`, `MOVK`, `TBZ`, `UBFX`, ...), starting with user-mode
    functions extracted from real programs.

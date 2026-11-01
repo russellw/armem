@@ -1,0 +1,50 @@
+AArch64 ALU-simd
+"Single-threaded check of SIMD&FP moves, immediates, logic, CNT/ADDV/UADDLV, and loads and stores to memory and the stack"
+{ uint64_t x[2]; 0:X20=x; }
+ P0                              ;
+ MOVZ X0,#0x0123,LSL #48         ;
+ MOVK X0,#0x4567,LSL #32         ;
+ MOVK X0,#0x89ab,LSL #16         ;
+ MOVK X0,#0xcdef                 ;
+ MOV X1,#-1                      ;
+ FMOV D0,X0                      ;
+ MOV V0.D[1],X1                  ;
+ MOV X2,V0.D[1]                  ;
+ FMOV W3,S0                      ;
+ SMOV X4,V0.B[1]                 ;
+ UMOV W5,V0.H[3]                 ;
+ MOV W6,V0.S[1]                  ;
+ FMOV S1,S0                      ;
+ FMOV X7,D1                      ;
+ MOVI V2.2D,#0xff00ff00ff00ff00  ;
+ EOR V3.16B,V0.16B,V2.16B        ;
+ MOV X8,V3.D[0]                  ;
+ MOV X9,V3.D[1]                  ;
+ CNT V4.16B,V0.16B               ;
+ UADDLV H5,V4.16B                ;
+ UMOV W10,V5.H[0]                ;
+ ADDV B6,V4.8B                   ;
+ UMOV W11,V6.B[0]                ;
+ DUP V7.4S,W0                    ;
+ MOV X12,V7.D[1]                 ;
+ MVNI V8.4S,#0x12,LSL #8         ;
+ MOV X13,V8.D[0]                 ;
+ MOVI V9.2S,#5,MSL #8            ;
+ MOV X15,V9.D[0]                 ;
+ INS V9.B[15],W0                 ;
+ MOV X16,V9.D[1]                 ;
+ MOV V10.H[2],V0.H[0]            ;
+ MOV X17,V10.D[0]                ;
+ BIC V11.8B,V0.8B,V2.8B          ;
+ MOV X18,V11.D[1]                ;
+ MOV X19,V11.D[0]                ;
+ STR Q0,[X20]                    ;
+ LDR D12,[X20,#8]                ;
+ FMOV X21,D12                    ;
+ LDUR S13,[X20,#2]               ;
+ FMOV W22,S13                    ;
+ STP S13,S1,[SP,#-16]!           ;
+ LDR Q14,[SP],#16                ;
+ MOV X23,V14.D[0]                ;
+ MOV X24,V14.D[1]                ;
+forall (0:X2=-1 /\ 0:X3=0x89abcdef /\ 0:X4=0xffffffffffffffcd /\ 0:X5=0x0123 /\ 0:X6=0x01234567 /\ 0:X7=0x89abcdef /\ 0:X8=0xfe23ba6776ab32ef /\ 0:X9=0x00ff00ff00ff00ff /\ 0:X10=96 /\ 0:X11=32 /\ 0:X12=0x89abcdef89abcdef /\ 0:X13=0xffffedffffffedff /\ 0:X15=0x000005ff000005ff /\ 0:X16=0xef00000000000000 /\ 0:X17=0x0000cdef00000000 /\ 0:X18=0 /\ 0:X19=0x0023006700ab00ef /\ 0:X21=-1 /\ 0:X22=0x456789ab /\ 0:X23=0x89abcdef456789ab /\ 0:X24=0 /\ x[0]=0x0123456789abcdef /\ x[1]=-1)

@@ -184,6 +184,25 @@ const CLASSES: &[(&str, u32, u32)] = &[
     ("ld/st imm9", 0x3f20_0000, 0x3800_0000),
     ("ld/st uimm", 0x3f00_0000, 0x3900_0000),
     ("ld/st pair", 0x3e00_0000, 0x2800_0000),
+    ("simd&fp ld/st reg offset", 0x3f20_0c00, 0x3c20_0800),
+    ("simd&fp ld/st imm9", 0x3f20_0000, 0x3c00_0000),
+    ("simd&fp ld/st uimm", 0x3f00_0000, 0x3d00_0000),
+    ("simd&fp ld/st pair", 0x3e00_0000, 0x2c00_0000),
+    ("simd&fp data", 0x0e00_0000, 0x0e00_0000),
+    ("simd copy", 0x9fe0_8400, 0x0e00_0400),
+    ("simd scalar copy", 0xdfe0_8400, 0x5e00_0400),
+    ("simd modified imm", 0x9ff8_0400, 0x0f00_0400),
+    ("simd three same", 0x9f20_0400, 0x0e20_0400),
+    ("simd two-reg misc", 0x9f3e_0c00, 0x0e20_0800),
+    ("simd across lanes", 0x9f3e_0c00, 0x0e30_0800),
+    ("fp<->int", 0x7f20_fc00, 0x1e20_0000),
+    ("fp 1-source", 0x5f20_7c00, 0x1e20_4000),
+    ("dp 1-source (opcode < 8)", 0x7fff_e000, 0x5ac0_0000),
+    ("simd logical", 0x9f20_fc00, 0x0e20_1c00),
+    ("simd cnt", 0x9f3f_fc00, 0x0e20_5800),
+    ("simd addv", 0x9f3f_fc00, 0x0e31_b800),
+    ("simd uaddlv", 0x9f3f_fc00, 0x0e30_3800),
+    ("fmov register", 0xff3f_fc00, 0x1e20_4000),
 ];
 
 /// Words sampled per class; `ARMEM_DECODE_SAMPLES` overrides it.
@@ -295,7 +314,8 @@ fn random_words_match_llvm() {
     // Discrepancies grouped by kind and mnemonic, with a few examples each.
     let mut problems: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
     let mut accepted = 0;
-    for (&w, l) in words.iter().zip(&llvm) {
+    let mut per_class = vec![0; CLASSES.len()];
+    for (k, (&w, l)) in words.iter().zip(&llvm).enumerate() {
         let ours = decode(w, BASE).map(normalize);
         let mnem = l.text.as_deref().map_or("-", |t| t.split_whitespace().next().unwrap()).to_string();
         let problem = match (&ours, &l.text) {
@@ -306,6 +326,7 @@ fn random_words_match_llvm() {
             (Ok(i), Some(t)) => match parse_llvm(t).map(normalize) {
                 Ok(p) if p == *i => {
                     accepted += 1;
+                    per_class[k / n] += 1;
                     None
                 }
                 Ok(p) => Some(("decoded differently", format!("{:#010x} {}: decoded {:?}, parsed {:?}", w, t, i, p))),
@@ -329,6 +350,9 @@ fn random_words_match_llvm() {
     let report: Vec<String> =
         problems.iter().map(|(k, (n, ex))| format!("{} ({}x)\n    {}", k, n, ex.join("\n    "))).collect();
     assert!(report.is_empty(), "{} discrepancies:\n{}", problems.values().map(|p| p.0).sum::<usize>(), report.join("\n"));
+    for (&(name, ..), c) in CLASSES.iter().zip(&per_class) {
+        eprintln!("{:>8} of {} {}", c, n, name);
+    }
     eprintln!("{} of {} words decoded and matched LLVM", accepted, words.len());
     assert!(accepted > 10_000, "only {} words decoded and matched", accepted);
 }

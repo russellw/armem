@@ -31,7 +31,7 @@
 //! includes dependencies through conditional selects and CAS comparisons.
 //! Pick dependencies order later writes, but not later reads.
 
-use crate::core::{Core, MemOp, RV, Step, View, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, VR, View, low_bytes, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
@@ -521,8 +521,8 @@ impl<'a> Solo<'a> {
         out
     }
 
-    /// A plain or release store, split into single-copy-atomic pieces (each
-    /// one a separate write message).
+    /// A plain or release store, split into single-copy-atomic pieces of up
+    /// to `granule` bytes (each one a separate write message).
     #[allow(clippy::too_many_arguments)]
     fn do_store(
         &mut self,
@@ -530,6 +530,7 @@ impl<'a> Solo<'a> {
         ext: &[Msg],
         addr: RV,
         size: Size,
+        granule: u64,
         val: u128,
         data: RV,
         release: bool,
@@ -537,7 +538,7 @@ impl<'a> Solo<'a> {
         let a = addr.val;
         let kind = WriteKind { release, ..WriteKind::default() };
         let mut states: Vec<Succ> = vec![(st.clone(), ext.to_vec())];
-        for (p, len) in pieces(a, size.bytes(), size.bytes(), self.lse2) {
+        for (p, len) in pieces(a, size.bytes(), granule, self.lse2) {
             let psize = Size::from_bytes(len).expect("piece size");
             let shifted = val >> (8 * (p - a));
             let pval = if len >= 16 { shifted } else { shifted & ((1u128 << (8 * len)) - 1) };
@@ -683,8 +684,46 @@ impl<'a> Solo<'a> {
                     }
                 }
             }
+            MemOp::VLoad { addr, vt, vt2, size } => {
+                // Each register is an independent read; a 16-byte one is
+                // single-copy atomic only per 8-byte half.
+                let n = size.bytes();
+                let mut states = vec![st];
+                for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
+                    let a = RV { val: addr.val + i as u64 * n, ..addr };
+                    let mut next = Vec::new();
+                    for s in &states {
+                        for r in self.do_read(s, ext, a, ReadKind::plain(), size, n.min(8)) {
+                            let mut s = r.state;
+                            s.core.vset(v, VR::with(r.val, r.dep));
+                            next.push(s);
+                        }
+                    }
+                    states = next;
+                }
+                for mut s in states {
+                    s.core.retire(prog);
+                    out.push((s, ext.to_vec()));
+                }
+            }
+            MemOp::VStore { addr, data, data2, size } => {
+                let n = size.bytes();
+                let mut states = vec![(st, ext.to_vec())];
+                for (i, d) in std::iter::once(data).chain(data2).enumerate() {
+                    let a = RV { val: addr.val + i as u64 * n, ..addr };
+                    let mut next = Vec::new();
+                    for (s, e) in &states {
+                        next.extend(self.do_store(s, e, a, size, n.min(8), low_bytes(d.val, n), d.dep(), false));
+                    }
+                    states = next;
+                }
+                for (mut s, e) in states {
+                    s.core.retire(prog);
+                    out.push((s, e));
+                }
+            }
             MemOp::Store { addr, data, size, release } => {
-                for (mut s, e) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data, release) {
+                for (mut s, e) in self.do_store(&st, ext, addr, size, size.bytes(), size.mask(data.val) as u128, data, release) {
                     s.core.retire(prog);
                     out.push((s, e));
                 }
@@ -694,12 +733,12 @@ impl<'a> Solo<'a> {
                 let states = if self.lse2 && addr.val % total.bytes() == 0 {
                     // FEAT_LSE2: an aligned pair is one single-copy-atomic write.
                     let val = pair_value(data.val, data2.val, size);
-                    self.do_store(&st, ext, addr, total, val, RV::joined(0, data, data2), false)
+                    self.do_store(&st, ext, addr, total, total.bytes(), val, RV::joined(0, data, data2), false)
                 } else {
                     let addr2 = RV { val: addr.val + size.bytes(), ..addr };
                     let mut states = Vec::new();
-                    for (s1, e1) in self.do_store(&st, ext, addr, size, size.mask(data.val) as u128, data, false) {
-                        states.extend(self.do_store(&s1, &e1, addr2, size, size.mask(data2.val) as u128, data2, false));
+                    for (s1, e1) in self.do_store(&st, ext, addr, size, size.bytes(), size.mask(data.val) as u128, data, false) {
+                        states.extend(self.do_store(&s1, &e1, addr2, size, size.bytes(), size.mask(data2.val) as u128, data2, false));
                     }
                     states
                 };

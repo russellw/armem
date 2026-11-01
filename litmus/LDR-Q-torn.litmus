@@ -1,0 +1,9 @@
+AArch64 LDR-Q-torn
+"A 128-bit SIMD&FP load or store is two single-copy-atomic 64-bit accesses, so a Q load can see half of a Q store"
+{ uint64_t x[2]; 0:X1=x; 1:X1=x; }
+ P0               | P1              ;
+ MOV X0,#1        | LDR Q0,[X1]     ;
+ FMOV D0,X0       | MOV X2,V0.D[0]  ;
+ MOV V0.D[1],X0   | MOV X3,V0.D[1]  ;
+ STR Q0,[X1]      |                 ;
+exists (1:X2=0 /\ 1:X3=1)

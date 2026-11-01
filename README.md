@@ -107,8 +107,9 @@ in `ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSR #2` (`LSL`, `LSR`, `ASR`, and for
 logical instructions `ROR`), and `ADD`/`SUB` accept `#imm,LSL #12`.
 
 herd7 (7.58) does not accept the bitfield moves, `UDIV`/`SDIV`, `SMULH`/
-`UMULH`, `CCMP`/`CCMN`, `CNEG`, `CLZ`/`CLS` or add/subtract with carry,
-so tests that use them run only in armem. It also computes some results
+`UMULH`, `CCMP`/`CCMN`, `CNEG`, `CLZ`/`CLS`, add/subtract with carry or
+most of the SIMD&FP instructions, so tests that use them run only in
+armem. It also computes some results
 differently from the architecture: `UMULL`/`UMSUBL` as if signed, `EON`
 as `EOR`, some W-register results sign-extended rather than
 zero-extended, and X-register `REV`, `RBIT` and `EXTR` results as if
@@ -132,6 +133,8 @@ their result has a data dependency on the flags.
 * barriers: `DMB` (`SY/ISH/...`, `LD`, `ST` variants), `DSB` (treated as
   DMB), `ISB`
 * `CLREX`, which clears the exclusive monitor
+* SIMD&FP registers (`V0`-`V31`, also named `Bn`, `Hn`, `Sn`, `Dn`, `Qn`
+  for their low 1 to 16 bytes); see [SIMD&FP registers](#simdfp-registers)
 
 Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
 `[Xn,Wm,SXTW|UXTW #k]`, pre-index `[Xn,#imm]!`, and post-index
@@ -142,6 +145,41 @@ it: as a base register, as the first source of `ADD`/`SUB`/`ADDS`/`SUBS`
 and `CMP`/`CMN`, as the destination of `ADD`/`SUB` and of
 `AND`/`ORR`/`EOR` with an immediate, and in `MOV` to or from SP (an alias of
 `ADD #0`). See [Stacks](#stacks).
+
+### SIMD&FP registers
+
+Compilers use SIMD&FP registers even in integer code: for `memset`,
+`memcpy` and struct copies, for popcount, and at `-O0` to spill
+`__int128` values. armem supports:
+
+* loads and stores: `LDR`, `STR`, `LDUR`, `STUR` of `B`, `H`, `S`, `D`
+  and `Q` registers, and `LDP`, `STP`, `LDNP`, `STNP` of `S`, `D` and `Q`,
+  with the same addressing modes as general-purpose registers (a register
+  offset is shifted by 0 or by the log2 of the access size);
+* moves: `FMOV` between general-purpose and `S`, `D` or `Vn.D[1]`
+  registers, and between `S` or `D` registers; `MOVI` and `MVNI` (every
+  form); `DUP` from a general-purpose register or an element; `INS`
+  (`MOV Vd.T[i], ...`) from a general-purpose register or an element;
+  `UMOV` and `SMOV` (`MOV Wd, Vn.S[i]`, `MOV Xd, Vn.D[i]`); `MOV` of a
+  scalar from an element; and `MOV Vd.T, Vn.T`;
+* vector logic: `AND`, `BIC`, `ORR`, `ORN`, `EOR` (`8B` or `16B`);
+* `CNT`, `ADDV` and `UADDLV` on bytes (`8B` or `16B`), which compilers use
+  for popcount.
+
+There is no floating-point or other vector arithmetic yet. Dependencies
+are tracked per register, as for general-purpose registers: inserting an
+element makes the whole register depend on the inserted value and on the
+register's old value.
+
+A load or store of a `B`, `H`, `S` or `D` register is single-copy atomic
+when aligned, like a general-purpose one. A `Q` load or store is two
+single-copy-atomic 64-bit accesses (when 8-byte aligned), so another
+thread can see half of it (`LDR-Q-torn`). That is the Arm ARM's rule.
+`--lse2` makes each half atomic even if unaligned within a 16-byte
+block, but never the whole `Q` access, and an `LDP`/`STP` of SIMD&FP
+registers is never one atomic access. This is the conservative reading:
+it may report tearing that some LSE2 hardware rules out, but not miss
+any.
 
 Register combinations that the architecture makes CONSTRAINED
 UNPREDICTABLE are rejected: for example, a writeback base register that is
@@ -258,10 +296,12 @@ outside the code, for example through a bad return address, faults.
 spinlock whose functions call each other at `-O0`, `-O2` and
 `-O2 -mcmodel=large`. It also runs integer arithmetic (bitfields,
 division by variables and constants, conditional selects and compares,
-byte and bit reversal, leading-bit counts, rotates and 128-bit
-arithmetic)
-compiled at `-O0` to `-Os`, and checks the result against the same C
-compiled for the host and run natively.
+byte and bit reversal, leading-bit counts, rotates, 128-bit
+arithmetic and popcount) compiled at `-O0` to `-Os`, and checks the
+result against the same C compiled for the host and run natively. A
+last test publishes a 16-byte struct, which clang copies through `Q`
+registers at `-O0` and `-O2`: with a relaxed flag the reader can copy a
+stale or torn struct on ARM only.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -286,14 +326,14 @@ base addresses.
 is installed:
 * every thread in `litmus/` is assembled with `llvm-mc`, and decoding it
   must give the program the assembly parser produces;
-* random words from each relevant encoding class (128,000 by default; set
+* random words from each relevant encoding class (204,000 by default; set
   `ARMEM_DECODE_SAMPLES` for more per class) are disassembled by
   `llvm-mc`, and the text is parsed by armem's assembler. The decoder
   must accept a word exactly when the parser accepts its disassembly,
   with the same result, and must reject every word LLVM rejects or flags
   as potentially undefined. The one documented exception: LLVM silently
   ignores a non-ones should-be-one `Rt2` field in `STXR`, which armem
-  rejects. A run of 1.6 million words (677,758 decoded) found no other
+  rejects. A run of 2 million words (750,468 decoded) found no other
   differences.
 
 ### Calls
@@ -336,7 +376,8 @@ the last. A preloaded image or a test location that overlaps the stack
 area is an error. A stack is initially zero.
 
 A stack is private to its thread, so plain loads and stores within it
-are not given to the memory model. The core performs them directly: a
+(including those of SIMD&FP registers) are not given to the memory
+model. The core performs them directly: a
 load reads the thread's latest store to each byte. The value keeps the
 address and data dependencies of the store, as a load that is forwarded
 a store's value does in Arm's model (`(addr | data); rfi` orders it). The
@@ -427,12 +468,13 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 77 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 83 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
-exclusive pairs, FEAT_LSE2 atomicity, and the pick, NoRet and CAS
-dependency rules. Their expected ARMv8/TSO verdicts are in
+exclusive pairs, FEAT_LSE2 atomicity, the pick, NoRet and CAS
+dependency rules, and SIMD&FP values, `Q` tearing and dependencies
+through SIMD&FP registers. Their expected ARMv8/TSO verdicts are in
 `litmus/expected.txt` (one line per test and option set; an optional
 `lse2` column runs the test with `--lse2`), and `cargo test` checks them.
 The tests also check that every SC outcome is reachable under TSO and
@@ -469,7 +511,7 @@ Current results (herdtools7 7.58):
 | diy7, basic edges, 3 threads | 5428 | all match |
 | diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
 | diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
-| `litmus/` | 77 | 63 match, 1 known difference; herd7 times out or rejects 13 |
+| `litmus/` | 83 | 63 match, 1 known difference; herd7 times out or rejects 19 |
 
 The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
 a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when
@@ -478,10 +520,11 @@ lets a lone `LDXP` be torn.
 
 ## Limitations (current)
 
-* No SIMD/FP.
-* The TSO and SC reference models read both halves of an `LDP` in a
-  single step. They perform an `STP` as two consecutive stores, and
-  ignore `--lse2`.
+* No floating-point arithmetic, and of the other SIMD instructions only
+  those listed in [SIMD&FP registers](#simdfp-registers).
+* The TSO and SC reference models read both halves of an `LDP`, and all
+  of a `Q` load, in a single step. They perform an `STP` as two
+  consecutive stores and a `Q` store as one, and ignore `--lse2`.
 * The status register written by `STXR` carries no dependency (as in
   Arm's model).
 * Stacks are private: a thread cannot access another thread's stack
@@ -494,18 +537,17 @@ lets a lone `LDXP` be torn.
 
 ## Roadmap
 
-1. More of the ISA: SIMD/FP registers, loads/stores and arithmetic.
+1. More of the ISA: floating-point and vector arithmetic.
 2. Run real compiled code: the binary decoder, an ELF loader and
    static relocation are done, and a loaded image can be a test's initial
    memory (see [Machine code](#machine-code)); tests can run ELF functions as
    threads (`P0 = name`), with SP and a private stack per thread, and
    they can make calls (`BL`, `BLR`, `RET`) and use the integer
    instructions compilers commonly emit (bitfield moves, multiply-add,
-   division, conditional compare, byte reversal, add with carry, ...);
-   next come SIMD&FP registers with their loads, stores and moves
-   (compilers use them for `memset`, `memcpy`, struct copies and `-O0`
-   spills of `__int128` even in integer code), then user-mode functions
-   extracted from real programs.
+   division, conditional compare, byte reversal, add with carry, ...),
+   and the SIMD&FP loads, stores and moves that integer code uses (see
+   [SIMD&FP registers](#simdfp-registers)); next come user-mode
+   functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
    and prioritizing reads that disagree with what TSO would return.

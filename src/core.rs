@@ -6,6 +6,7 @@
 
 use crate::isa::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A timestamp/view. 0 is the initial state of memory.
 pub type View = u32;
@@ -33,6 +34,43 @@ impl RV {
     pub fn joined(val: u64, a: RV, b: RV) -> RV {
         RV { val, view: a.view.max(b.view), pick: a.pick.max(b.pick) }
     }
+}
+
+/// A SIMD&FP register value with its dependency views, as in `RV`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VR {
+    pub val: u128,
+    pub view: View,
+    pub pick: View,
+}
+
+impl VR {
+    /// `val` with the dependencies of `d`.
+    pub fn with(val: u128, d: RV) -> VR {
+        VR { val, view: d.view, pick: d.pick }
+    }
+    /// The dependencies, as a general-purpose value of 0.
+    pub fn dep(self) -> RV {
+        RV { val: 0, view: self.view, pick: self.pick }
+    }
+}
+
+/// The low `n` bytes of `v` (n <= 16).
+pub fn low_bytes(v: u128, n: u64) -> u128 {
+    if n >= 16 { v } else { v & ((1u128 << (8 * n)) - 1) }
+}
+
+/// Element `index` of `size` bytes of a vector value.
+fn element(v: u128, index: u8, size: Size) -> u64 {
+    let n = size.bytes();
+    low_bytes(v >> (8 * n * index as u64), n) as u64
+}
+
+/// `v` with element `index` of `size` bytes replaced by the low bytes of `e`.
+fn with_element(v: u128, index: u8, size: Size, e: u64) -> u128 {
+    let n = size.bytes();
+    let shift = 8 * n * index as u64;
+    v & !(low_bytes(u128::MAX, n) << shift) | low_bytes(e as u128, n) << shift
 }
 
 /// Start of the stack area. It holds `threads + 2` slots of `STACK_SIZE`
@@ -115,18 +153,18 @@ impl Stack {
 
     /// Read `n` bytes at `a` (within the stack), with the dependencies
     /// of the stores they come from.
-    fn read(&self, a: u64, n: u64) -> (u64, View, View) {
-        let (mut val, mut view, mut pick) = (0u64, 0, 0);
+    fn read(&self, a: u64, n: u64) -> (u128, View, View) {
+        let (mut val, mut view, mut pick) = (0u128, 0, 0);
         for b in (a..a + n).rev() {
             let (v, w, p) = self.bytes.get(&b).copied().unwrap_or((0, 0, 0));
-            val = val << 8 | v as u64;
+            val = val << 8 | v as u128;
             view = view.max(w);
             pick = pick.max(p);
         }
         (val, view, pick)
     }
 
-    fn write(&mut self, a: u64, n: u64, val: u64, view: View, pick: View) {
+    fn write(&mut self, a: u64, n: u64, val: u128, view: View, pick: View) {
         for i in 0..n {
             self.bytes.insert(a + i, ((val >> (8 * i)) as u8, view, pick));
         }
@@ -139,6 +177,10 @@ pub struct Core {
     pub pc: usize,
     pub regs: [RV; 31],
     pub sp: RV,
+    /// The SIMD&FP registers V0..V31: None until one is written (so that
+    /// code without them costs nothing to copy and hash), then shared until
+    /// written.
+    pub vregs: Option<Arc<[VR; 32]>>,
     pub stack: Stack,
     /// NZCV flags in bits 3..0 of `val`.
     pub flags: RV,
@@ -163,6 +205,13 @@ pub enum MemOp {
     /// Two independent stores, at `addr` and `addr + size`.
     StorePair { addr: RV, data: RV, data2: RV, size: Size },
     StoreExcl { addr: RV, data: RV, rs: RegOp, size: Size, release: bool },
+    /// Load SIMD&FP register `vt` (and `vt2` from `addr + size`, an
+    /// independent access), each zeroed above `size` bytes. A 16-byte
+    /// element is two single-copy-atomic 8-byte accesses.
+    VLoad { addr: RV, vt: VReg, vt2: Option<VReg>, size: Size },
+    /// Store `size` bytes of `data` (and of `data2` at `addr + size`), split
+    /// into single-copy-atomic accesses as for `VLoad`.
+    VStore { addr: RV, data: VR, data2: Option<VR>, size: Size },
     /// Atomic read-modify-write. For CAS, `cmp` is Some(expected).
     /// `noret`: the loaded value is discarded (destination XZR/WZR). Such a
     /// read has no acquire semantics and is not ordered by `DMB LD`.
@@ -270,7 +319,15 @@ impl Core {
             r[i].val = *v;
         }
         let stack = Stack::new(tid, threads);
-        Core { pc: entry, regs: r, sp: RV::imm(stack.hi), stack, flags: RV::default(), steps: 0 }
+        Core {
+            pc: entry,
+            regs: r,
+            sp: RV::imm(stack.hi),
+            vregs: None,
+            stack,
+            flags: RV::default(),
+            steps: 0,
+        }
     }
 
     pub fn get(&self, r: RegOp) -> RV {
@@ -289,6 +346,15 @@ impl Core {
             SP => self.sp = v,
             i => self.regs[i as usize] = v,
         }
+    }
+
+    pub fn vget(&self, v: VReg) -> VR {
+        self.vregs.as_ref().map_or(VR::default(), |r| r[v as usize])
+    }
+
+    pub fn vset(&mut self, v: VReg, x: VR) {
+        let regs = self.vregs.get_or_insert_with(|| Arc::new([VR::default(); 32]));
+        Arc::make_mut(regs)[v as usize] = x;
     }
 
     fn operand(&self, o: Operand, wide: bool) -> RV {
@@ -338,7 +404,9 @@ impl Core {
             Instr::Load { addr, .. }
             | Instr::Store { addr, .. }
             | Instr::LoadPair { addr, .. }
-            | Instr::StorePair { addr, .. } => self.writeback(addr),
+            | Instr::StorePair { addr, .. }
+            | Instr::VLoad { addr, .. }
+            | Instr::VStore { addr, .. } => self.writeback(addr),
             _ => {}
         }
         self.pc += 1;
@@ -349,12 +417,19 @@ impl Core {
     fn stack_load(&self, a: RV, off: u64, size: Size, signed: bool) -> RV {
         let (v, view, pick) = self.stack.read(a.val + off, size.bytes());
         let view = view.max(a.view);
-        RV { val: size.extend(v, signed), view, pick: pick.max(a.pick).max(view) }
+        RV { val: size.extend(v as u64, signed), view, pick: pick.max(a.pick).max(view) }
     }
 
     /// Store `size` bytes of `data` at `a + off` on the stack.
     fn stack_store(&mut self, a: RV, off: u64, size: Size, data: RV) {
-        self.stack.write(a.val + off, size.bytes(), data.val, a.view.max(data.view), a.pick.max(data.pick));
+        self.stack.write(a.val + off, size.bytes(), data.val as u128, a.view.max(data.view), a.pick.max(data.pick));
+    }
+
+    /// Load SIMD&FP register `v` from `size` bytes at `a + off` on the stack.
+    fn stack_vload(&mut self, a: RV, off: u64, size: Size, v: VReg) {
+        let (val, view, pick) = self.stack.read(a.val + off, size.bytes());
+        let view = view.max(a.view);
+        self.vset(v, VR { val, view, pick: pick.max(a.pick).max(view) });
     }
 
     /// Execute a plain load or store that is within the thread's stack, or
@@ -370,6 +445,9 @@ impl Core {
             }
             Instr::LoadExclPair { addr, rt, .. } | Instr::StoreExclPair { addr, rt, .. } => {
                 (addr, 2 * Size::of(rt).bytes(), false)
+            }
+            Instr::VLoad { addr, vt2, size, .. } | Instr::VStore { addr, vt2, size, .. } => {
+                (addr, size.bytes() * if vt2.is_some() { 2 } else { 1 }, true)
             }
             _ => return None,
         };
@@ -397,6 +475,19 @@ impl Core {
                 let (d1, d2) = (self.get(rt), self.get(rt2));
                 self.stack_store(a, 0, size, d1);
                 self.stack_store(a, size.bytes(), size, d2);
+            }
+            Instr::VLoad { vt, vt2, size, .. } => {
+                self.stack_vload(a, 0, size, vt);
+                if let Some(v2) = vt2 {
+                    self.stack_vload(a, size.bytes(), size, v2);
+                }
+            }
+            Instr::VStore { vt, vt2, size, .. } => {
+                let n = size.bytes();
+                for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
+                    let d = self.vget(v);
+                    self.stack.write(a.val + i as u64 * n, n, d.val, a.view.max(d.view), a.pick.max(d.pick));
+                }
             }
             _ => unreachable!("only plain accesses go to the stack"),
         }
@@ -670,6 +761,74 @@ impl Core {
             }
             Instr::Barrier(b) => return Step::Mem(MemOp::Barrier(b)),
             Instr::Clrex => return Step::Mem(MemOp::Clrex),
+            Instr::VLoad { vt, vt2, addr, size } => {
+                return Step::Mem(MemOp::VLoad { addr: self.addr(&addr), vt, vt2, size });
+            }
+            Instr::VStore { vt, vt2, addr, size } => {
+                return Step::Mem(MemOp::VStore {
+                    addr: self.addr(&addr),
+                    data: self.vget(vt),
+                    data2: vt2.map(|v| self.vget(v)),
+                    size,
+                });
+            }
+            Instr::VMovImm { vd, imm } => self.vset(vd, VR { val: imm, view: 0, pick: 0 }),
+            Instr::VMov { vd, vn, size } => {
+                let v = self.vget(vn);
+                self.vset(vd, VR { val: low_bytes(v.val, size.bytes()), ..v });
+            }
+            Instr::VLogic { op, vd, vn, vm, q } => {
+                let (a, b) = (self.vget(vn), self.vget(vm));
+                let r = match op {
+                    AluOp::And => a.val & b.val,
+                    AluOp::Bic => a.val & !b.val,
+                    AluOp::Orr => a.val | b.val,
+                    AluOp::Orn => a.val | !b.val,
+                    AluOp::Eor => a.val ^ b.val,
+                    _ => unreachable!("not a vector logical operation"),
+                };
+                let r = low_bytes(r, if q { 16 } else { 8 });
+                self.vset(vd, VR::with(r, RV::joined(0, a.dep(), b.dep())));
+            }
+            Instr::VIns { vd, index, size, rn, zero } => {
+                let x = self.get(rn);
+                let old = if zero { VR::default() } else { self.vget(vd) };
+                let r = with_element(old.val, index, size, x.val);
+                self.vset(vd, VR::with(r, RV::joined(0, old.dep(), x)));
+            }
+            Instr::VInsElem { vd, index, vn, index2, size } => {
+                let (old, src) = (self.vget(vd), self.vget(vn));
+                let r = with_element(old.val, index, size, element(src.val, index2, size));
+                self.vset(vd, VR::with(r, RV::joined(0, old.dep(), src.dep())));
+            }
+            Instr::VDup { vd, size, q, rn } => {
+                let x = self.get(rn);
+                let n = (if q { 16 } else { 8 }) / size.bytes() as u8;
+                let r = (0..n).fold(0, |v, i| with_element(v, i, size, x.val));
+                self.vset(vd, VR::with(r, x));
+            }
+            Instr::VDupElem { vd, vn, index, size, lanes } => {
+                let v = self.vget(vn);
+                let e = element(v.val, index, size);
+                let r = (0..lanes).fold(0, |r, i| with_element(r, i, size, e));
+                self.vset(vd, VR { val: r, ..v });
+            }
+            Instr::VMovToGp { rd, vn, index, size, signed } => {
+                let v = self.vget(vn);
+                self.set(rd, RV { val: size.extend(element(v.val, index, size), signed), ..v.dep() });
+            }
+            Instr::VCnt { vd, vn, q } => {
+                let v = self.vget(vn);
+                let n = if q { 16 } else { 8 };
+                let r = (0..n).fold(0, |r, i| with_element(r, i, Size::B1, element(v.val, i, Size::B1).count_ones() as u64));
+                self.vset(vd, VR { val: r, ..v });
+            }
+            Instr::VAddv { vd, vn, q, long } => {
+                let v = self.vget(vn);
+                let sum: u64 = (0..if q { 16 } else { 8 }).map(|i| element(v.val, i, Size::B1)).sum();
+                let r = low_bytes(sum as u128, if long { 2 } else { 1 });
+                self.vset(vd, VR { val: r, ..v });
+            }
         }
         self.pc = next;
         self.steps += 1;

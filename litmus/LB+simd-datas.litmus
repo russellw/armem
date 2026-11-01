@@ -1,0 +1,11 @@
+AArch64 LB+simd-datas
+"Data dependencies through SIMD&FP loads, logic and stores order the stores"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0                     | P1                     ;
+ LDR S0,[X1]            | LDR S0,[X1]            ;
+ EOR V1.8B,V0.8B,V0.8B  | EOR V1.8B,V0.8B,V0.8B  ;
+ MOVI V2.2S,#1          | MOVI V2.2S,#1          ;
+ ORR V1.8B,V1.8B,V2.8B  | ORR V1.8B,V1.8B,V2.8B  ;
+ STR S1,[X3]            | STR S1,[X3]            ;
+ FMOV W0,S0             | FMOV W0,S0             ;
+exists (0:X0=1 /\ 1:X0=1)

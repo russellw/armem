@@ -393,6 +393,10 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         Ok(Instr::Alu { op, rd, rn, op2, flags })
     };
 
+    if SIMD_MNEMONICS.contains(&m) && ops.iter().any(|o| parse_vop(o).is_some()) {
+        return parse_simd(m, &ops);
+    }
+
     let ins = match m {
         // Hints that may be implemented as NOP, which is all the emulator needs.
         "NOP" | "YIELD" | "WFE" | "WFI" | "SEV" | "SEVL" => Instr::Nop,
@@ -847,6 +851,252 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         }
     };
     Ok(ins)
+}
+
+/// Mnemonics that have forms with SIMD&FP register operands.
+const SIMD_MNEMONICS: &[&str] = &[
+    "LDR", "STR", "LDUR", "STUR", "LDP", "STP", "LDNP", "STNP", "MOVI", "MVNI", "FMOV", "MOV", "INS", "UMOV", "SMOV", "DUP",
+    "AND", "BIC", "ORR", "ORN", "EOR", "CNT", "ADDV", "UADDLV",
+];
+
+/// A SIMD&FP register operand.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VOp {
+    /// Bn, Hn, Sn, Dn or Qn.
+    Scalar(VReg, Size),
+    /// Vn.T: the element size, and whether it is 128 bits (`Q`) or 64.
+    Vector(VReg, Size, bool),
+    /// Vn.Ts[index].
+    Elem(VReg, Size, u8),
+}
+
+fn elem_size(c: char) -> Option<Size> {
+    Some(match c {
+        'B' => Size::B1,
+        'H' => Size::B2,
+        'S' => Size::B4,
+        'D' => Size::B8,
+        _ => return None,
+    })
+}
+
+fn vreg_num(s: &str) -> Option<VReg> {
+    let n: u8 = s.parse().ok()?;
+    (n <= 31 && !s.starts_with('+')).then_some(n)
+}
+
+fn parse_vop(s: &str) -> Option<VOp> {
+    let u = s.trim().to_ascii_uppercase();
+    let mut chars = u.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str();
+    if first != 'V' {
+        let size = match first {
+            'Q' => Size::B16,
+            c => elem_size(c)?,
+        };
+        return Some(VOp::Scalar(vreg_num(rest)?, size));
+    }
+    let (n, t) = rest.split_once('.')?;
+    let n = vreg_num(n)?;
+    if let Some((e, i)) = t.strip_suffix(']').and_then(|t| t.split_once('[')) {
+        let mut ec = e.chars();
+        let size = elem_size(ec.next()?)?;
+        let i: u8 = i.parse().ok()?;
+        return (ec.next().is_none() && (i as u64) < 16 / size.bytes()).then_some(VOp::Elem(n, size, i));
+    }
+    let (size, q) = match t {
+        "8B" => (Size::B1, false),
+        "16B" => (Size::B1, true),
+        "4H" => (Size::B2, false),
+        "8H" => (Size::B2, true),
+        "2S" => (Size::B4, false),
+        "4S" => (Size::B4, true),
+        "2D" => (Size::B8, true),
+        _ => return None,
+    };
+    Some(VOp::Vector(n, size, q))
+}
+
+/// An instruction with SIMD&FP register operands.
+fn parse_simd(m: &str, ops: &[String]) -> Result<Instr> {
+    let bad = || Err(format!("{}: unsupported operands '{}'", m, ops.join(", ")));
+    let vop = |i: usize| ops.get(i).and_then(|o| parse_vop(o));
+    let gp = |i: usize| ops.get(i).ok_or_else(|| format!("{}: missing operand", m)).and_then(|o| parse_reg(o));
+    // A general-purpose register of the width that suits an element.
+    let gp_for = |i: usize, size: Size| -> Result<RegOp> {
+        let r = gp(i)?;
+        if r.wide != (size == Size::B8) {
+            return Err(format!("{}: register {} does not match the element size", m, r));
+        }
+        Ok(r)
+    };
+    match m {
+        "LDR" | "STR" | "LDUR" | "STUR" => {
+            let Some(VOp::Scalar(vt, size)) = vop(0) else { return bad() };
+            let addr = parse_mem_operand(ops, 1, m)?;
+            if m.ends_with("UR") && (addr.writeback != Writeback::None || !matches!(addr.offset, Offset::Imm(_))) {
+                return Err(format!("{}: only an immediate offset is allowed", m));
+            }
+            if let Offset::Reg(_, Extend::Lsl(s) | Extend::Uxtw(s) | Extend::Sxtw(s)) = addr.offset {
+                if s != 0 && 1u64 << s != size.bytes() {
+                    return Err(format!("{}: bad index shift", m));
+                }
+            }
+            Ok(if m.starts_with('L') {
+                Instr::VLoad { vt, vt2: None, addr, size }
+            } else {
+                Instr::VStore { vt, vt2: None, addr, size }
+            })
+        }
+        "LDP" | "STP" | "LDNP" | "STNP" => {
+            let (Some(VOp::Scalar(vt, size)), Some(VOp::Scalar(vt2, size2))) = (vop(0), vop(1)) else { return bad() };
+            if size != size2 || size < Size::B4 {
+                return Err(format!("{}: registers must be S, D or Q, of the same size", m));
+            }
+            let addr = parse_mem_operand(ops, 2, m)?;
+            if !matches!(addr.offset, Offset::Imm(_)) || (m.ends_with("NP") && addr.writeback != Writeback::None) {
+                return Err(format!("{}: bad addressing mode", m));
+            }
+            if m.starts_with('L') {
+                if vt == vt2 {
+                    return Err(format!("UNPREDICTABLE register combination in '{} {}'", m, ops.join(", ")));
+                }
+                Ok(Instr::VLoad { vt, vt2: Some(vt2), addr, size })
+            } else {
+                Ok(Instr::VStore { vt, vt2: Some(vt2), addr, size })
+            }
+        }
+        "MOVI" | "MVNI" => {
+            let (vd, esize, q) = match vop(0) {
+                Some(VOp::Scalar(vd, Size::B8)) if m == "MOVI" => (vd, Size::B8, false),
+                Some(VOp::Vector(vd, esize, q)) => (vd, esize, q),
+                _ => return bad(),
+            };
+            if !(2..=3).contains(&ops.len()) {
+                return bad();
+            }
+            let imm = parse_imm(&ops[1])?;
+            let shift = ops.get(2).map(|e| e.trim().to_ascii_uppercase());
+            let (kind, amt) = match &shift {
+                None => ("LSL", 0),
+                Some(e) => {
+                    let (k, a) = e.split_once(char::is_whitespace).ok_or_else(|| format!("{}: bad shift '{}'", m, e))?;
+                    (if k == "MSL" { "MSL" } else if k == "LSL" { "LSL" } else { return bad() }, parse_imm(a)? as u32)
+                }
+            };
+            let i = imm as u64;
+            let rep32 = |v: u64| v | v << 32;
+            let byte_ok = (0..=255).contains(&imm);
+            let v = match (esize, kind, amt) {
+                (Size::B8, "LSL", 0) if m == "MOVI" && (0..8).all(|b| matches!(i >> (8 * b) & 0xff, 0 | 0xff)) => i,
+                (Size::B1, "LSL", 0) if m == "MOVI" && byte_ok => i * 0x0101_0101_0101_0101,
+                (Size::B2, "LSL", 0 | 8) if byte_ok => (i << amt) * 0x0001_0001_0001_0001,
+                (Size::B4, "LSL", 0 | 8 | 16 | 24) if byte_ok => rep32(i << amt),
+                (Size::B4, "MSL", 8 | 16) if byte_ok => rep32(i << amt | ((1 << amt) - 1)),
+                _ => return Err(format!("{}: bad immediate '{}'", m, ops[1..].join(", "))),
+            };
+            let v = if m == "MVNI" { !v } else { v };
+            Ok(Instr::VMovImm { vd, imm: if q { v as u128 | (v as u128) << 64 } else { v as u128 } })
+        }
+        "FMOV" => {
+            want(ops, 2, m)?;
+            Ok(match (vop(0), vop(1)) {
+                (Some(VOp::Scalar(vd, size @ (Size::B4 | Size::B8))), None) => {
+                    Instr::VIns { vd, index: 0, size, rn: gp_for(1, size)?, zero: true }
+                }
+                (Some(VOp::Elem(vd, Size::B8, 1)), None) => Instr::VIns { vd, index: 1, size: Size::B8, rn: gp_for(1, Size::B8)?, zero: false },
+                (None, Some(VOp::Scalar(vn, size @ (Size::B4 | Size::B8)))) => {
+                    Instr::VMovToGp { rd: gp_for(0, size)?, vn, index: 0, size, signed: false }
+                }
+                (None, Some(VOp::Elem(vn, Size::B8, 1))) => {
+                    Instr::VMovToGp { rd: gp_for(0, Size::B8)?, vn, index: 1, size: Size::B8, signed: false }
+                }
+                (Some(VOp::Scalar(vd, s1 @ (Size::B4 | Size::B8))), Some(VOp::Scalar(vn, s2))) if s1 == s2 => {
+                    Instr::VMov { vd, vn, size: s1 }
+                }
+                _ => return bad(),
+            })
+        }
+        "MOV" | "INS" | "UMOV" | "SMOV" => {
+            want(ops, 2, m)?;
+            Ok(match (m, vop(0), vop(1)) {
+                ("MOV", Some(VOp::Vector(vd, Size::B1, q)), Some(VOp::Vector(vn, Size::B1, q2))) if q == q2 => {
+                    Instr::VLogic { op: AluOp::Orr, vd, vn, vm: vn, q }
+                }
+                ("MOV" | "INS", Some(VOp::Elem(vd, size, index)), None) => Instr::VIns { vd, index, size, rn: gp_for(1, size)?, zero: false },
+                ("MOV" | "INS", Some(VOp::Elem(vd, size, index)), Some(VOp::Elem(vn, s2, index2))) if size == s2 => {
+                    Instr::VInsElem { vd, index, vn, index2, size }
+                }
+                ("MOV", Some(VOp::Scalar(vd, s1)), Some(VOp::Elem(vn, size, index))) if s1 == size => {
+                    Instr::VDupElem { vd, vn, index, size, lanes: 1 }
+                }
+                ("MOV", None, Some(VOp::Elem(vn, size @ (Size::B4 | Size::B8), index)))
+                | ("UMOV", None, Some(VOp::Elem(vn, size, index))) => {
+                    Instr::VMovToGp { rd: gp_for(0, size)?, vn, index, size, signed: false }
+                }
+                ("SMOV", None, Some(VOp::Elem(vn, size @ (Size::B1 | Size::B2 | Size::B4), index))) => {
+                    let rd = gp(0)?;
+                    if size == Size::B4 && !rd.wide {
+                        return bad();
+                    }
+                    Instr::VMovToGp { rd, vn, index, size, signed: true }
+                }
+                _ => return bad(),
+            })
+        }
+        "DUP" => {
+            want(ops, 2, m)?;
+            match (vop(0), vop(1)) {
+                (Some(VOp::Vector(vd, size, q)), None) => Ok(Instr::VDup { vd, size, q, rn: gp_for(1, size)? }),
+                (Some(VOp::Vector(vd, size, q)), Some(VOp::Elem(vn, s2, index))) if size == s2 => {
+                    let lanes = (if q { 16 } else { 8 }) / size.bytes() as u8;
+                    Ok(Instr::VDupElem { vd, vn, index, size, lanes })
+                }
+                (Some(VOp::Scalar(vd, s1)), Some(VOp::Elem(vn, size, index))) if s1 == size => {
+                    Ok(Instr::VDupElem { vd, vn, index, size, lanes: 1 })
+                }
+                _ => bad(),
+            }
+        }
+        "AND" | "BIC" | "ORR" | "ORN" | "EOR" => {
+            want(ops, 3, m)?;
+            let (Some(VOp::Vector(vd, Size::B1, q)), Some(VOp::Vector(vn, Size::B1, q1)), Some(VOp::Vector(vm, Size::B1, q2))) =
+                (vop(0), vop(1), vop(2))
+            else {
+                return bad();
+            };
+            if q != q1 || q != q2 {
+                return bad();
+            }
+            let op = match m {
+                "AND" => AluOp::And,
+                "BIC" => AluOp::Bic,
+                "ORR" => AluOp::Orr,
+                "ORN" => AluOp::Orn,
+                _ => AluOp::Eor,
+            };
+            Ok(Instr::VLogic { op, vd, vn, vm, q })
+        }
+        "CNT" => {
+            want(ops, 2, m)?;
+            match (vop(0), vop(1)) {
+                (Some(VOp::Vector(vd, Size::B1, q)), Some(VOp::Vector(vn, Size::B1, q2))) if q == q2 => Ok(Instr::VCnt { vd, vn, q }),
+                _ => bad(),
+            }
+        }
+        _ => {
+            // ADDV, UADDLV
+            want(ops, 2, m)?;
+            let long = m == "UADDLV";
+            match (vop(0), vop(1)) {
+                (Some(VOp::Scalar(vd, s)), Some(VOp::Vector(vn, Size::B1, q))) if s == if long { Size::B2 } else { Size::B1 } => {
+                    Ok(Instr::VAddv { vd, vn, q, long })
+                }
+                _ => bad(),
+            }
+        }
+    }
 }
 
 const LOADS: &[&str] = &["LDR", "LDUR", "LDAR", "LDAPR", "LDXR", "LDAXR"];

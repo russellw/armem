@@ -1,0 +1,8 @@
+AArch64 LDR-Q-halves
+"Each aligned 64-bit half of a Q load or store is single-copy atomic"
+{ uint64_t x[2]; 0:X1=x; 1:X1=x; }
+ P0                 | P1              ;
+ MOVI V0.2D,#0xffffffffffffffff | LDR Q0,[X1] ;
+ STR Q0,[X1]        | MOV X2,V0.D[0]  ;
+                    | MOV X3,V0.D[1]  ;
+exists (~(1:X2=0) /\ ~(1:X2=-1) \/ ~(1:X3=0) /\ ~(1:X3=-1))

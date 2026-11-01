@@ -408,13 +408,72 @@ fn compiled_calls() {
     }
 }
 
+const C_STRUCT: &str = r#"
+typedef __UINT64_TYPE__ u64;
+struct pair { u64 a, b; };
+struct pair data, out;
+int flag;
+void writer(void) { struct pair p = { 1, 1 }; data = p; __atomic_store_n(&flag, 1, REL); }
+void reader(void) { while (!__atomic_load_n(&flag, ACQ)) {} out = data; }
+"#;
+
+/// Compiled C that publishes a 16-byte struct, which clang copies through
+/// Q registers. With a relaxed flag the reader can copy a stale or torn
+/// struct on ARM only; release/acquire fixes it.
+#[test]
+fn compiled_struct_copy() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let c = scratch("struct.c");
+    std::fs::write(&c, C_STRUCT).unwrap();
+    let test = scratch("struct-c.litmus");
+    std::fs::write(&test, "AArch64 struct-c\n{ uint64_t out[2]; }\n P0 = writer | P1 = reader ;\nexists (~(out[0]=1 /\\ out[1]=1))\n")
+        .unwrap();
+    let relaxed = ["-DACQ=__ATOMIC_RELAXED", "-DREL=__ATOMIC_RELAXED"];
+    let ordered = ["-DACQ=__ATOMIC_ACQUIRE", "-DREL=__ATOMIC_RELEASE"];
+    for opt in ["-O0", "-O2"] {
+        for (order, arm_only) in [(ordered, false), (relaxed, true)] {
+            let tag = format!("{} {}", opt, order[0]);
+            let o = scratch("struct.o");
+            let out = Command::new(&clang)
+                .args(["--target=aarch64-linux-gnu", opt, "-fno-pic", "-c", "-o"])
+                .arg(&o)
+                .args(order)
+                .arg(&c)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let data = std::fs::read(&o).unwrap();
+            let elf = Elf::parse(&data).unwrap();
+            let code = Image::load(&elf, &LoadOptions::default()).unwrap().code().unwrap().unwrap();
+            let q = |i: &armem::isa::Instr, load: bool| match i {
+                armem::isa::Instr::VLoad { size: armem::isa::Size::B16, .. } => load,
+                armem::isa::Instr::VStore { size: armem::isa::Size::B16, .. } => !load,
+                _ => false,
+            };
+            assert!(code.instrs.iter().any(|i| q(i, true)) && code.instrs.iter().any(|i| q(i, false)), "{}: no Q loads and stores", tag);
+            let out = Command::new(env!("CARGO_BIN_EXE_armem")).arg("--elf").arg(&o).arg(&test).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(text.contains("reachable on ARM only"), arm_only, "{}:\n{}", tag, text);
+            assert!(!text.contains("fuel") && !text.contains("FAULT"), "{}:\n{}", tag, text);
+        }
+    }
+}
+
 /// Arithmetic that compilers turn into bitfield moves (UBFX, BFI, SXTH,
 /// ...), multiply-adds and high multiplies (division by a constant),
 /// divisions, inverted logical operations, shifted operands, CSINV/CSNEG,
-/// CCMP, byte and bit reversal (REV, RBIT), leading-bit counts (CLZ,
-/// and CLS, though clang does not emit it), rotates and EXTR, and 128-bit addition and subtraction (ADC,
-/// SBC). The hash of the results must be the same as when the code is
-/// compiled for the host and run natively.
+/// CCMP, byte and bit reversal (REV, RBIT), leading-bit counts (CLZ, and
+/// CLS, though clang does not emit it), rotates and EXTR, 128-bit addition
+/// and subtraction (ADC, SBC; at -O0 clang spills `__int128` values through
+/// Q registers), and popcount (CNT and UADDLV on SIMD&FP registers). The
+/// hash of the results must be the same as when the code is compiled for
+/// the host and run natively.
 const C_ARITH: &str = r#"typedef __UINT8_TYPE__ uint8_t;
 typedef __INT8_TYPE__ int8_t;
 typedef __INT16_TYPE__ int16_t;
@@ -463,9 +522,11 @@ __attribute__((noinline)) void ops(u64 a, u64 b, u64 *h) {
   mix(h, a ? __builtin_clzll(a) : 64); mix(h, wb ? __builtin_clz(wb) : 32); mix(h, wb ? __builtin_ctz(wb) : 32);
   mix(h, __builtin_clrsbll(sa)); mix(h, __builtin_clrsb(swb));
   mix(h, (a >> (b & 63)) | (a << (-b & 63))); mix(h, (wa >> 7) | (wa << 25)); mix(h, (a << 9) | (b >> 55));
-  /* No __int128 variables: at -O0 clang spills them through SIMD registers. */
-  mix(h, (u64)((((unsigned __int128)a << 64 | b) + ((unsigned __int128)b << 64 | a)) >> 64));
-  mix(h, (u64)((((unsigned __int128)a << 64 | b) - ((unsigned __int128)b << 64 | wa)) >> 64));
+  /* At -O0, clang spills these through Q registers. */
+  unsigned __int128 p = ((unsigned __int128)a << 64 | b) + ((unsigned __int128)b << 64 | a);
+  unsigned __int128 q = ((unsigned __int128)a << 64 | b) - ((unsigned __int128)b << 64 | wa);
+  mix(h, (u64)p); mix(h, (u64)(p >> 64)); mix(h, (u64)q); mix(h, (u64)(q >> 64));
+  mix(h, __builtin_popcountll(a)); mix(h, __builtin_popcount(wb));
 }
 
 void run(void) {
@@ -516,7 +577,7 @@ fn compiled_arithmetic() {
             let data = std::fs::read(&o).unwrap();
             let elf = Elf::parse(&data).unwrap();
             let code = Image::load(&elf, &LoadOptions::default()).unwrap().code().unwrap().unwrap();
-            let kinds: [(&str, fn(&Instr) -> bool); 19] = [
+            let kinds: [(&str, fn(&Instr) -> bool); 20] = [
                 ("bitfield", |i| matches!(i, Instr::Bitfield { .. })),
                 ("MADD/MSUB", |i| matches!(i, Instr::Madd { kind: MulKind::Plain, .. })),
                 ("UMULL", |i| matches!(i, Instr::Madd { kind: MulKind::UnsignedLong, .. })),
@@ -536,6 +597,7 @@ fn compiled_arithmetic() {
                 ("ROR immediate", |i| matches!(i, Instr::Extr { rn, rm, .. } if rn == rm)),
                 ("RORV", |i| matches!(i, Instr::Alu { op: AluOp::Ror, .. })),
                 ("ADC/SBC", |i| matches!(i, Instr::Adc { .. })),
+                ("CNT", |i| matches!(i, Instr::VCnt { .. })),
             ];
             for (name, f) in kinds {
                 assert!(code.instrs.iter().any(f), "no {} in the -O2 code", name);

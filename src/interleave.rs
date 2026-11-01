@@ -6,7 +6,7 @@
 //! They answer the question "could this outcome also have happened on an
 //! x86-like machine?", so that ARM-only outcomes can be singled out.
 
-use crate::core::{Core, MemOp, RV, Step, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::Outcomes;
@@ -190,6 +190,23 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                         t.core.set(rt, RV { val: v1, pick: 0, view: 0 });
                         t.core.set(rt2, RV { val: v2, pick: 0, view: 0 });
                         t.core.retire(prog);
+                        true
+                    }
+                    MemOp::VLoad { addr, vt, vt2, size } => {
+                        // All registers are read in one step.
+                        for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
+                            let val = n.read(tid, addr.val + i as u64 * size.bytes(), size, test);
+                            n.threads[tid].core.vset(v, VR { val, view: 0, pick: 0 });
+                        }
+                        n.threads[tid].core.retire(prog);
+                        true
+                    }
+                    MemOp::VStore { addr, data, data2, size } => {
+                        let len = size.bytes();
+                        for (i, d) in std::iter::once(data).chain(data2).enumerate() {
+                            n.store(tid, kind, (addr.val + i as u64 * len, size, low_bytes(d.val, len)));
+                        }
+                        n.threads[tid].core.retire(prog);
                         true
                     }
                     MemOp::Store { addr, data, size, .. } => {

@@ -15,6 +15,9 @@
 //! the instruction's own index. `BL` and `BLR` write a return address,
 //! which is computed when they run (`isa::Code::addr`).
 //!
+//! SIMD&FP data processing covers only the moves, vector logic and byte
+//! counts in `isa::Instr` (`simd_fp`).
+//!
 //! `ADR` and `ADRP` compute an address from the PC, so they decode only when
 //! the code's load address is known (`decode_at`, `decode_program_at`), and
 //! become `MovImm` of the computed address: the result is a constant with
@@ -206,8 +209,123 @@ fn decode_inner(w: u32, index: usize, base: Option<u64>) -> Result<Instr> {
         0b1010 | 0b1011 => branch_system(w, index),
         0b0101 | 0b1101 => data_reg(w),
         _ if op0 & 0b0101 == 0b0100 => load_store(w),
+        _ if op0 & 0b0111 == 0b0111 => simd_fp(w),
         _ => unsupported(),
     }
+}
+
+/// The 64-bit value of an Advanced SIMD modified immediate (the
+/// architecture's AdvSIMDExpandImm), for the MOVI and MVNI encodings only.
+fn simd_imm(op: bool, cmode: u32, imm8: u32) -> Option<u64> {
+    let i = imm8 as u64;
+    let rep32 = |v: u64| v | v << 32;
+    let rep16 = |v: u64| v * 0x0001_0001_0001_0001;
+    let v = match (cmode >> 1, cmode & 1) {
+        (0..=3, 0) => rep32(i << (8 * (cmode >> 1))),
+        (4 | 5, 0) => rep16(i << (8 * ((cmode >> 1) & 1))),
+        (6, msl) => rep32(if msl == 0 { i << 8 | 0xff } else { i << 16 | 0xffff }),
+        (7, 0) if !op => i * 0x0101_0101_0101_0101,
+        (7, 0) => (0..8).fold(0, |v, b| v | if imm8 >> b & 1 != 0 { 0xff << (8 * b) } else { 0 }),
+        // ORR, BIC and FMOV (immediate).
+        _ => return None,
+    };
+    // MVNI, except for the 64-bit MOVI.
+    Some(if op && cmode != 0b1110 { !v } else { v })
+}
+
+/// Data processing on SIMD&FP registers: moves, vector logic, CNT, ADDV and
+/// UADDLV.
+fn simd_fp(w: u32) -> Result<Instr> {
+    let (rd, rn, rm) = (bits(w, 4, 0) as u8, bits(w, 9, 5) as u8, bits(w, 20, 16) as u8);
+    let q = bit(w, 30);
+    // Advanced SIMD copy: DUP (general), INS, SMOV, UMOV.
+    if w & 0x9fe0_8400 == 0x0e00_0400 {
+        let imm5 = bits(w, 20, 16);
+        let tz = imm5.trailing_zeros();
+        if tz > 3 {
+            return unsupported();
+        }
+        let size = size_field(tz);
+        let index = (imm5 >> (tz + 1)) as u8;
+        let gp = |i: u8, wide: bool| zr(i as u32, wide);
+        let lanes = (if q { 16 } else { 8 }) / size.bytes() as u8;
+        return match (bit(w, 29), bits(w, 14, 11), q, tz) {
+            (false, 0b0000, _, 0..=2) | (false, 0b0000, true, 3) => Ok(Instr::VDupElem { vd: rd, vn: rn, index, size, lanes }),
+            (false, 0b0001, _, 0..=2) | (false, 0b0001, true, 3) => Ok(Instr::VDup { vd: rd, size, q, rn: gp(rn, tz == 3) }),
+            (false, 0b0011, true, _) => Ok(Instr::VIns { vd: rd, index, size, rn: gp(rn, tz == 3), zero: false }),
+            (false, 0b0101, _, 0..=1) | (false, 0b0101, true, 2) => {
+                Ok(Instr::VMovToGp { rd: gp(rd, q), vn: rn, index, size, signed: true })
+            }
+            (false, 0b0111, false, 0..=2) | (false, 0b0111, true, 3) => {
+                Ok(Instr::VMovToGp { rd: gp(rd, q), vn: rn, index, size, signed: false })
+            }
+            (true, imm4, true, _) => Ok(Instr::VInsElem { vd: rd, index, vn: rn, index2: (imm4 >> tz) as u8, size }),
+            _ => unsupported(),
+        };
+    }
+    // Advanced SIMD scalar copy: DUP (element), also written MOV.
+    if w & 0xffe0_fc00 == 0x5e00_0400 {
+        let imm5 = bits(w, 20, 16);
+        let tz = imm5.trailing_zeros();
+        if tz > 3 {
+            return unsupported();
+        }
+        let index = (imm5 >> (tz + 1)) as u8;
+        return Ok(Instr::VDupElem { vd: rd, vn: rn, index, size: size_field(tz), lanes: 1 });
+    }
+    // Advanced SIMD modified immediate: MOVI, MVNI.
+    if w & 0x9ff8_0400 == 0x0f00_0400 {
+        let (op, cmode) = (bit(w, 29), bits(w, 15, 12));
+        let imm8 = bits(w, 18, 16) << 5 | bits(w, 9, 5);
+        if bit(w, 11) {
+            return unsupported();
+        }
+        let Some(v) = simd_imm(op, cmode, imm8) else {
+            return unsupported();
+        };
+        let imm = if q { v as u128 | (v as u128) << 64 } else { v as u128 };
+        return Ok(Instr::VMovImm { vd: rd, imm });
+    }
+    // Advanced SIMD three same, logical: AND, BIC, ORR, ORN, EOR.
+    if w & 0x9f20_fc00 == 0x0e20_1c00 {
+        let op = match (bit(w, 29), bits(w, 23, 22)) {
+            (false, 0) => AluOp::And,
+            (false, 1) => AluOp::Bic,
+            (false, 2) => AluOp::Orr,
+            (false, _) => AluOp::Orn,
+            (true, 0) => AluOp::Eor,
+            _ => return unsupported(), // BSL, BIT, BIF
+        };
+        return Ok(Instr::VLogic { op, vd: rd, vn: rn, vm: rm, q });
+    }
+    match w & 0xbfff_fc00 {
+        0x0e20_5800 => return Ok(Instr::VCnt { vd: rd, vn: rn, q }),
+        0x0e31_b800 => return Ok(Instr::VAddv { vd: rd, vn: rn, q, long: false }),
+        0x2e30_3800 => return Ok(Instr::VAddv { vd: rd, vn: rn, q, long: true }),
+        _ => {}
+    }
+    // FMOV (general): between a general-purpose register and S, D or the
+    // upper half of a V register.
+    if w & 0x7f20_fc00 == 0x1e20_0000 {
+        let (index, size) = match (bit(w, 31), bits(w, 23, 22), bits(w, 20, 19), bits(w, 18, 17)) {
+            (false, 0b00, 0b00, 0b11) => (0, Size::B4),
+            (true, 0b01, 0b00, 0b11) => (0, Size::B8),
+            (true, 0b10, 0b01, 0b11) => (1, Size::B8),
+            _ => return unsupported(),
+        };
+        let wide = bit(w, 31);
+        return Ok(if bit(w, 16) {
+            Instr::VIns { vd: rd, index, size, rn: zr(rn as u32, wide), zero: index == 0 }
+        } else {
+            Instr::VMovToGp { rd: zr(rd as u32, wide), vn: rn, index, size, signed: false }
+        });
+    }
+    // FMOV (register): S or D.
+    if w & 0xff3f_fc00 == 0x1e20_4000 && bits(w, 23, 22) < 2 {
+        let size = if bit(w, 22) { Size::B8 } else { Size::B4 };
+        return Ok(Instr::VMov { vd: rd, vn: rn, size });
+    }
+    unsupported()
 }
 
 /// ADR / ADRP.
@@ -508,17 +626,23 @@ fn same_base(rt: u32, rn: u32) -> bool {
     rt == rn && rn != 31
 }
 
+/// The log2 of the size of a single-register load or store: as given by
+/// the size field, except for a Q register.
+fn scale(w: u32) -> u32 {
+    if bit(w, 26) && bit(w, 23) && bits(w, 31, 30) == 0 { 4 } else { bits(w, 31, 30) }
+}
+
 fn load_store(w: u32) -> Result<Instr> {
-    if bit(w, 26) {
-        return Err("SIMD/FP loads and stores are not supported".into());
-    }
+    let v = bit(w, 26);
     let (rt, rn) = (bits(w, 4, 0), bits(w, 9, 5));
     match bits(w, 29, 27) {
-        0b001 if bits(w, 25, 24) == 0 => exclusive_ordered(w),
+        0b001 if bits(w, 25, 24) == 0 && !v => exclusive_ordered(w),
         0b011 if !bit(w, 24) => Err("PC-relative literal loads are not supported".into()),
+        0b101 if !bit(w, 25) && v => vpair(w),
         0b101 if !bit(w, 25) => pair(w),
         0b111 => {
-            let size = bits(w, 31, 30);
+            let size = scale(w);
+            let single = if v { vsingle } else { single };
             if bits(w, 25, 24) == 0b01 {
                 let off = (bits(w, 21, 10) as i64) << size;
                 let addr = Addr { base: sp(rn, true), offset: Offset::Imm(off), writeback: Writeback::None };
@@ -536,7 +660,7 @@ fn load_store(w: u32) -> Result<Instr> {
                     0b11 => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::Pre },
                     _ => return unsupported(), // LDTR/STTR
                 };
-                if addr.writeback != Writeback::None && same_base(rt, rn) {
+                if addr.writeback != Writeback::None && same_base(rt, rn) && !v {
                     return unpredictable();
                 }
                 return single(w, addr);
@@ -555,7 +679,7 @@ fn load_store(w: u32) -> Result<Instr> {
                     let addr = Addr { base: sp(rn, true), offset: Offset::Reg(rm, ext), writeback: Writeback::None };
                     single(w, addr)
                 }
-                0b00 => atomic(w),
+                0b00 if !v => atomic(w),
                 _ => unsupported(),
             }
         }
@@ -583,6 +707,17 @@ fn single(w: u32, addr: Addr) -> Result<Instr> {
         0b11 if size < 2 => Ok(load(false, true)),
         _ => unsupported(), // PRFM and unallocated
     }
+}
+
+/// LDR / STR of a SIMD&FP register, given the decoded address.
+fn vsingle(w: u32, addr: Addr) -> Result<Instr> {
+    let vt = bits(w, 4, 0) as u8;
+    let (size, load) = match (bits(w, 31, 30), bits(w, 23, 22)) {
+        (s, opc @ (0b00 | 0b01)) => (size_field(s), opc == 1),
+        (0b00, opc) => (Size::B16, opc == 0b11),
+        _ => return unsupported(),
+    };
+    Ok(if load { Instr::VLoad { vt, vt2: None, addr, size } } else { Instr::VStore { vt, vt2: None, addr, size } })
 }
 
 /// LSE atomics (including the ST<op> aliases) and LDAPR.
@@ -709,6 +844,30 @@ fn pair(w: u32) -> Result<Instr> {
     } else {
         Instr::StorePair { rt, rt2, addr, size }
     })
+}
+
+/// LDP, STP, LDNP, STNP of SIMD&FP registers.
+fn vpair(w: u32) -> Result<Instr> {
+    let (size, shift) = match bits(w, 31, 30) {
+        0b00 => (Size::B4, 2),
+        0b01 => (Size::B8, 3),
+        0b10 => (Size::B16, 4),
+        _ => return unsupported(),
+    };
+    let load = bit(w, 22);
+    let (vt2, rn, vt) = (bits(w, 14, 10) as u8, bits(w, 9, 5), bits(w, 4, 0) as u8);
+    let imm = sext(bits(w, 21, 15), 7) << shift;
+    let base = sp(rn, true);
+    let addr = match bits(w, 24, 23) {
+        0b00 | 0b10 => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::None },
+        0b01 => Addr { base, offset: Offset::Imm(0), writeback: Writeback::Post(imm) },
+        _ => Addr { base, offset: Offset::Imm(imm), writeback: Writeback::Pre },
+    };
+    if load && vt == vt2 {
+        return unpredictable();
+    }
+    let vt2 = Some(vt2);
+    Ok(if load { Instr::VLoad { vt, vt2, addr, size } } else { Instr::VStore { vt, vt2, addr, size } })
 }
 
 #[cfg(test)]
@@ -845,6 +1004,102 @@ mod tests {
             0xba00_0420,
         ] {
             assert!(decode(word, 0).is_err(), "{:#x}", word);
+        }
+    }
+
+    #[test]
+    fn simd_fp() {
+        // Encodings and text from llvm-mc.
+        let text = [
+            (0x6f00_e400, "MOVI V0.2D,#0000000000000000"),
+            (0x6f05_e540, "MOVI V0.2D,#0XFF00FF00FF00FF00"),
+            (0x2f05_e541, "MOVI D1,#0XFF00FF00FF00FF00"),
+            (0x2f00_e401, "MOVI D1,#0000000000000000"),
+            (0x4f07_e7e2, "MOVI V2.16B,#255"),
+            (0x0f00_e422, "MOVI V2.8B,#1"),
+            (0x0f00_a423, "MOVI V3.4H,#1,LSL #8"),
+            (0x4f00_8423, "MOVI V3.8H,#1"),
+            (0x0f00_6424, "MOVI V4.2S,#1,LSL #24"),
+            (0x4f00_d444, "MOVI V4.4S,#2,MSL #16"),
+            (0x6f00_2465, "MVNI V5.4S,#3,LSL #8"),
+            (0x2f00_8465, "MVNI V5.4H,#3"),
+            (0x2f00_c486, "MVNI V6.2S,#4,MSL #8"),
+            (0x1e27_0020, "FMOV S0,W1"),
+            (0x1e26_0001, "FMOV W1,S0"),
+            (0x9e67_0020, "FMOV D0,X1"),
+            (0x9e66_0001, "FMOV X1,D0"),
+            (0x9eaf_0020, "FMOV V0.D[1],X1"),
+            (0x9eae_0001, "FMOV X1,V0.D[1]"),
+            (0x1e20_4062, "FMOV S2,S3"),
+            (0x1e60_4062, "FMOV D2,D3"),
+            (0x4ea1_1c20, "MOV V0.16B,V1.16B"),
+            (0x0ea1_1c20, "MOV V0.8B,V1.8B"),
+            (0x4ea2_1c20, "ORR V0.16B,V1.16B,V2.16B"),
+            (0x0e22_1c20, "AND V0.8B,V1.8B,V2.8B"),
+            (0x4e62_1c20, "BIC V0.16B,V1.16B,V2.16B"),
+            (0x4ee2_1c20, "ORN V0.16B,V1.16B,V2.16B"),
+            (0x6e22_1c20, "EOR V0.16B,V1.16B,V2.16B"),
+            (0x4e0c_1c20, "MOV V0.S[1],W1"),
+            (0x4e18_1c20, "MOV V0.D[1],X1"),
+            (0x4e1f_1c20, "MOV V0.B[15],W1"),
+            (0x6e0e_7420, "MOV V0.H[3],V1.H[7]"),
+            (0x0e07_3c20, "UMOV W0,V1.B[3]"),
+            (0x0e0c_3c20, "MOV W0,V1.S[1]"),
+            (0x4e18_3c20, "MOV X0,V1.D[1]"),
+            (0x0e07_2c20, "SMOV W0,V1.B[3]"),
+            (0x4e1c_2c20, "SMOV X0,V1.S[3]"),
+            (0x4e0e_2c20, "SMOV X0,V1.H[3]"),
+            (0x4e04_0c20, "DUP V0.4S,W1"),
+            (0x4e08_0c20, "DUP V0.2D,X1"),
+            (0x0e01_0c20, "DUP V0.8B,W1"),
+            (0x0e20_5820, "CNT V0.8B,V1.8B"),
+            (0x4e20_5820, "CNT V0.16B,V1.16B"),
+            (0x4e31_b820, "ADDV B0,V1.16B"),
+            (0x2e30_3820, "UADDLV H0,V1.8B"),
+            (0x5e18_0400, "MOV D0,V0.D[1]"),
+            (0x5e1f_0441, "MOV B1,V2.B[15]"),
+            (0x5e14_0483, "DUP S3,V4.S[2]"),
+            (0x4e1c_0420, "DUP V0.4S,V1.S[3]"),
+            (0x0e0f_0462, "DUP V2.8B,V3.B[7]"),
+            (0x4e18_04a4, "DUP V4.2D,V5.D[1]"),
+            (0x3dc0_0420, "LDR Q0,[X1,#16]"),
+            (0x3c62_6820, "LDR B0,[X1,X2]"),
+            (0x3c62_7820, "LDR B0,[X1,X2,LSL #0]"),
+            (0x3ce2_7820, "LDR Q0,[X1,X2,LSL #4]"),
+            (0x7c62_d820, "LDR H0,[X1,W2,SXTW #1]"),
+            (0xfc1f_8fe0, "STR D0,[SP,#-8]!"),
+            (0x3cdf_f020, "LDUR Q0,[X1,#-1]"),
+            (0xacc1_07e0, "LDP Q0,Q1,[SP],#32"),
+            (0x6dbf_27e8, "STP D8,D9,[SP,#-16]!"),
+            (0x2c41_0400, "LDNP S0,S1,[X0,#8]"),
+            (0x3c9f_0420, "STR Q0,[X1],#-16"),
+        ];
+        for (word, src) in text {
+            let parsed = crate::asm::parse_instr(src, &Default::default());
+            assert!(parsed.is_ok(), "{}: {:?}", src, parsed);
+            assert_eq!(decode(word, 0), parsed, "{}", src);
+        }
+        let addr = Addr { base: RegOp { idx: 1, wide: true }, offset: Offset::Imm(16), writeback: Writeback::None };
+        assert_eq!(decode(0x3dc0_0420, 0), Ok(Instr::VLoad { vt: 0, vt2: None, addr, size: Size::B16 }));
+        assert_eq!(decode(0x4f07_e7e2, 0), Ok(Instr::VMovImm { vd: 2, imm: u128::MAX }));
+        assert_eq!(decode(0x2f00_c486, 0), Ok(Instr::VMovImm { vd: 6, imm: !0x0000_04ff_0000_04ffu64 as u128 }));
+        assert_eq!(decode(0x2f05_e541, 0), Ok(Instr::VMovImm { vd: 1, imm: 0xff00_ff00_ff00_ff00 }));
+        // LDP with Rt = Rt2; LDR with size 01 and opc 1x; ORR (vector,
+        // immediate); FMOV (vector, immediate); BSL; DUP V.1D; UMOV
+        // Wd from a D element; INS with Q = 0; FMOV H; LD1.
+        for word in [
+            0xad40_0000u32,
+            0x7cc0_0020,
+            0x4f00_1400,
+            0x4f00_f400,
+            0x6e62_1c20,
+            0x0e18_0420,
+            0x0e18_3c20,
+            0x0e0c_1c20,
+            0x1ee7_0020,
+            0x4c40_7020,
+        ] {
+            assert!(decode(word, 0).is_err(), "{:#x}: {:?}", word, decode(word, 0));
         }
     }
 

@@ -45,6 +45,7 @@ ALU-bitfield           yes  yes
 ALU-arith              yes  yes
 ALU-mul-logic          yes  yes
 ALU-rev-carry          yes  yes
+ALU-simd               yes  yes
 LDST                   yes  yes
 SCA-H                  no   no
 MP-bytes               yes  no
@@ -84,3 +85,9 @@ LB+rev-extr-datas      no   no
 MP+dmb.sy+adc-addr     no   no
 MP+rel+ldaddnoret-dmb.ld yes no
 MP+rel+cas-addr        yes  no
+LDR-Q-torn             yes  no
+LDR-Q-torn             yes  no   lse2
+LDR-Q-halves           no   no
+MP+dmb.sy+fmov-addr    no   no
+LB+simd-datas          no   no
+MP+dmb.sy+addr-qspill  no   no

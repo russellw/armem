@@ -1,0 +1,11 @@
+AArch64 MP+dmb.sy+fmov-addr
+"An address dependency through SIMD&FP registers (FMOV, MOV) orders a later read"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0          | P1                  ;
+ MOV W0,#1   | LDR W0,[X1]         ;
+ STR W0,[X1] | FMOV S1,W0          ;
+ DMB SY      | MOV V2.16B,V1.16B   ;
+ MOV W2,#1   | FMOV W4,S2          ;
+ STR W2,[X3] | EOR W4,W4,W4        ;
+             | LDR W2,[X3,W4,SXTW] ;
+exists (1:X0=1 /\ 1:X2=0)

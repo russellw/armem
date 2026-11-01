@@ -1,0 +1,39 @@
+AArch64 ALU-rev-carry
+"Single-threaded check of byte and bit reversal, leading-bit counts, EXTR and rotates, and add/subtract with carry"
+{ }
+ P0                          ;
+ MOVZ X0,#0x0123,LSL #48     ;
+ MOVK X0,#0x4567,LSL #32     ;
+ MOVK X0,#0x89ab,LSL #16     ;
+ MOVK X0,#0xcdef             ;
+ REV X1,X0                   ;
+ REV32 X2,X0                 ;
+ REV16 X3,X0                 ;
+ REV W4,W0                   ;
+ RBIT X5,X0                  ;
+ RBIT W6,W0                  ;
+ CLZ X7,X0                   ;
+ CLZ W8,WZR                  ;
+ CLS X9,X0                   ;
+ MOV X10,#-1                 ;
+ CLS W11,W10                 ;
+ EXTR X12,X0,X1,#16          ;
+ ROR W13,W0,#4               ;
+ MOV X14,#72                 ;
+ ROR X15,X0,X14              ;
+ ROR W16,W0,W14              ;
+ ADDS X17,X10,#1             ;
+ ADC X18,X10,XZR             ;
+ NEGS X19,X10                ;
+ SBC X20,XZR,XZR             ;
+ CMP X0,X0                   ;
+ NGC X21,X0                  ;
+ MOV W22,#0x7fffffff         ;
+ ADCS W23,W22,WZR            ;
+ CSET W24,VS                 ;
+ CSET W25,CS                 ;
+ MOV W26,#5                  ;
+ CMP W0,W0                   ;
+ SBCS W27,W26,W26            ;
+ CSET W28,EQ                 ;
+forall (0:X1=0xefcdab8967452301 /\ 0:X2=0x67452301efcdab89 /\ 0:X3=0x23016745ab89efcd /\ 0:X4=0xefcdab89 /\ 0:X5=0xf7b3d591e6a2c480 /\ 0:X6=0xf7b3d591 /\ 0:X7=7 /\ 0:X8=32 /\ 0:X9=6 /\ 0:X11=31 /\ 0:X12=0xcdefefcdab896745 /\ 0:X13=0xf89abcde /\ 0:X15=0xef0123456789abcd /\ 0:X16=0xef89abcd /\ 0:X17=0 /\ 0:X18=0 /\ 0:X19=1 /\ 0:X20=-1 /\ 0:X21=0xfedcba9876543211 /\ 0:X23=0x80000000 /\ 0:X24=1 /\ 0:X25=0 /\ 0:X27=0 /\ 0:X28=1)

@@ -410,8 +410,10 @@ fn compiled_calls() {
 
 /// Arithmetic that compilers turn into bitfield moves (UBFX, BFI, SXTH,
 /// ...), multiply-adds and high multiplies (division by a constant),
-/// divisions, inverted logical operations, shifted operands, CSINV/CSNEG
-/// and CCMP. The hash of the results must be the same as when the code is
+/// divisions, inverted logical operations, shifted operands, CSINV/CSNEG,
+/// CCMP, byte and bit reversal (REV, RBIT), leading-bit counts (CLZ,
+/// and CLS, though clang does not emit it), rotates and EXTR, and 128-bit addition and subtraction (ADC,
+/// SBC). The hash of the results must be the same as when the code is
 /// compiled for the host and run natively.
 const C_ARITH: &str = r#"typedef __UINT8_TYPE__ uint8_t;
 typedef __INT8_TYPE__ int8_t;
@@ -456,6 +458,14 @@ __attribute__((noinline)) void ops(u64 a, u64 b, u64 *h) {
   mix(h, a == b ? -1 : 0); mix(h, a == 3 ? b : ~b); mix(h, (a < b) ? a + 1 : b);
   mix(h, (a > 5 && b < 9) ? 11 : 13); mix(h, (sa < sb || a == 100) ? 17 : 19);
   mix(h, (wa != 0 && wb == wa) ? 23 : 29); mix(h, (a == b || a == -b) ? 31 : 37);
+  mix(h, __builtin_bswap64(a)); mix(h, __builtin_bswap32(wb)); mix(h, __builtin_bswap16(a));
+  mix(h, __builtin_bitreverse64(a)); mix(h, __builtin_bitreverse32(wb));
+  mix(h, a ? __builtin_clzll(a) : 64); mix(h, wb ? __builtin_clz(wb) : 32); mix(h, wb ? __builtin_ctz(wb) : 32);
+  mix(h, __builtin_clrsbll(sa)); mix(h, __builtin_clrsb(swb));
+  mix(h, (a >> (b & 63)) | (a << (-b & 63))); mix(h, (wa >> 7) | (wa << 25)); mix(h, (a << 9) | (b >> 55));
+  /* No __int128 variables: at -O0 clang spills them through SIMD registers. */
+  mix(h, (u64)((((unsigned __int128)a << 64 | b) + ((unsigned __int128)b << 64 | a)) >> 64));
+  mix(h, (u64)((((unsigned __int128)a << 64 | b) - ((unsigned __int128)b << 64 | wa)) >> 64));
 }
 
 void run(void) {
@@ -502,11 +512,11 @@ fn compiled_arithmetic() {
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         if opt == "-O2" {
-            use armem::isa::{Extend, Instr, MulKind, Operand, AluOp};
+            use armem::isa::{AluOp, Extend, Instr, MulKind, Operand, UnaryOp};
             let data = std::fs::read(&o).unwrap();
             let elf = Elf::parse(&data).unwrap();
             let code = Image::load(&elf, &LoadOptions::default()).unwrap().code().unwrap().unwrap();
-            let kinds: [(&str, fn(&Instr) -> bool); 12] = [
+            let kinds: [(&str, fn(&Instr) -> bool); 19] = [
                 ("bitfield", |i| matches!(i, Instr::Bitfield { .. })),
                 ("MADD/MSUB", |i| matches!(i, Instr::Madd { kind: MulKind::Plain, .. })),
                 ("UMULL", |i| matches!(i, Instr::Madd { kind: MulKind::UnsignedLong, .. })),
@@ -519,6 +529,13 @@ fn compiled_arithmetic() {
                 ("CCMP/CCMN", |i| matches!(i, Instr::Ccmp { .. })),
                 ("ASR operand", |i| matches!(i, Instr::Alu { op2: Operand::RegExt(_, Extend::Asr(_)), .. })),
                 ("ROR operand", |i| matches!(i, Instr::Alu { op2: Operand::RegExt(_, Extend::Ror(_)), .. })),
+                ("REV", |i| matches!(i, Instr::Unary { op: UnaryOp::Rev, .. })),
+                ("RBIT", |i| matches!(i, Instr::Unary { op: UnaryOp::Rbit, .. })),
+                ("CLZ", |i| matches!(i, Instr::Unary { op: UnaryOp::Clz, .. })),
+                ("EXTR", |i| matches!(i, Instr::Extr { rn, rm, .. } if rn != rm)),
+                ("ROR immediate", |i| matches!(i, Instr::Extr { rn, rm, .. } if rn == rm)),
+                ("RORV", |i| matches!(i, Instr::Alu { op: AluOp::Ror, .. })),
+                ("ADC/SBC", |i| matches!(i, Instr::Adc { .. })),
             ];
             for (name, f) in kinds {
                 assert!(code.instrs.iter().any(f), "no {} in the -O2 code", name);

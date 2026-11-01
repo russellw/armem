@@ -144,6 +144,8 @@ pub enum AluOp {
     Lsl,
     Lsr,
     Asr,
+    /// Rotate right (RORV); ROR by an immediate is `Instr::Extr`.
+    Ror,
     Mul,
     /// Division rounds toward zero; dividing by zero gives 0.
     Udiv,
@@ -217,6 +219,23 @@ pub enum RmwOp {
     Swp,
 }
 
+/// Data-processing (1 source) operations, on the whole register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// RBIT: reverse the bits.
+    Rbit,
+    /// REV16: reverse the bytes in each halfword.
+    Rev16,
+    /// REV32 (X registers only): reverse the bytes in each word.
+    Rev32,
+    /// REV (REV64 for X registers): reverse all the bytes.
+    Rev,
+    /// CLZ: count leading zero bits.
+    Clz,
+    /// CLS: count the leading bits below the top bit that equal it.
+    Cls,
+}
+
 /// Multiply-add kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MulKind {
@@ -265,6 +284,15 @@ pub enum Instr {
     /// `sub`), and the long forms (`kind`). MADD with ra = the zero
     /// register is `Alu` MUL instead (see `Instr::madd`).
     Madd { kind: MulKind, rd: RegOp, rn: RegOp, rm: RegOp, ra: RegOp, sub: bool },
+    /// RBIT / REV16 / REV32 / REV / CLZ / CLS rd, rn.
+    Unary { op: UnaryOp, rd: RegOp, rn: RegOp },
+    /// EXTR rd, rn, rm, #lsb: bits lsb + datasize - 1 .. lsb of the
+    /// concatenation rn:rm. ROR (immediate) is EXTR with rn = rm.
+    Extr { rd: RegOp, rn: RegOp, rm: RegOp, lsb: u8 },
+    /// ADC / SBC rd, rn, rm: rd := rn + rm + C (rn + !rm + C when `sub`),
+    /// where C is the carry flag; `flags` for ADCS / SBCS. NGC(S) rd, rm
+    /// is SBC(S) rd, ZR, rm.
+    Adc { rd: RegOp, rn: RegOp, rm: RegOp, sub: bool, flags: bool },
     /// UMULH / SMULH rd, rn, rm: the high 64 bits of the 128-bit product.
     Mulh { rd: RegOp, rn: RegOp, rm: RegOp, signed: bool },
     /// CCMP / CCMN rn, op2, #nzcv, cond: if cond holds, set the flags as
@@ -415,7 +443,10 @@ impl Instr {
             | Instr::Csel { rd, .. }
             | Instr::Bitfield { rd, .. }
             | Instr::Madd { rd, .. }
-            | Instr::Mulh { rd, .. } => reg(rd),
+            | Instr::Mulh { rd, .. }
+            | Instr::Unary { rd, .. }
+            | Instr::Extr { rd, .. }
+            | Instr::Adc { rd, .. } => reg(rd),
             Instr::Load { rt, addr, .. } => {
                 reg(rt);
                 base = wb(addr);

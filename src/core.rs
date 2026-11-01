@@ -212,26 +212,53 @@ fn extend(v: u64, e: Extend, wide: bool) -> u64 {
     }
 }
 
-/// The NZCV flags (N=8, Z=4, C=2, V=1) set by `op` on `x` and `y`, whose
-/// result is `r`, all of them masked to the operation's size.
+/// The architecture's AddWithCarry: `x + y + carry` at the operation's
+/// size (64 bits if `wide`, else 32; `x` and `y` masked to it), and the
+/// NZCV flags it sets (N=8, Z=4, C=2, V=1).
+fn add_with_carry(x: u64, y: u64, carry: bool, wide: bool) -> (u64, u64) {
+    let bits = if wide { 64 } else { 32 };
+    let sext = |v: u64| (v as i128) << (128 - bits) >> (128 - bits);
+    let unsigned = x as u128 + y as u128 + carry as u128;
+    let signed = sext(x) + sext(y) + carry as i128;
+    let r = unsigned as u64 & (u64::MAX >> (64 - bits));
+    let n = r >> (bits - 1) & 1;
+    let z = (r == 0) as u64;
+    let c = (unsigned >> bits != 0) as u64;
+    let v = (sext(r) != signed) as u64;
+    (r, n << 3 | z << 2 | c << 1 | v)
+}
+
+/// The NZCV flags set by `op` on `x` and `y`, whose result is `r`, all of
+/// them masked to the operation's size. Only ADD and SUB set C and V.
 fn nzcv(op: AluOp, x: u64, y: u64, r: u64, wide: bool) -> u64 {
-    let sign = if wide { 1u64 << 63 } else { 1 << 31 };
-    let n = r & sign != 0;
-    let z = r == 0;
-    let (c, v) = match op {
-        AluOp::Add => {
-            let c = if wide { x.checked_add(y).is_none() } else { x + y > 0xffff_ffff };
-            let v = (x & sign == y & sign) && (r & sign != x & sign);
-            (c, v)
+    match op {
+        AluOp::Add => add_with_carry(x, y, false, wide).1,
+        AluOp::Sub => add_with_carry(x, !y & if wide { u64::MAX } else { 0xffff_ffff }, true, wide).1,
+        _ => {
+            let sign = if wide { 1u64 << 63 } else { 1 << 31 };
+            ((r & sign != 0) as u64) << 3 | ((r == 0) as u64) << 2
         }
-        AluOp::Sub => {
-            let c = x >= y;
-            let v = (x & sign != y & sign) && (r & sign != x & sign);
-            (c, v)
-        }
-        _ => (false, false),
-    };
-    (n as u64) << 3 | (z as u64) << 2 | (c as u64) << 1 | v as u64
+    }
+}
+
+/// The result of a data-processing (1 source) operation on `v`, a
+/// register value of 64 bits if `wide`, else 32.
+fn unary(op: UnaryOp, v: u64, wide: bool) -> u64 {
+    let w = v as u32;
+    match (op, wide) {
+        (UnaryOp::Rbit, true) => v.reverse_bits(),
+        (UnaryOp::Rbit, false) => w.reverse_bits() as u64,
+        (UnaryOp::Rev16, _) => (v & 0x00ff_00ff_00ff_00ff) << 8 | (v >> 8) & 0x00ff_00ff_00ff_00ff,
+        (UnaryOp::Rev32, _) => w.swap_bytes() as u64 | (((v >> 32) as u32).swap_bytes() as u64) << 32,
+        (UnaryOp::Rev, true) => v.swap_bytes(),
+        (UnaryOp::Rev, false) => w.swap_bytes() as u64,
+        (UnaryOp::Clz, true) => v.leading_zeros() as u64,
+        (UnaryOp::Clz, false) => w.leading_zeros() as u64,
+        // The leading zeros of each bit XORed with the one below it,
+        // ignoring the bottom bit.
+        (UnaryOp::Cls, true) => ((v ^ v << 1) | 1).leading_zeros() as u64,
+        (UnaryOp::Cls, false) => ((w ^ w << 1) | 1).leading_zeros() as u64,
+    }
 }
 
 impl Core {
@@ -431,6 +458,13 @@ impl Core {
                             ((x as u32 as i32) >> (y % 32)) as u32 as u64
                         }
                     }
+                    AluOp::Ror => {
+                        if wide {
+                            x.rotate_right((y % 64) as u32)
+                        } else {
+                            (x as u32).rotate_right((y % 32) as u32) as u64
+                        }
+                    }
                     AluOp::Mul => x.wrapping_mul(y),
                     AluOp::Udiv => x.checked_div(y).unwrap_or(0),
                     AluOp::Sdiv => {
@@ -494,6 +528,28 @@ impl Core {
                     ((a.val as u128 * b.val as u128) >> 64) as u64
                 };
                 self.set(rd, RV::joined(r, a, b));
+            }
+            Instr::Unary { op, rd, rn } => {
+                let v = self.get(rn);
+                self.set(rd, RV { val: unary(op, v.val, rd.wide), ..v });
+            }
+            Instr::Extr { rd, rn, rm, lsb } => {
+                let (a, b) = (self.get(rn), self.get(rm));
+                let bits = 8 * Size::of(rd).bytes() as u32;
+                let r = ((a.val as u128) << bits | b.val as u128) >> lsb;
+                self.set(rd, RV::joined(r as u64, a, b));
+            }
+            Instr::Adc { rd, rn, rm, sub, flags } => {
+                // The carry flag is an input, so the result has a data
+                // dependency on the flags.
+                let (a, b, f) = (self.get(rn), self.get(rm), self.flags);
+                let y = if sub { Size::of(rm).mask(!b.val) } else { b.val };
+                let (r, nzcv) = add_with_carry(a.val, y, f.val & 2 != 0, rd.wide);
+                let v = RV::joined(r, RV::joined(0, a, b), f);
+                if flags {
+                    self.flags = RV { val: nzcv, ..v };
+                }
+                self.set(rd, v);
             }
             Instr::Ccmp { rn, op2, nzcv: imm, cond, cmn } => {
                 let f = self.flags;

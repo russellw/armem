@@ -277,6 +277,14 @@ fn data_imm(w: u32) -> Result<Instr> {
             };
             Ok(Instr::bitfield(kind, zr(rd, wide), zr(rn, wide), immr as u8, imms as u8))
         }
+        // Extract: EXTR, and its alias ROR (immediate).
+        0b111 => {
+            let lsb = bits(w, 15, 10);
+            if bits(w, 30, 29) != 0 || bit(w, 21) || bit(w, 22) != wide || (!wide && lsb > 31) {
+                return unsupported();
+            }
+            Ok(Instr::Extr { rd: zr(rd, wide), rn: zr(rn, wide), rm: zr(bits(w, 20, 16), wide), lsb: lsb as u8 })
+        }
         _ => unsupported(),
     }
 }
@@ -402,7 +410,25 @@ fn data_reg(w: u32) -> Result<Instr> {
         let rd = if flags { zr(rd, wide) } else { sp(rd, wide) };
         return Ok(Instr::Alu { op, rd, rn: sp(rn, wide), op2: Operand::RegExt(rm, ext), flags });
     }
-    // Data-processing (2 source): UDIV, SDIV, LSLV, LSRV, ASRV.
+    // Add/subtract with carry: ADC, ADCS, SBC, SBCS.
+    if bits(w, 28, 21) == 0b11010000 && bits(w, 15, 10) == 0 {
+        let (rd, rn, rm) = (zr(rd, wide), zr(rn, wide), zr(rm, wide));
+        return Ok(Instr::Adc { rd, rn, rm, sub: bit(w, 30), flags: bit(w, 29) });
+    }
+    // Data-processing (1 source): RBIT, REV16, REV32, REV, CLZ, CLS.
+    if bits(w, 30, 16) == 0b101101011000000 {
+        let op = match (bits(w, 15, 10), wide) {
+            (0b000000, _) => UnaryOp::Rbit,
+            (0b000001, _) => UnaryOp::Rev16,
+            (0b000010, true) => UnaryOp::Rev32,
+            (0b000010, false) | (0b000011, true) => UnaryOp::Rev,
+            (0b000100, _) => UnaryOp::Clz,
+            (0b000101, _) => UnaryOp::Cls,
+            _ => return unsupported(),
+        };
+        return Ok(Instr::Unary { op, rd: zr(rd, wide), rn: zr(rn, wide) });
+    }
+    // Data-processing (2 source): UDIV, SDIV, LSLV, LSRV, ASRV, RORV.
     if bits(w, 30, 21) == 0b0011010110 {
         let op = match bits(w, 15, 10) {
             0b000010 => AluOp::Udiv,
@@ -410,6 +436,7 @@ fn data_reg(w: u32) -> Result<Instr> {
             0b001000 => AluOp::Lsl,
             0b001001 => AluOp::Lsr,
             0b001010 => AluOp::Asr,
+            0b001011 => AluOp::Ror,
             _ => return unsupported(),
         };
         return Ok(Instr::Alu { op, rd: zr(rd, wide), rn: zr(rn, wide), op2: Operand::Reg(zr(rm, wide)), flags: false });
@@ -783,13 +810,40 @@ mod tests {
             (0x9ba8_7ce6, "UMULL X6,W7,W8"),
             (0x0b82_1c20, "ADD W0,W1,W2,ASR #7"),
             (0xcb42_fc20, "SUB X0,X1,X2,LSR #63"),
+            (0x5ac0_0020, "RBIT W0,W1"),
+            (0xdac0_0462, "REV16 X2,X3"),
+            (0xdac0_08a4, "REV32 X4,X5"),
+            (0x5ac0_08e6, "REV W6,W7"),
+            (0xdac0_0d28, "REV X8,X9"),
+            (0x5ac0_116a, "CLZ W10,W11"),
+            (0xdac0_15ac, "CLS X12,X13"),
+            (0x93c2_3420, "EXTR X0,X1,X2,#13"),
+            (0x1384_1c83, "ROR W3,W4,#7"),
+            (0x9ac7_2cc5, "ROR X5,X6,X7"),
+            (0x9a02_0020, "ADC X0,X1,X2"),
+            (0x3a05_0083, "ADCS W3,W4,W5"),
+            (0xda08_00e6, "SBC X6,X7,X8"),
+            (0x7a0b_0149, "SBCS W9,W10,W11"),
+            (0xda0d_03ec, "NGC X12,X13"),
+            (0x7a0f_03ee, "NGCS W14,W15"),
         ];
         for (word, src) in text {
             assert_eq!(decode(word, 0), crate::asm::parse_instr(src, &Default::default()), "{}", src);
         }
         // SMULH with Ra != 31; CCMP with o3 set; UMULL with sf = 0; CSEL
-        // with op2 = 10; ADD with ROR.
-        for word in [0x9b42_7820u32, 0xfa45_1834, 0x1ba8_7ce6, 0x9a82_0820, 0x8bc2_3420] {
+        // with op2 = 10; ADD with ROR; REV64 with sf = 0; EXTR with N != sf;
+        // a W EXTR with lsb >= 32; RMIF (not ADC).
+        for word in [
+            0x9b42_7820u32,
+            0xfa45_1834,
+            0x1ba8_7ce6,
+            0x9a82_0820,
+            0x8bc2_3420,
+            0x5ac0_0c00,
+            0x9382_3420,
+            0x1384_9c83,
+            0xba00_0420,
+        ] {
             assert!(decode(word, 0).is_err(), "{:#x}", word);
         }
     }

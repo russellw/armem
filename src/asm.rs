@@ -385,6 +385,11 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         let logical_imm = matches!(op, AluOp::And | AluOp::Orr | AluOp::Eor) && matches!(op2, Operand::Imm(_));
         let rd = if !flags && (add_sub || logical_imm) { parse_reg_sp(&ops[0])? } else { reg(0)? };
         let rn = if add_sub { parse_reg_sp(&ops[1])? } else { reg(1)? };
+        // With an immediate, register 31 is SP: the zero register cannot be
+        // encoded.
+        if add_sub && rn.idx == ZR && matches!(op2, Operand::Imm(_)) {
+            return Err(format!("{}: the first source cannot be the zero register with an immediate", m));
+        }
         Ok(Instr::Alu { op, rd, rn, op2, flags })
     };
 
@@ -462,6 +467,60 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         "LSR" => alu(AluOp::Lsr, false)?,
         "ASR" => alu(AluOp::Asr, false)?,
         "MUL" => alu(AluOp::Mul, false)?,
+        "ROR" if ops.len() == 3 && ops[2].starts_with('#') => {
+            let (rd, rn) = (reg(0)?, reg(1)?);
+            same_width(&[rd, rn], m)?;
+            let lsb = parse_imm(&ops[2])?;
+            if !(0..8 * Size::of(rd).bytes() as i128).contains(&lsb) {
+                return Err(format!("{}: shift out of range", m));
+            }
+            Instr::Extr { rd, rn, rm: rn, lsb: lsb as u8 }
+        }
+        "ROR" => {
+            want(&ops, 3, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            same_width(&[rd, rn, rm], m)?;
+            Instr::Alu { op: AluOp::Ror, rd, rn, op2: Operand::Reg(rm), flags: false }
+        }
+        "EXTR" => {
+            want(&ops, 4, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            same_width(&[rd, rn, rm], m)?;
+            let lsb = parse_imm(&ops[3])?;
+            if !(0..8 * Size::of(rd).bytes() as i128).contains(&lsb) {
+                return Err(format!("{}: bit position out of range", m));
+            }
+            Instr::Extr { rd, rn, rm, lsb: lsb as u8 }
+        }
+        "RBIT" | "REV16" | "REV32" | "REV" | "REV64" | "CLZ" | "CLS" => {
+            want(&ops, 2, m)?;
+            let (rd, rn) = (reg(0)?, reg(1)?);
+            same_width(&[rd, rn], m)?;
+            let op = match m {
+                "RBIT" => UnaryOp::Rbit,
+                "REV16" => UnaryOp::Rev16,
+                "REV32" => UnaryOp::Rev32,
+                "REV" | "REV64" => UnaryOp::Rev,
+                "CLZ" => UnaryOp::Clz,
+                _ => UnaryOp::Cls,
+            };
+            if !rd.wide && matches!(m, "REV32" | "REV64") {
+                return Err(format!("{}: registers must be X", m));
+            }
+            Instr::Unary { op, rd, rn }
+        }
+        "ADC" | "ADCS" | "SBC" | "SBCS" => {
+            want(&ops, 3, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            same_width(&[rd, rn, rm], m)?;
+            Instr::Adc { rd, rn, rm, sub: m.starts_with('S'), flags: m.ends_with('S') }
+        }
+        "NGC" | "NGCS" => {
+            want(&ops, 2, m)?;
+            let (rd, rm) = (reg(0)?, reg(1)?);
+            same_width(&[rd, rm], m)?;
+            Instr::Adc { rd, rn: RegOp { idx: ZR, wide: rd.wide }, rm, sub: true, flags: m == "NGCS" }
+        }
         "BIC" | "BICS" | "ORN" | "EON" => {
             let op = match m {
                 "ORN" => AluOp::Orn,
@@ -975,6 +1034,9 @@ mod tests {
         assert_eq!(p("SBFX W0,W1,#3,#29").unwrap(), p("ASR W0,W1,#3").unwrap());
         assert_eq!(p("SBFM X0,X1,#0,#31").unwrap(), p("SXTW X0,W1").unwrap());
         assert_eq!(p("MADD W0,W1,W2,WZR").unwrap(), p("MUL W0,W1,W2").unwrap());
+        assert_eq!(p("ROR X0,X1,#3").unwrap(), Instr::Extr { rd: x(0), rn: x(1), rm: x(1), lsb: 3 });
+        assert_eq!(p("REV64 X0,X1").unwrap(), p("REV X0,X1").unwrap());
+        assert_eq!(p("NGCS W0,W1").unwrap(), Instr::Adc { rd: w(0), rn: w(ZR), rm: w(1), sub: true, flags: true });
         assert_eq!(
             p("CSETM W0,EQ").unwrap(),
             Instr::Csel { rd: w(0), rn: w(ZR), rm: w(ZR), cond: Cond::Ne, inv: true, inc: false }
@@ -1009,6 +1071,18 @@ mod tests {
             "CCMP X0,#32,#0,EQ",
             "CCMP X0,X1,#16,EQ",
             "CCMP X0,W1,#0,EQ",
+            "REV32 W0,W1",
+            "REV64 W0,W1",
+            "CLZ X0,W1",
+            "ROR W0,W1,#32",
+            "ROR X0,X1,W2",
+            "EXTR X0,X1,X2,#64",
+            "EXTR W0,W1,X2,#3",
+            "ADC X0,X1,#1",
+            "SBC W0,W1,X2",
+            "NGC X0,W1",
+            "SUBS X0,XZR,#1",
+            "ADD W0,WZR,#1",
         ] {
             assert!(p(bad).is_err(), "accepted {}", bad);
         }

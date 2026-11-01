@@ -11,6 +11,10 @@
 //! `ADD`/`SUB` (immediate and extended register), and the destination of
 //! a logical immediate are SP.
 //!
+//! Branches (including `BL`) decode to instruction indexes, relative to
+//! the instruction's own index. `BL` and `BLR` write a return address,
+//! which is computed when they run (`isa::Code::addr`).
+//!
 //! `ADR` and `ADRP` compute an address from the PC, so they decode only when
 //! the code's load address is known (`decode_at`, `decode_program_at`), and
 //! become `MovImm` of the computed address: the result is a constant with
@@ -127,55 +131,69 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>> {
 /// Decode little-endian A64 code loaded at address `base`, if known
 /// (needed for `ADR`/`ADRP`).
 pub fn decode_program_at(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
-    decode_code(code, base, false)
+    decode_code(code, base)
 }
 
-const RET_MASK: u32 = 0xffff_fc1f;
-const RET: u32 = 0xd65f_0000;
-
-/// Decode a function that runs as a whole thread. A `RET` returns from
-/// the thread, so it becomes a branch to the end of the code. That holds
-/// only while X30 has the thread's return address, so a function that
-/// returns must not write X30 (calls are not supported yet), and must
-/// return through X30.
-pub fn decode_thread(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
-    decode_code(code, base, true)
-}
-
-fn decode_code(code: &[u8], base: Option<u64>, ret_ends: bool) -> Result<Vec<Instr>> {
+fn decode_code(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
     if code.len() % 4 != 0 {
         return Err(format!("code size {} is not a multiple of 4", code.len()));
     }
-    let n = code.len() / 4;
-    let mut rets = false;
     let prog: Vec<Instr> = code
         .chunks_exact(4)
         .enumerate()
-        .map(|(i, c)| {
-            let w = u32::from_le_bytes(c.try_into().unwrap());
-            if ret_ends && w & RET_MASK == RET {
-                if bits(w, 9, 5) != 30 {
-                    return Err(format!("instruction {}: RET X{} cannot return from the thread", i, bits(w, 9, 5)));
-                }
-                rets = true;
-                return Ok(Instr::B { target: n });
-            }
-            decode_at(w, i, base)
-        })
+        .map(|(i, c)| decode_at(u32::from_le_bytes(c.try_into().unwrap()), i, base))
         .collect::<Result<_>>()?;
-    if rets {
-        if let Some(i) = prog.iter().position(|ins| ins.writes().contains(&30)) {
-            return Err(format!("instruction {} writes X30, so RET may not return from the thread (calls are not supported yet)", i));
-        }
-    }
     for (i, ins) in prog.iter().enumerate() {
-        if let Instr::B { target } | Instr::BCond { target, .. } | Instr::Cbz { target, .. } = *ins {
+        if let Some(target) = branch_target(ins) {
             if target > prog.len() {
                 return Err(format!("instruction {}: branch target {} is outside the code", i, target));
             }
         }
     }
     Ok(prog)
+}
+
+/// The target of a direct branch.
+fn branch_target(ins: &Instr) -> Option<usize> {
+    match *ins {
+        Instr::B { target }
+        | Instr::Bl { target }
+        | Instr::BCond { target, .. }
+        | Instr::Cbz { target, .. }
+        | Instr::Tbz { target, .. } => {
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
+/// Decode code loaded at `base` to run, such as all of an image's code
+/// (see `Image::code`). Unlike `decode_program_at`, a word that cannot be
+/// decoded is not an error: it becomes `Instr::Invalid`, a fault only if
+/// it runs, as is a direct branch out of the code. `gaps` are byte ranges
+/// (relative to `base`) that hold no code, such as the space between
+/// sections, or data in a code section.
+pub fn decode_code_at(code: &[u8], base: u64, gaps: &[(usize, usize)]) -> Code {
+    let n = code.len() / 4;
+    let mut out = Code::new(base, Vec::with_capacity(n));
+    for (i, c) in code.chunks_exact(4).enumerate() {
+        let r = if gaps.iter().any(|&(lo, hi)| 4 * i < hi && 4 * i + 4 > lo) {
+            Err("not code".to_string())
+        } else {
+            decode_at(u32::from_le_bytes(c.try_into().unwrap()), i, Some(base)).and_then(|ins| match branch_target(&ins) {
+                Some(t) if t > n => Err(format!("branch to {:#x}, which is not in the code", out.addr(t))),
+                _ => Ok(ins),
+            })
+        };
+        out.instrs.push(match r {
+            Ok(ins) => ins,
+            Err(e) => {
+                out.errors.insert(i, e);
+                Instr::Invalid
+            }
+        });
+    }
+    out
 }
 
 fn decode_inner(w: u32, index: usize, base: Option<u64>) -> Result<Instr> {
@@ -238,6 +256,7 @@ fn data_imm(w: u32) -> Result<Instr> {
             let imm = match bits(w, 30, 29) {
                 0b00 => size.mask(!v), // MOVN
                 0b10 => v,             // MOVZ
+                0b11 => return Ok(Instr::Movk { rd: zr(rd, wide), imm: bits(w, 20, 5) as u16, shift: 16 * hw as u8 }),
                 _ => return unsupported(),
             };
             Ok(Instr::MovImm { rd: zr(rd, wide), imm })
@@ -277,8 +296,28 @@ fn branch_system(w: u32, index: usize) -> Result<Instr> {
         let t = index as i64 + off;
         usize::try_from(t).map_err(|_| "branch target before the start of the code".to_string())
     };
-    if bits(w, 31, 26) == 0b000101 {
-        return Ok(Instr::B { target: rel(sext(bits(w, 25, 0), 26))? });
+    if bits(w, 30, 26) == 0b00101 {
+        let target = rel(sext(bits(w, 25, 0), 26))?;
+        return Ok(if bit(w, 31) { Instr::Bl { target } } else { Instr::B { target } });
+    }
+    if bits(w, 30, 25) == 0b011011 {
+        let wide = bit(w, 31);
+        return Ok(Instr::Tbz {
+            rt: zr(bits(w, 4, 0), wide),
+            bit: (bits(w, 31, 31) << 5 | bits(w, 23, 19)) as u8,
+            nonzero: bit(w, 24),
+            target: rel(sext(bits(w, 18, 5), 14))?,
+        });
+    }
+    // BR, BLR, RET (without pointer authentication).
+    if w & 0xff9f_fc1f == 0xd61f_0000 {
+        let kind = match bits(w, 22, 21) {
+            0b00 => BrKind::Br,
+            0b01 => BrKind::Blr,
+            0b10 => BrKind::Ret,
+            _ => return unsupported(),
+        };
+        return Ok(Instr::BrReg { rn: zr(bits(w, 9, 5), true), kind });
     }
     if bits(w, 31, 24) == 0x54 && !bit(w, 4) {
         let cond = CONDS[bits(w, 3, 0) as usize];
@@ -308,6 +347,8 @@ fn branch_system(w: u32, index: usize) -> Result<Instr> {
                 _ => unsupported(),
             },
             0b110 if crm == 0b1111 => Ok(Instr::Barrier(Barrier::Isb)),
+            // CLREX #imm: the immediate is ignored.
+            0b010 => Ok(Instr::Clrex),
             _ => unsupported(),
         };
     }
@@ -653,21 +694,46 @@ mod tests {
     }
 
     #[test]
-    fn ret_ends_a_thread() {
-        let code = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
-        const RET_X30: u32 = 0xd65f_03c0;
-        const CBZ_X0_2: u32 = 0xb400_0040; // CBZ X0, .+8
+    fn calls_returns_and_movk() {
+        let x = |i| RegOp { idx: i, wide: true };
+        // Encodings from llvm-mc.
+        let cases = [
+            (0x9400_0002u32, Instr::Bl { target: 7 }),
+            (0x97ff_ffff, Instr::Bl { target: 4 }),
+            (0xd65f_03c0, Instr::BrReg { rn: x(30), kind: BrKind::Ret }),
+            (0xd65f_0020, Instr::BrReg { rn: x(1), kind: BrKind::Ret }),
+            (0xd61f_0040, Instr::BrReg { rn: x(2), kind: BrKind::Br }),
+            (0xd63f_0060, Instr::BrReg { rn: x(3), kind: BrKind::Blr }),
+            (0xd61f_03e0, Instr::BrReg { rn: x(ZR), kind: BrKind::Br }),
+            (0xf2e2_4680, Instr::Movk { rd: x(0), imm: 0x1234, shift: 48 }),
+            (0x72bf_ffe5, Instr::Movk { rd: RegOp { idx: 5, wide: false }, imm: 0xffff, shift: 16 }),
+            (0xf280_00e1, Instr::Movk { rd: x(1), imm: 7, shift: 0 }),
+        ];
+        for (w, want) in cases {
+            assert_eq!(decode(w, 5), Ok(want), "{:#x}", w);
+        }
+        // Unallocated: opc 0011 between RET and ERET; RETAA (pointer
+        // authentication); MOVK W with LSL #32.
+        for w in [0xd67f_0000u32, 0xd65f_0bff, 0x72c0_0000] {
+            assert!(decode(w, 0).is_err(), "{:#x}", w);
+        }
+    }
+
+    #[test]
+    fn code_decodes_lazily() {
         const NOP: u32 = 0xd503_201f;
+        let words = [NOP, 0x9400_0001, 0xffff_ffff, 0x1400_0004, NOP, 0x97ff_fffb];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = decode_code_at(&code, 0x1000, &[(16, 20)]);
+        assert_eq!(c.base, 0x1000);
         assert_eq!(
-            decode_thread(&code(&[CBZ_X0_2, RET_X30, NOP, RET_X30]), None).unwrap(),
-            [Instr::Cbz { rt: zr(0, true), nonzero: false, target: 2 }, Instr::B { target: 4 }, Instr::Nop, Instr::B { target: 4 }]
+            c.instrs,
+            [Instr::Nop, Instr::Bl { target: 2 }, Instr::Invalid, Instr::Invalid, Instr::Invalid, Instr::Bl { target: 0 }]
         );
-        assert!(decode_program(&code(&[RET_X30])).is_err());
-        assert!(decode_thread(&code(&[0xd65f_0020]), None).unwrap_err().contains("RET X1"));
-        // MOV X30, X0
-        let e = decode_thread(&code(&[0xaa00_03fe, RET_X30]), None).unwrap_err();
-        assert!(e.contains("writes X30"), "{}", e);
-        assert!(decode_thread(&code(&[0xaa00_03fe]), None).is_ok());
+        assert!(c.errors[&2].contains("unsupported"));
+        assert!(c.errors[&3].contains("branch to 0x101c"), "{}", c.errors[&3]);
+        assert_eq!(c.errors[&4], "not code");
+        assert_eq!((c.exit(), c.index(0x1014), c.index(0x1018), c.index(0x1019), c.index(0xffc)), (0x1018, Some(5), Some(6), None, None));
     }
 
     #[test]

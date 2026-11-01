@@ -2,6 +2,8 @@
 # Options: lse2 = run with FEAT_LSE2. A test may be listed with and without options.
 MP                     yes  no
 MP+dmb.sy+addr         no   no
+MP+dmb.sy+addr-call    no   no
+MP-calls               yes  no
 MP+dmbs                no   no
 MP+po+addr             yes  no
 MP+dmb.st+addr         no   no

@@ -15,6 +15,7 @@
 
 use armem::asm::assemble;
 use armem::elf::*;
+use armem::isa::{BrKind, Instr};
 use armem::litmus;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -286,7 +287,7 @@ fn litmus_threads_from_objects() {
             };
             match elf.decode_function("thread") {
                 Err(e) => failures.push(format!("{}: {}", tag, e)),
-                Ok(got) if got != *prog => failures.push(format!("{}: decoded {:?}, parsed {:?}", tag, got, prog)),
+                Ok(got) if got != prog.code.instrs => failures.push(format!("{}: decoded {:?}, parsed {:?}", tag, got, prog)),
                 Ok(_) => {}
             }
         }
@@ -428,10 +429,9 @@ long calls_out(long x) { extern long ext(long); return ext(x) + weak_fn(x) + tls
         assert!(err.contains("needs relocation R_AARCH64_"), "{}: {}", tag, err);
         assert!(elf.function("ext").unwrap_err().contains("not a function"), "{}", tag);
         assert!(elf.function("tls_var").unwrap_err().contains("not a function"), "{}", tag);
-        // Without relocations, a function is extracted; decoding then
-        // stops at RET, which only a thread may contain.
-        let err = elf.decode_function("hidden_fn").unwrap_err();
-        assert!(err.contains("unsupported"), "{}: {}", tag, err);
+        // Without relocations, a function is extracted and decoded.
+        let f = elf.decode_function("hidden_fn").unwrap();
+        assert!(matches!(f.last(), Some(Instr::BrReg { kind: BrKind::Ret, .. })), "{}: {:?}", tag, f);
         cc = clang(&suffix).unwrap();
     }
 }

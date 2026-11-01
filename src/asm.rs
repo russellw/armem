@@ -351,7 +351,15 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
     let ins = match m {
         // Hints that may be implemented as NOP, which is all the emulator needs.
         "NOP" | "YIELD" | "WFE" | "WFI" | "SEV" | "SEVL" => Instr::Nop,
-        "MOVZ" | "MOVN" => {
+        "CLREX" => {
+            match ops.len() {
+                0 => {}
+                1 if (0..=15).contains(&parse_imm(&ops[0])?) => {}
+                _ => return Err(format!("CLREX: bad operands '{}'", rest)),
+            }
+            Instr::Clrex
+        }
+        "MOVZ" | "MOVN" | "MOVK" => {
             if !(2..=3).contains(&ops.len()) {
                 return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
             }
@@ -364,6 +372,9 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
             };
             if !(0..=0xffff).contains(&imm) {
                 return Err(format!("{}: immediate out of range", m));
+            }
+            if m == "MOVK" {
+                return Ok(Instr::Movk { rd, imm: imm as u16, shift });
             }
             let v = (imm as u64) << shift;
             Instr::MovImm { rd, imm: Size::of(rd).mask(if m == "MOVN" { !v } else { v }) }
@@ -452,9 +463,35 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
             let z = RegOp { idx: ZR, wide: rd.wide };
             Instr::Csel { rd, rn: z, rm: z, cond: invert(parse_cond(&ops[1])?), inc: true }
         }
-        "B" => {
+        "B" | "BL" => {
             want(&ops, 1, m)?;
-            Instr::B { target: label(labels, &ops[0])? }
+            let target = label(labels, &ops[0])?;
+            if m == "BL" { Instr::Bl { target } } else { Instr::B { target } }
+        }
+        "BR" | "BLR" | "RET" => {
+            let rn = match (m, ops.len()) {
+                ("RET", 0) => RegOp { idx: 30, wide: true },
+                (_, 1) => reg(0)?,
+                _ => return Err(format!("{} expects {} operand", m, if m == "RET" { "at most one" } else { "one" })),
+            };
+            if !rn.wide {
+                return Err(format!("{}: the target must be an X register", m));
+            }
+            let kind = match m {
+                "BR" => BrKind::Br,
+                "BLR" => BrKind::Blr,
+                _ => BrKind::Ret,
+            };
+            Instr::BrReg { rn, kind }
+        }
+        "TBZ" | "TBNZ" => {
+            want(&ops, 3, m)?;
+            let rt = reg(0)?;
+            let bit = parse_imm(&ops[1])?;
+            if !(0..8 * Size::of(rt).bytes() as i128).contains(&(bit as i128)) {
+                return Err(format!("{}: bit number out of range", m));
+            }
+            Instr::Tbz { rt, bit: bit as u8, nonzero: m == "TBNZ", target: label(labels, &ops[2])? }
         }
         "CBZ" | "CBNZ" => {
             want(&ops, 2, m)?;
@@ -736,6 +773,25 @@ mod tests {
         assert!(matches!(p("CMP X0,X1,LSL #2").unwrap(), Instr::Alu { op2: Operand::RegExt(_, Extend::Lsl(2)), .. }));
         assert_eq!(p("WFE").unwrap(), Instr::Nop);
         assert_eq!(p("ISB SY").unwrap(), Instr::Barrier(Barrier::Isb));
+    }
+
+    #[test]
+    fn calls_and_branches() {
+        let x = |i| RegOp { idx: i, wide: true };
+        let labels: HashMap<String, usize> = [("f".to_string(), 3)].into();
+        let q = |s: &str| parse_instr(s, &labels).unwrap();
+        assert_eq!(q("BL f"), Instr::Bl { target: 3 });
+        assert_eq!(q("RET"), Instr::BrReg { rn: x(30), kind: BrKind::Ret });
+        assert_eq!(q("RET X1"), Instr::BrReg { rn: x(1), kind: BrKind::Ret });
+        assert_eq!(q("BLR X2"), Instr::BrReg { rn: x(2), kind: BrKind::Blr });
+        assert_eq!(q("BR XZR"), Instr::BrReg { rn: x(ZR), kind: BrKind::Br });
+        assert_eq!(q("TBNZ X3,#63,f"), Instr::Tbz { rt: x(3), bit: 63, nonzero: true, target: 3 });
+        assert_eq!(q("MOVK X0,#0x1234,LSL #48"), Instr::Movk { rd: x(0), imm: 0x1234, shift: 48 });
+        assert_eq!(q("CLREX"), Instr::Clrex);
+        assert_eq!(q("CLREX #3"), Instr::Clrex);
+        for bad in ["RET W0", "BR", "BLR X1,X2", "TBZ W0,#32,f", "MOVK X0,#1,LSL #8", "MOVK W0,#1,LSL #32", "CLREX #16"] {
+            assert!(parse_instr(bad, &labels).is_err(), "accepted {}", bad);
+        }
     }
 
     #[test]

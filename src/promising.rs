@@ -32,7 +32,7 @@
 //! Pick dependencies order later writes, but not later reads.
 
 use crate::core::{Core, MemOp, RV, Step, View, pair_value, rmw_result, split_pair};
-use crate::isa::{Barrier, Instr, LoadKind, RmwOp, Size};
+use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
@@ -115,9 +115,9 @@ struct TState {
 }
 
 impl TState {
-    fn new(regs: [u64; 31], tid: usize, threads: usize) -> TState {
+    fn new(regs: [u64; 31], tid: usize, threads: usize, entry: usize) -> TState {
         TState {
-            core: Core::new(regs, tid, threads),
+            core: Core::new(regs, tid, threads, entry),
             v_rold: 0,
             v_rold_p: 0,
             v_rnoret: 0,
@@ -196,7 +196,7 @@ type Candidate = (u64, Size, u128);
 /// Exhaustive exploration of one thread running alone against a memory.
 struct Solo<'a> {
     test: &'a Test,
-    prog: &'a [Instr],
+    prog: &'a Code,
     tid: usize,
     base: Vec<Msg>,
     fuel: u32,
@@ -245,7 +245,7 @@ impl<'a> Solo<'a> {
     fn new(test: &'a Test, cfg: &Options, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
         Solo {
             test,
-            prog: &test.threads[tid],
+            prog: &test.threads[tid].code,
             tid,
             base,
             fuel: cfg.fuel,
@@ -584,6 +584,12 @@ impl<'a> Solo<'a> {
         let mut out = Vec::new();
         let status = |ok: bool| RV::imm(if ok { 0 } else { 1 });
         match op {
+            MemOp::Clrex => {
+                let mut s = st;
+                s.xcl = None;
+                s.core.retire(prog);
+                out.push((s, ext.to_vec()));
+            }
             MemOp::Barrier(b) => {
                 let mut s = st;
                 match b {
@@ -792,7 +798,7 @@ impl<'a> Solo<'a> {
                     self.visited.insert(key, st.core.steps);
                 }
             }
-            if st.core.steps >= self.fuel && st.core.pc < self.prog.len() {
+            if st.core.steps >= self.fuel && st.core.pc < self.prog.instrs.len() {
                 self.truncated = true;
                 continue;
             }
@@ -816,7 +822,7 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
 
     let solo = |tid: usize, mem: &[Msg], mode: Mode| Solo::new(test, cfg, &proj, tid, mem.to_vec(), mode);
     let start = |tid: usize, mem: &[Msg]| {
-        let mut st = TState::new(test.init_regs[tid], tid, n);
+        let mut st = TState::new(test.init_regs[tid], tid, n, test.threads[tid].entry);
         st.promises = (1..=mem.len() as View).filter(|&t| mem[t as usize - 1].tid == tid).collect();
         st
     };

@@ -80,9 +80,11 @@ exists (1:X2=0)
 ### Supported instructions
 
 `MOV/MOVZ/MOVN`, `ADD(S)`, `SUB(S)`, `NEG(S)`, `AND(S)`, `ORR`, `EOR`,
-`LSL`, `LSR`, `ASR`, `MUL`, `SXTW`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`,
-`CINC`, `CSET`, `B`, `B.cond`, `CBZ/CBNZ`, `NOP` (and the hints `YIELD`,
-`WFE`, `WFI`, `SEV`, `SEVL`, run as `NOP`), and these memory accesses. ALU
+`LSL`, `LSR`, `ASR`, `MUL`, `SXTW`, `MOVK`, `CMP`, `CMN`, `TST`, `CSEL`,
+`CSINC`, `CINC`, `CSET`, `B`, `B.cond`, `CBZ/CBNZ`, `TBZ/TBNZ`, calls and
+returns (`BL`, `BLR`, `BR`, `RET`; see [Calls](#calls)), `NOP` (and the
+hints `YIELD`, `WFE`, `WFI`, `SEV`, `SEVL`, run as `NOP`), and these memory
+accesses. ALU
 instructions also accept a shifted or extended register operand, as in
 `ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSL #2`, and `ADD`/`SUB` accept
 `#imm,LSL #12`.
@@ -98,6 +100,7 @@ instructions also accept a shifted or extended register operand, as in
   `CAS`, each with `A`/`L`/`AL` ordering and `B`/`H` size variants
 * barriers: `DMB` (`SY/ISH/...`, `LD`, `ST` variants), `DSB` (treated as
   DMB), `ISB`
+* `CLREX`, which clears the exclusive monitor
 
 Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
 `[Xn,Wm,SXTW|UXTW #k]`, pre-index `[Xn,#imm]!`, and post-index
@@ -133,7 +136,7 @@ objects (`.o`), executables and shared objects. It has no dependencies.
 It exposes the sections, loadable segments, symbol table and
 relocations, and `Elf::function(name)` / `Elf::decode_function(name)`
 extract a function's code by symbol name (using the symbol's size) and
-decode it. Branches must stay inside the function. Every offset and size
+decode it. Branches, including calls (`BL`), must stay inside the function. Every offset and size
 in the file is checked, so a malformed file gives an error, not a panic.
 
 A function is rejected, rather than decoded wrongly, when:
@@ -149,7 +152,8 @@ in order from a base address, or at addresses given by name. Common
 symbols get space, and a GOT is built if the code uses one. The caller
 gives addresses for the symbols the file uses but does not define. The
 relocations are then applied. `Image::function` / `decode_function` give
-a function's relocated code at its final address. These relocations are
+a function's relocated code at its final address, and `Image::code`
+decodes all of its executable memory for threads to run (see below). These relocations are
 supported:
 * data: `ABS64/32/16`, `PREL64/32/16`, `PLT32`;
 * instructions: `ADR_PREL_PG_HI21(_NC)`, `ADR_PREL_LO21`,
@@ -209,13 +213,19 @@ exists (1:X0=0)
 `armem --elf mp.o MP-c.litmus` reports that the reader can return 0 on
 ARM only. With `__ATOMIC_RELEASE` / `__ATOMIC_ACQUIRE` it cannot.
 
-Calls are not supported yet, so a `RET` in the function returns from the
-thread and ends it. That is only right while X30 holds the thread's
-return address, so a function that writes X30, or returns through
-another register, is rejected. This rules out functions that save and
-restore X30 (non-leaf functions). The function must use only supported
-instructions. It can use the stack, so leaf functions compiled at `-O0`
-work. `tests/preload.rs` runs the example above at `-O0` and `-O2`.
+Such a thread runs the image's code: all of its executable memory, from
+the lowest executable address to the highest, so it can call other
+functions directly (`BL`) or through pointers (`BLR`). The code is decoded
+once, when the file is loaded, and a word that cannot be decoded (an
+unsupported instruction, data marked by a `$d` mapping symbol, or a gap
+between sections) is a fault only if a thread runs it. Code is not reread
+from memory, so self-modifying code is not supported. A thread returns
+from its function to an exit address just past the code (see
+[Calls](#calls)), which ends it. A thread that branches to an address
+outside the code, for example through a bad return address, faults.
+`tests/preload.rs` runs the example above at `-O0` and `-O2`, and a
+spinlock whose functions call each other at `-O0`, `-O2` and
+`-O2 -mcmodel=large`.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -249,6 +259,37 @@ is installed:
   ignores a non-ones should-be-one `Rt2` field in `STXR`, which armem
   rejects. A run of 1.2 million words (409,568 decoded) found no other
   differences.
+
+### Calls
+
+`BL` and `BLR` put the address of the next instruction in X30, and `BR`,
+`BLR` and `RET` branch to the address in a register. Every instruction
+therefore has an address. An ELF function's code is at its loaded address.
+Thread `i`'s assembly code is at `0x7e0000000000 + i * 0x1000000`. These
+addresses appear only in registers, since a test's code is not in memory.
+A branch to an address in a register is a control dependency on that
+register, like `CBZ`.
+
+Each thread starts with X30 holding its code's exit address, just past
+the last instruction, unless the init block sets X30. So a `RET` from the
+code a thread starts in ends the thread, and so does running off the end
+of the code. A function that calls others saves X30 first, usually on the
+stack:
+
+```
+ P0             ;
+ BL f           ;
+ r0:            ;
+ B end          ;
+ f:             ;
+ LDR W0,[X1]    ;
+ RET            ;
+ end:           ;
+```
+
+herd7 accepts `BL` and `RET`, given a label after each `BL` (`r0:` above),
+as long as return addresses stay in registers: it cannot follow one that
+is saved to memory.
 
 ### Stacks
 
@@ -421,10 +462,10 @@ lets a lone `LDXP` be torn.
 2. Run real compiled code: the binary decoder, an ELF loader and
    static relocation are done, and a loaded image can be a test's initial
    memory (see [Machine code](#machine-code)); tests can run ELF functions as
-   threads (`P0 = name`), with SP and a private stack per thread; next
-   come calls and returns, and the instructions compilers commonly emit
-   (`MOVK`, `TBZ`, `UBFX`, ...),
-   starting with user-mode functions extracted from real programs.
+   threads (`P0 = name`), with SP and a private stack per thread, and
+   they can make calls (`BL`, `BLR`, `RET`); next come more of the
+   instructions compilers commonly emit (`UBFX`, `CSNEG`, `MADD`, `UDIV`,
+   ...), starting with user-mode functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
    and prioritizing reads that disagree with what TSO would return.

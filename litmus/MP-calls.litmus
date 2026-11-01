@@ -1,0 +1,24 @@
+AArch64 MP-calls
+"Message passing through nested calls, no ordering: the reader calls read_both, which saves X30 in X7 and calls load twice"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0          | P1                    ;
+ MOV W0,#1   | BL read_both          ;
+ STR W0,[X1] | r0:                   ;
+ MOV W2,#1   | B end                 ;
+ STR W2,[X3] | read_both:            ;
+             | MOV X7,X30            ;
+             | MOV X5,X1             ;
+             | BL load               ;
+             | r1:                   ;
+             | MOV W0,W6             ;
+             | MOV X5,X3             ;
+             | BL load               ;
+             | r2:                   ;
+             | MOV W2,W6             ;
+             | MOV X30,X7            ;
+             | RET                   ;
+             | load:                 ;
+             | LDR W6,[X5]           ;
+             | RET                   ;
+             | end:                  ;
+exists (1:X0=1 /\ 1:X2=0)

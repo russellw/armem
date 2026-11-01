@@ -26,6 +26,7 @@ fn manual_preload() -> Preload {
             PreSym { name: "a".into(), addr: 0x8000, size: 4, ty: int },
             PreSym { name: "b".into(), addr: 0x8004, size: 4, ty: int },
         ],
+        code: None,
         functions: Default::default(),
     }
 }
@@ -197,11 +198,19 @@ fn function_threads() {
     let x = |i| armem::isa::RegOp { idx: i, wide: true };
     let w = |i| armem::isa::RegOp { idx: i, wide: false };
     let addr = |r| armem::isa::Addr { base: x(r), offset: armem::isa::Offset::Imm(0), writeback: armem::isa::Writeback::None };
-    use armem::isa::{Instr, LoadKind};
-    // load_b: LDR W0,[X1]
+    use armem::isa::{BrKind, Code, Instr, LoadKind};
+    // load_b: LDR W0,[X1]; RET. broken: an instruction that did not decode.
     let load = Instr::Load { rt: w(0), addr: addr(1), size: Size::B4, signed: false, kind: LoadKind::Plain, excl: false };
-    pre.functions.insert("load_b".into(), Ok(vec![load]));
-    pre.functions.insert("broken".into(), Err("function 'broken': unsupported".into()));
+    let ret = Instr::BrReg { rn: x(30), kind: BrKind::Ret };
+    let mut code = Code::new(0x9000, vec![load, ret, Instr::Invalid]);
+    code.errors.insert(2, "unsupported".into());
+    // Without code, no function can run.
+    pre.functions.insert("load_b".into(), 0x9000);
+    let e = litmus::parse_with("AArch64 t\n{ }\n P0 = load_b ;\n", &pre).unwrap_err();
+    assert!(e.contains("not in the loaded code"), "{}", e);
+    pre.code = Some(code.into());
+    pre.functions.insert("broken".into(), 0x9008);
+    pre.functions.insert("outside".into(), 0x900c);
     let parse = |src: &str| litmus::parse_with(src, &pre);
     let t = parse("AArch64 t\n{ 0:X1=b; 1:X3=a; }\n P0 = load_b | P1 ;\n | LDR W2,[X3] ;\nforall (0:X0=9 /\\ 1:X2=1)").unwrap();
     assert_eq!(t.functions, [Some("load_b".to_string()), None]);
@@ -213,7 +222,14 @@ fn function_threads() {
     let err = |src: &str| parse(src).unwrap_err();
     assert!(err("AArch64 t\n{ }\n P0 = load_b ;\n NOP ;\n").contains("must be empty"));
     assert!(err("AArch64 t\n{ }\n P0 = nope ;\n").contains("no function 'nope'"));
-    assert!(err("AArch64 t\n{ }\n P0 = broken ;\n").contains("P0: function 'broken': unsupported"));
+    assert!(err("AArch64 t\n{ }\n P0 = outside ;\n").contains("not in the loaded code"));
+    let t = parse("AArch64 t\n{ }\n P0 = broken ;\n").unwrap();
+    let faults = run(&t, Model::Arm, &Options::default()).faults;
+    assert_eq!(faults.into_iter().collect::<Vec<_>>(), ["P0: 0x9008: unsupported"]);
+    // X30 starts at the code's exit unless the test sets it.
+    assert_eq!(t.init_regs[0][30], 0x900c);
+    let t = parse("AArch64 t\n{ 0:X30=0x9004; }\n P0 = broken ;\n").unwrap();
+    assert_eq!(t.init_regs[0][30], 0x9004);
     assert!(err("AArch64 t\n{ }\n P0 = 1x ;\n").contains("bad thread header"));
     assert!(err("AArch64 t\n{ }\n P1 = load_b ;\n").contains("bad thread header"));
     let e = litmus::parse("AArch64 t\n{ }\n P0 = load_b ;\n").unwrap_err();
@@ -282,10 +298,12 @@ fn assembled_functions_as_threads() {
     // The reader sees the flag and then the data, or neither.
     let t = litmus::parse_with("AArch64 MP-fn\n{ }\n P0 = writer | P1 = reader ;\nforall (1:X0=-1 \\/ 1:X0=42 \\/ 1:X0=0)", &pre).unwrap();
     assert!(observed(&t, Model::Arm));
-    let e = litmus::parse_with("AArch64 t\n{ }\n P0 = bad_ret ;\n", &pre).unwrap_err();
-    assert!(e.contains("RET X1"), "{}", e);
-    let e = litmus::parse_with("AArch64 t\n{ }\n P0 = clobbers_lr ;\n", &pre).unwrap_err();
-    assert!(e.contains("writes X30"), "{}", e);
+    // Returning somewhere other than the thread's return address faults.
+    for f in ["bad_ret", "clobbers_lr"] {
+        let t = litmus::parse_with(&format!("AArch64 t\n{{ }}\n P0 = {} ;\n", f), &pre).unwrap();
+        let faults = run(&t, Model::Sc, &Options::default()).faults;
+        assert!(faults.len() == 1 && faults.iter().all(|e| e.contains("branch to 0x0, which is not in the code")), "{:?}", faults);
+    }
 }
 
 const C_MP: &str = r#"
@@ -329,5 +347,63 @@ fn compiled_functions_as_threads() {
         check("P0 = writer | P1 = reader", true);
         check("P0 = writer_rel | P1 = reader_acq", false);
         check("P0 = writer_rel | P1 = reader", true);
+    }
+}
+
+const C_LOCK: &str = r#"
+int lock, counter;
+__attribute__((noinline)) void acquire(int *l) {
+  int z;
+  do { z = 0; } while (!__atomic_compare_exchange_n(l, &z, 1, 0, ACQ, __ATOMIC_RELAXED));
+}
+__attribute__((noinline)) void release(int *l) { __atomic_store_n(l, 0, REL); }
+__attribute__((noinline)) void incr(void) { counter = counter + 1; }
+void (*volatile hook)(void) = incr;
+void worker(void) { acquire(&lock); hook(); release(&lock); }
+"#;
+
+/// Compiled C with calls: `worker` calls `acquire` and `release` (BL, the
+/// last as a tail call) and `incr` through a function pointer (BLR), and
+/// saves X30 on the stack. With a relaxed lock, an increment can be lost on
+/// ARM only. `-mcmodel=large` builds addresses with MOVZ/MOVK.
+#[test]
+fn compiled_calls() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let c = scratch("lock.c");
+    std::fs::write(&c, C_LOCK).unwrap();
+    let test = scratch("lock-c.litmus");
+    std::fs::write(&test, "AArch64 lock-c\n{ }\n P0 = worker | P1 = worker ;\nexists (counter=1)\n").unwrap();
+    let relaxed = ["-DACQ=__ATOMIC_RELAXED", "-DREL=__ATOMIC_RELAXED"];
+    let ordered = ["-DACQ=__ATOMIC_ACQUIRE", "-DREL=__ATOMIC_RELEASE"];
+    for (opt, model) in [("-O0", "small"), ("-O2", "small"), ("-O2", "large")] {
+        for (order, arm_only) in [(ordered, false), (relaxed, true)] {
+            let tag = format!("{} {} {}", opt, model, order[0]);
+            let o = scratch("lock.o");
+            let out = Command::new(&clang)
+                .args(["--target=aarch64-linux-gnu", opt, &format!("-mcmodel={}", model), "-fno-pic", "-c", "-o"])
+                .arg(&o)
+                .args(order)
+                .arg(&c)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            if model == "large" {
+                let data = std::fs::read(&o).unwrap();
+                let elf = Elf::parse(&data).unwrap();
+                let code = Image::load(&elf, &LoadOptions::default()).unwrap().code().unwrap().unwrap();
+                assert!(code.instrs.iter().any(|i| matches!(i, armem::isa::Instr::Movk { .. })), "{}: no MOVK", tag);
+            }
+            // -O0 code spins for longer.
+            let out = Command::new(env!("CARGO_BIN_EXE_armem")).args(["-f", "1000", "--elf"]).arg(&o).arg(&test).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(text.contains("reachable on ARM only"), arm_only, "{}:\n{}", tag, text);
+            assert!(!text.contains("fuel") && !text.contains("FAULT"), "{}:\n{}", tag, text);
+        }
     }
 }

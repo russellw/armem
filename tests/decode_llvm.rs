@@ -122,7 +122,7 @@ fn litmus_threads_round_trip() {
                 Err(e) => failures.push(format!("{}: {}", tag, e)),
                 Ok(got) => {
                     let got: Vec<Instr> = got.into_iter().map(normalize).collect();
-                    let want: Vec<Instr> = prog.iter().copied().map(normalize).collect();
+                    let want: Vec<Instr> = prog.code.instrs.iter().copied().map(normalize).collect();
                     if got != want {
                         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                             if g != w {
@@ -159,6 +159,10 @@ const CLASSES: &[(&str, u32, u32)] = &[
     ("hint", 0xffff_f000, 0xd503_2000),
     ("barrier", 0xffff_f000, 0xd503_3000),
     ("b", 0x7c00_0000, 0x1400_0000),
+    ("bl", 0xfc00_0000, 0x9400_0000),
+    ("tbz", 0x7e00_0000, 0x3600_0000),
+    ("branch reg", 0xfe00_0000, 0xd600_0000),
+    ("branch reg (no pac)", 0xff80_fc1f, 0xd600_0000),
     ("b.cond", 0xff00_0000, 0x5400_0000),
     ("cbz", 0x7e00_0000, 0x3400_0000),
     ("add/sub imm", 0x1f80_0000, 0x1100_0000),
@@ -240,7 +244,7 @@ fn disassemble(suffix: &str, words: &[u32]) -> Vec<Llvm> {
 /// label at `BASE + imm / 4`.
 fn parse_llvm(text: &str) -> Result<Instr, String> {
     let lower = text.to_ascii_lowercase();
-    let is_branch = ["b\t", "b.", "cbz\t", "cbnz\t"].iter().any(|p| lower.starts_with(p));
+    let is_branch = ["b\t", "bl\t", "b.", "cbz\t", "cbnz\t", "tbz\t", "tbnz\t"].iter().any(|p| lower.starts_with(p));
     let mut labels = HashMap::new();
     if is_branch {
         let (head, off) = text.rsplit_once('#').ok_or("branch without offset")?;

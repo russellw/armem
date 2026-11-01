@@ -195,12 +195,6 @@ impl Function<'_> {
     pub fn decode(&self) -> Result<Vec<Instr>> {
         decode::decode_program_at(self.code, self.load_addr).map_err(|e| format!("function '{}': {}", self.name, e))
     }
-
-    /// Decode the code to run as a whole thread: `RET` ends the thread
-    /// (see `decode::decode_thread`).
-    pub fn decode_thread(&self) -> Result<Vec<Instr>> {
-        decode::decode_thread(self.code, self.load_addr).map_err(|e| format!("function '{}': {}", self.name, e))
-    }
 }
 
 /// Where a function's code is: its section and its byte range within it.

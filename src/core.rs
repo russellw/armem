@@ -178,6 +178,8 @@ pub enum MemOp {
         noret: bool,
     },
     Barrier(Barrier),
+    /// Clear the exclusive monitor, which belongs to the model.
+    Clrex,
 }
 
 /// Result of attempting to execute the next instruction locally.
@@ -205,15 +207,15 @@ fn extend(v: u64, e: Extend) -> u64 {
 }
 
 impl Core {
-    /// Thread `tid` of `threads`, with its stack pointer at the top of its
-    /// (empty) stack.
-    pub fn new(regs: [u64; 31], tid: usize, threads: usize) -> Core {
+    /// Thread `tid` of `threads`, starting at instruction `entry`, with its
+    /// stack pointer at the top of its (empty) stack.
+    pub fn new(regs: [u64; 31], tid: usize, threads: usize, entry: usize) -> Core {
         let mut r = [RV::default(); 31];
         for (i, v) in regs.iter().enumerate() {
             r[i].val = *v;
         }
         let stack = Stack::new(tid, threads);
-        Core { pc: 0, regs: r, sp: RV::imm(stack.hi), stack, flags: RV::default(), steps: 0 }
+        Core { pc: entry, regs: r, sp: RV::imm(stack.hi), stack, flags: RV::default(), steps: 0 }
     }
 
     pub fn get(&self, r: RegOp) -> RV {
@@ -276,8 +278,8 @@ impl Core {
 
     /// Advance past the current (memory) instruction, performing any base
     /// register writeback.
-    pub fn retire(&mut self, prog: &[Instr]) {
-        match prog[self.pc] {
+    pub fn retire(&mut self, code: &Code) {
+        match code.instrs[self.pc] {
             Instr::Load { addr, .. }
             | Instr::Store { addr, .. }
             | Instr::LoadPair { addr, .. }
@@ -351,8 +353,8 @@ impl Core {
 
     /// Execute the next instruction if it is local, or describe the memory
     /// operation it needs.
-    pub fn step(&mut self, prog: &[Instr]) -> Step {
-        let Some(ins) = prog.get(self.pc) else {
+    pub fn step(&mut self, code: &Code) -> Step {
+        let Some(ins) = code.instrs.get(self.pc) else {
             return Step::Done;
         };
         if let Some(step) = self.stack_access(*ins) {
@@ -362,7 +364,16 @@ impl Core {
         let mut next = self.pc + 1;
         match *ins {
             Instr::Nop => {}
+            Instr::Invalid => {
+                let e = code.errors.get(&self.pc).map_or("invalid instruction", String::as_str);
+                return Step::Fault(format!("{:#x}: {}", code.addr(self.pc), e));
+            }
             Instr::MovImm { rd, imm } => self.set(rd, RV::imm(imm)),
+            Instr::Movk { rd, imm, shift } => {
+                let old = self.get(rd);
+                let val = old.val & !(0xffff << shift) | (imm as u64) << shift;
+                self.set(rd, RV { val, ..old });
+            }
             Instr::MovReg { rd, rn } => {
                 let v = self.get(rn);
                 self.set(rd, v)
@@ -427,6 +438,35 @@ impl Core {
                 self.set(rd, RV { pick: v.pick.max(f.pick), ..v });
             }
             Instr::B { target } => next = target,
+            Instr::Tbz { rt, bit, nonzero, target } => {
+                let v = self.get(rt);
+                ctrl = Some(v.pick);
+                if (v.val >> bit & 1 != 0) == nonzero {
+                    next = target;
+                }
+            }
+            Instr::Bl { target } => {
+                self.regs[30] = RV::imm(code.addr(self.pc + 1));
+                next = target;
+            }
+            Instr::BrReg { rn, kind } => {
+                // The target is read before BLR writes X30.
+                let t = self.get(rn);
+                ctrl = Some(t.pick);
+                let Some(i) = code.index(t.val) else {
+                    return Step::Fault(format!(
+                        "{:#x}: branch to {:#x}, which is not in the code {:#x}..{:#x}",
+                        code.addr(self.pc),
+                        t.val,
+                        code.base,
+                        code.exit()
+                    ));
+                };
+                if kind == BrKind::Blr {
+                    self.regs[30] = RV::imm(code.addr(self.pc + 1));
+                }
+                next = i;
+            }
             Instr::BCond { cond, target } => {
                 ctrl = Some(self.flags.pick);
                 if cond.holds(self.flags.val) {
@@ -501,6 +541,7 @@ impl Core {
                 });
             }
             Instr::Barrier(b) => return Step::Mem(MemOp::Barrier(b)),
+            Instr::Clrex => return Step::Mem(MemOp::Clrex),
         }
         self.pc = next;
         self.steps += 1;

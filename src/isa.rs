@@ -4,7 +4,9 @@
 //! executes. It is produced by the assembly parser in `asm.rs` and by the
 //! machine-code decoder in `decode.rs`.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// A general-purpose register operand. `idx` 0..=30 are X0..X30,
 /// 31 is the zero register (XZR/WZR) and 32 the stack pointer (SP/WSP).
@@ -191,11 +193,25 @@ pub enum RmwOp {
     Swp,
 }
 
+/// Kinds of branch to a register. They differ only in that `BLR` writes
+/// the return address to X30 (`RET` merely hints that it is a return).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BrKind {
+    Br,
+    Blr,
+    Ret,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Instr {
     Nop,
+    /// An instruction that could not be decoded; executing it is a fault
+    /// (the reason is in `Code::errors`).
+    Invalid,
     /// MOV/MOVZ rd, #imm
     MovImm { rd: RegOp, imm: u64 },
+    /// MOVK rd, #imm, LSL #shift: replace 16 bits of rd.
+    Movk { rd: RegOp, imm: u16, shift: u8 },
     /// MOV rd, rn
     MovReg { rd: RegOp, rn: RegOp },
     /// ADD/SUB/AND/...; `flags` for ADDS/SUBS/ANDS (and CMP/CMN/TST).
@@ -204,10 +220,16 @@ pub enum Instr {
     Csel { rd: RegOp, rn: RegOp, rm: RegOp, cond: Cond, inc: bool },
     /// B label
     B { target: usize },
+    /// BL label: X30 := the address of the next instruction.
+    Bl { target: usize },
+    /// BR / BLR / RET to the address in `rn`.
+    BrReg { rn: RegOp, kind: BrKind },
     /// B.cond label
     BCond { cond: Cond, target: usize },
     /// CBZ / CBNZ
     Cbz { rt: RegOp, nonzero: bool, target: usize },
+    /// TBZ / TBNZ: branch if bit `bit` of rt is zero (nonzero).
+    Tbz { rt: RegOp, bit: u8, nonzero: bool, target: usize },
     /// LDR{B,H,SB,SH,SW} / LDUR* / LDAR* / LDAPR* / LDXR* / LDAXR*.
     /// `signed` sign-extends the loaded value into `rt`.
     Load { rt: RegOp, addr: Addr, size: Size, signed: bool, kind: LoadKind, excl: bool },
@@ -228,6 +250,8 @@ pub enum Instr {
     /// CAS rs, rt, [addr]: compare with rs, store rt, old value into rs.
     Cas { rs: RegOp, rt: RegOp, addr: Addr, size: Size, acquire: bool, release: bool },
     Barrier(Barrier),
+    /// CLREX: clear the exclusive monitor.
+    Clrex,
 }
 
 impl Cond {
@@ -288,8 +312,18 @@ impl Instr {
         let wb = |a: Addr| (a.writeback != Writeback::None).then_some(a.base);
         let mut base = None;
         match *self {
-            Instr::Nop | Instr::B { .. } | Instr::BCond { .. } | Instr::Cbz { .. } | Instr::Barrier(_) => {}
-            Instr::MovImm { rd, .. } | Instr::MovReg { rd, .. } | Instr::Alu { rd, .. } | Instr::Csel { rd, .. } => reg(rd),
+            Instr::Nop
+            | Instr::Invalid
+            | Instr::B { .. }
+            | Instr::BCond { .. }
+            | Instr::Cbz { .. }
+            | Instr::Tbz { .. }
+            | Instr::BrReg { kind: BrKind::Br | BrKind::Ret, .. }
+            | Instr::Barrier(_)
+            | Instr::Clrex => {}
+            Instr::Bl { .. } | Instr::BrReg { kind: BrKind::Blr, .. } => reg(RegOp { idx: 30, wide: true }),
+            Instr::MovImm { rd, .. }
+            | Instr::Movk { rd, .. } | Instr::MovReg { rd, .. } | Instr::Alu { rd, .. } | Instr::Csel { rd, .. } => reg(rd),
             Instr::Load { rt, addr, .. } => {
                 reg(rt);
                 base = wb(addr);
@@ -311,5 +345,55 @@ impl Instr {
             reg(b);
         }
         out
+    }
+}
+
+/// Code a thread runs: instructions at consecutive addresses from `base`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Code {
+    pub base: u64,
+    pub instrs: Vec<Instr>,
+    /// Why each `Instr::Invalid` could not be decoded, by index.
+    pub errors: BTreeMap<usize, String>,
+}
+
+impl Code {
+    pub fn new(base: u64, instrs: Vec<Instr>) -> Code {
+        Code { base, instrs, errors: BTreeMap::new() }
+    }
+
+    /// The address of instruction `i`.
+    pub fn addr(&self, i: usize) -> u64 {
+        self.base.wrapping_add(4 * i as u64)
+    }
+
+    /// The address just past the code. A thread that reaches it has
+    /// finished, so it is every thread's initial return address (X30).
+    pub fn exit(&self) -> u64 {
+        self.addr(self.instrs.len())
+    }
+
+    /// The index of the instruction at `addr`, which may be the exit.
+    pub fn index(&self, addr: u64) -> Option<usize> {
+        let off = addr.checked_sub(self.base)?;
+        if off % 4 != 0 {
+            return None;
+        }
+        let i = usize::try_from(off / 4).ok()?;
+        (i <= self.instrs.len()).then_some(i)
+    }
+}
+
+/// What a thread runs: shared code and the index it starts at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    pub code: Arc<Code>,
+    pub entry: usize,
+}
+
+impl Program {
+    /// Run `instrs`, loaded at `base`, from the start.
+    pub fn new(base: u64, instrs: Vec<Instr>) -> Program {
+        Program { code: Arc::new(Code::new(base, instrs)), entry: 0 }
     }
 }

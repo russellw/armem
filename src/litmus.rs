@@ -12,14 +12,21 @@
 //! ```
 
 use crate::asm::{self, Result};
-use crate::isa::{Instr, Size};
+use crate::isa::{Code, Program, Size};
 use crate::memory::InitMem;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Base address of the first named location; each further one is `SYM_STRIDE` higher.
 pub const SYM_BASE: u64 = 0x1000;
 pub const SYM_STRIDE: u64 = 0x100;
+
+/// Thread `i`'s assembly code is at `CODE_BASE + i * CODE_STRIDE`. Its
+/// addresses are only seen in return addresses (X30): the code is not in
+/// memory.
+pub const CODE_BASE: u64 = 0x7e00_0000_0000;
+pub const CODE_STRIDE: u64 = 0x100_0000;
 
 /// Something observable in a final state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -81,7 +88,7 @@ pub struct Condition {
 #[derive(Clone, Debug)]
 pub struct Test {
     pub name: String,
-    pub threads: Vec<Vec<Instr>>,
+    pub threads: Vec<Program>,
     /// Source lines of each thread's code (labels included); empty for a
     /// thread that runs an ELF function.
     pub code: Vec<Vec<String>>,
@@ -220,9 +227,10 @@ pub struct PreSym {
 pub struct Preload {
     pub mem: InitMem,
     pub symbols: Vec<PreSym>,
-    /// Functions a thread can run (`P0 = name`): the decoded code, or why
-    /// it cannot be used.
-    pub functions: BTreeMap<String, Result<Vec<Instr>>>,
+    /// The preloaded code (see `Image::code`), which threads can run.
+    pub code: Option<Arc<Code>>,
+    /// Functions a thread can run (`P0 = name`): their addresses in `code`.
+    pub functions: BTreeMap<String, u64>,
 }
 
 struct Symbols {
@@ -508,7 +516,10 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
     let mut threads = Vec::new();
     for (i, (c, f)) in code.iter().zip(&functions).enumerate() {
         threads.push(match f {
-            None => asm::assemble(c).map_err(|e| format!("P{}: {}", i, e))?,
+            None => {
+                let instrs = asm::assemble(c).map_err(|e| format!("P{}: {}", i, e))?;
+                Program::new(CODE_BASE + i as u64 * CODE_STRIDE, instrs)
+            }
             Some(f) if !c.is_empty() => {
                 return Err(format!("P{} runs function '{}', so its code column must be empty", i, f));
             }
@@ -517,17 +528,29 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
                     return Err(format!("P{}: function '{}' needs an ELF file (--elf)", i, f));
                 }
                 None => return Err(format!("P{}: no function '{}' in the ELF file", i, f)),
-                Some(Err(e)) => return Err(format!("P{}: {}", i, e)),
-                Some(Ok(prog)) => prog.clone(),
+                Some(&addr) => {
+                    let code = pre.code.as_ref().filter(|c| c.index(addr).is_some_and(|i| i < c.instrs.len()));
+                    let Some(code) = code else {
+                        return Err(format!("P{}: function '{}' at {:#x} is not in the loaded code", i, f, addr));
+                    };
+                    Program { code: code.clone(), entry: code.index(addr).unwrap() }
+                }
             },
         });
     }
     let mut init_regs = vec![[0u64; 31]; n];
-    for (t, r, v) in reg_inits {
+    for &(t, r, v) in &reg_inits {
         if t >= n {
             return Err(format!("init refers to nonexistent thread {}", t));
         }
         init_regs[t][r as usize] = v;
+    }
+    // Unless the test says otherwise, a thread returns to its code's exit,
+    // so a `RET` from the function it starts in ends it.
+    for (t, p) in threads.iter().enumerate() {
+        if !reg_inits.iter().any(|&(t2, r, _)| t2 == t && r == 30) {
+            init_regs[t][30] = p.code.exit();
+        }
     }
 
     let (locations, mut condition) = parse_final(&rest, &mut syms)?;

@@ -93,7 +93,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             .threads
             .iter()
             .enumerate()
-            .map(|(i, _)| Thread { core: Core::new(test.init_regs[i], i, test.threads.len()), buf: Vec::new(), mon: None })
+            .map(|(i, p)| Thread { core: Core::new(test.init_regs[i], i, test.threads.len(), p.entry), buf: Vec::new(), mon: None })
             .collect(),
         mem: BTreeMap::new(),
     };
@@ -127,14 +127,14 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 stack.push(n);
                 any = true;
             }
-            if th.core.pc < test.threads[tid].len() && th.core.steps >= fuel {
+            if th.core.pc < test.threads[tid].code.instrs.len() && th.core.steps >= fuel {
                 results.truncated = true;
                 stuck = true;
                 continue;
             }
             let mut n = g.clone();
             let buf_empty = n.threads[tid].buf.is_empty();
-            let prog = &test.threads[tid];
+            let prog = &*test.threads[tid].code;
             let step = n.threads[tid].core.step(prog);
             let ok = match step {
                 Step::Done => false,
@@ -231,6 +231,12 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                             t.core.retire(prog);
                             true
                         }
+                    }
+                    MemOp::Clrex => {
+                        let t = &mut n.threads[tid];
+                        t.mon = None;
+                        t.core.retire(prog);
+                        true
                     }
                     MemOp::Barrier(b) => {
                         if b == Barrier::Full && !buf_empty {

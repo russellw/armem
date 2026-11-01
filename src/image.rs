@@ -18,15 +18,19 @@
 //! applied yet.
 
 use crate::elf::*;
-use crate::isa::Size;
+use crate::isa::{Code, Size};
 use crate::litmus::{DEFAULT_LOC_TYPE, LocType, PreSym, Preload, is_ident};
 use crate::memory::{InitMem, Region};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Largest total image size, so a corrupt size cannot exhaust memory.
 const MAX_IMAGE: u64 = 1 << 30;
+
+/// Largest span of executable memory `Image::code` decodes.
+const MAX_CODE: u64 = 1 << 26;
 
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
@@ -495,8 +499,61 @@ impl<'e, 'a> Image<'e, 'a> {
         Ok(Function { name: name.to_string(), section: r.section, load_addr: Some(addr), code })
     }
 
-    /// The image as initial memory for a test, with its functions (decoded
-    /// to run as threads; see `Function::decode_thread`) and its data symbols
+    /// All of the image's executable memory, decoded to run (see
+    /// `decode::decode_code_at`): from the lowest executable address to the
+    /// highest, so that calls and branches between functions work. Words
+    /// that are not in an executable chunk, or that mapping symbols (`$d`)
+    /// mark as data, are not code. None if nothing is executable.
+    pub fn code(&self) -> Result<Option<Code>> {
+        let exec: Vec<&Chunk> = self.chunks.iter().filter(|c| c.exec).collect();
+        let (Some(first), Some(last)) = (exec.first(), exec.last()) else {
+            return Ok(None);
+        };
+        let lo = first.addr & !3;
+        let hi = (last.addr + last.bytes.len() as u64 + 3) & !3;
+        if hi - lo > MAX_CODE {
+            return Err(format!("executable memory {:#x}..{:#x} is too large to decode", lo, hi));
+        }
+        let mut bytes = vec![0u8; (hi - lo) as usize];
+        // Byte ranges (relative to `lo`) that are not code.
+        let mut gaps = Vec::new();
+        let mut covered = 0;
+        for c in &exec {
+            let off = (c.addr - lo) as usize;
+            bytes[off..off + c.bytes.len()].copy_from_slice(&c.bytes);
+            gaps.push((covered, off));
+            covered = off + c.bytes.len();
+        }
+        gaps.push((covered, bytes.len()));
+        // Data marked by mapping symbols, up to the next `$x` or the end of
+        // the section.
+        for (si, sec) in self.elf.sections.iter().enumerate() {
+            let Some(addr) = self.section_addrs[si].filter(|_| sec.is_code()) else { continue };
+            let mut maps: Vec<(u64, bool)> = self
+                .elf
+                .symbols
+                .iter()
+                .filter(|s| s.section == SymSection::Index(si))
+                .filter_map(|s| Some((s.value.wrapping_sub(sec.addr), s.mapping()?)))
+                .collect();
+            maps.sort();
+            for (i, &(start, code)) in maps.iter().enumerate() {
+                if code {
+                    continue;
+                }
+                let end = maps[i + 1..].iter().find(|m| m.1).map_or(sec.size, |m| m.0).min(sec.size);
+                let (s, e) = (addr.wrapping_add(start), addr.wrapping_add(end));
+                if s >= lo && e <= hi && s < e {
+                    gaps.push(((s - lo) as usize, (e - lo) as usize));
+                }
+            }
+        }
+        gaps.retain(|g| g.0 < g.1);
+        Ok(Some(crate::decode::decode_code_at(&bytes, lo, &gaps)))
+    }
+
+    /// The image as initial memory for a test, with its code and the
+    /// addresses of its functions (see `code`), and its data symbols
     /// (objects and common symbols) as named locations. A symbol's type is
     /// a signed integer of its size if that is 1, 2, 4 or 8 bytes, else the
     /// default (signed 64-bit). Names that are not identifiers, or that
@@ -533,9 +590,10 @@ impl<'e, 'a> Image<'e, 'a> {
             .symbols
             .iter()
             .filter(|s| s.kind == SymKind::Func && s.section != SymSection::Undefined && is_ident(&s.name))
-            .map(|s| (s.name.clone(), self.function(&s.name).and_then(|f| f.decode_thread())))
+            .filter_map(|s| Some((s.name.clone(), self.symbol(&s.name).ok()?)))
             .collect();
-        Ok(Preload { mem, symbols, functions })
+        let code = self.code()?.map(Arc::new);
+        Ok(Preload { mem, symbols, code, functions })
     }
 
     /// Decode the loaded code of the function called `name`.

@@ -495,7 +495,8 @@ impl<'e, 'a> Image<'e, 'a> {
         Ok(Function { name: name.to_string(), section: r.section, load_addr: Some(addr), code })
     }
 
-    /// The image as initial memory for a test, with its data symbols
+    /// The image as initial memory for a test, with its functions (decoded
+    /// to run as threads; see `Function::decode_thread`) and its data symbols
     /// (objects and common symbols) as named locations. A symbol's type is
     /// a signed integer of its size if that is 1, 2, 4 or 8 bytes, else the
     /// default (signed 64-bit). Names that are not identifiers, or that
@@ -527,7 +528,14 @@ impl<'e, 'a> Image<'e, 'a> {
             })
             .collect();
         symbols.sort_by_key(|p| p.addr);
-        Ok(Preload { mem, symbols })
+        let functions = self
+            .elf
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymKind::Func && s.section != SymSection::Undefined && is_ident(&s.name))
+            .map(|s| (s.name.clone(), self.function(&s.name).and_then(|f| f.decode_thread())))
+            .collect();
+        Ok(Preload { mem, symbols, functions })
     }
 
     /// Decode the loaded code of the function called `name`.

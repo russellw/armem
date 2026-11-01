@@ -82,8 +82,11 @@ pub struct Condition {
 pub struct Test {
     pub name: String,
     pub threads: Vec<Vec<Instr>>,
-    /// Source lines of each thread's code (labels included).
+    /// Source lines of each thread's code (labels included); empty for a
+    /// thread that runs an ELF function.
     pub code: Vec<Vec<String>>,
+    /// The ELF function each thread runs (`P0 = name`), if any.
+    pub functions: Vec<Option<String>>,
     pub init_regs: Vec<[u64; 31]>,
     /// Initial memory contents (absent bytes are 0).
     pub init_mem: InitMem,
@@ -217,6 +220,9 @@ pub struct PreSym {
 pub struct Preload {
     pub mem: InitMem,
     pub symbols: Vec<PreSym>,
+    /// Functions a thread can run (`P0 = name`): the decoded code, or why
+    /// it cannot be used.
+    pub functions: BTreeMap<String, Result<Vec<Instr>>>,
 }
 
 struct Symbols {
@@ -450,11 +456,19 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
             None => return Err("missing thread header".into()),
         }
     };
+    // Each column is `Pn`, or `Pn = function` for a thread that runs a
+    // function of the preloaded ELF file.
     let cols: Vec<String> = thead.trim().trim_end_matches(';').split('|').map(|c| c.trim().to_string()).collect();
+    let mut functions = Vec::new();
     for (i, c) in cols.iter().enumerate() {
-        if !c.eq_ignore_ascii_case(&format!("P{}", i)) {
+        let (p, f) = match c.split_once('=') {
+            Some((p, f)) => (p.trim(), Some(f.trim())),
+            None => (c.as_str(), None),
+        };
+        if !p.eq_ignore_ascii_case(&format!("P{}", i)) || f.is_some_and(|f| !is_ident(f)) {
             return Err(format!("bad thread header '{}'", thead.trim()));
         }
+        functions.push(f.map(String::from));
     }
     let n = cols.len();
     let mut code: Vec<Vec<String>> = vec![Vec::new(); n];
@@ -492,8 +506,21 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
     }
 
     let mut threads = Vec::new();
-    for (i, c) in code.iter().enumerate() {
-        threads.push(asm::assemble(c).map_err(|e| format!("P{}: {}", i, e))?);
+    for (i, (c, f)) in code.iter().zip(&functions).enumerate() {
+        threads.push(match f {
+            None => asm::assemble(c).map_err(|e| format!("P{}: {}", i, e))?,
+            Some(f) if !c.is_empty() => {
+                return Err(format!("P{} runs function '{}', so its code column must be empty", i, f));
+            }
+            Some(f) => match pre.functions.get(f) {
+                None if pre.functions.is_empty() => {
+                    return Err(format!("P{}: function '{}' needs an ELF file (--elf)", i, f));
+                }
+                None => return Err(format!("P{}: no function '{}' in the ELF file", i, f)),
+                Some(Err(e)) => return Err(format!("P{}: {}", i, e)),
+                Some(Ok(prog)) => prog.clone(),
+            },
+        });
     }
     let mut init_regs = vec![[0u64; 31]; n];
     for (t, r, v) in reg_inits {
@@ -530,6 +557,7 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
         name,
         threads,
         code,
+        functions,
         init_regs,
         init_mem,
         loc_types,

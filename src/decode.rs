@@ -126,14 +126,47 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>> {
 /// Decode little-endian A64 code loaded at address `base`, if known
 /// (needed for `ADR`/`ADRP`).
 pub fn decode_program_at(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
+    decode_code(code, base, false)
+}
+
+const RET_MASK: u32 = 0xffff_fc1f;
+const RET: u32 = 0xd65f_0000;
+
+/// Decode a function that runs as a whole thread. A `RET` returns from
+/// the thread, so it becomes a branch to the end of the code. That holds
+/// only while X30 has the thread's return address, so a function that
+/// returns must not write X30 (calls are not supported yet), and must
+/// return through X30.
+pub fn decode_thread(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
+    decode_code(code, base, true)
+}
+
+fn decode_code(code: &[u8], base: Option<u64>, ret_ends: bool) -> Result<Vec<Instr>> {
     if code.len() % 4 != 0 {
         return Err(format!("code size {} is not a multiple of 4", code.len()));
     }
+    let n = code.len() / 4;
+    let mut rets = false;
     let prog: Vec<Instr> = code
         .chunks_exact(4)
         .enumerate()
-        .map(|(i, c)| decode_at(u32::from_le_bytes(c.try_into().unwrap()), i, base))
+        .map(|(i, c)| {
+            let w = u32::from_le_bytes(c.try_into().unwrap());
+            if ret_ends && w & RET_MASK == RET {
+                if bits(w, 9, 5) != 30 {
+                    return Err(format!("instruction {}: RET X{} cannot return from the thread", i, bits(w, 9, 5)));
+                }
+                rets = true;
+                return Ok(Instr::B { target: n });
+            }
+            decode_at(w, i, base)
+        })
         .collect::<Result<_>>()?;
+    if rets {
+        if let Some(i) = prog.iter().position(|ins| ins.writes().contains(&30)) {
+            return Err(format!("instruction {} writes X30, so RET may not return from the thread (calls are not supported yet)", i));
+        }
+    }
     for (i, ins) in prog.iter().enumerate() {
         if let Instr::B { target } | Instr::BCond { target, .. } | Instr::Cbz { target, .. } = *ins {
             if target > prog.len() {
@@ -610,6 +643,24 @@ mod tests {
             ]
         );
         assert!(decode_program(&code).unwrap_err().contains("load address"));
+    }
+
+    #[test]
+    fn ret_ends_a_thread() {
+        let code = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        const RET_X30: u32 = 0xd65f_03c0;
+        const CBZ_X0_2: u32 = 0xb400_0040; // CBZ X0, .+8
+        const NOP: u32 = 0xd503_201f;
+        assert_eq!(
+            decode_thread(&code(&[CBZ_X0_2, RET_X30, NOP, RET_X30]), None).unwrap(),
+            [Instr::Cbz { rt: zr(0, true), nonzero: false, target: 2 }, Instr::B { target: 4 }, Instr::Nop, Instr::B { target: 4 }]
+        );
+        assert!(decode_program(&code(&[RET_X30])).is_err());
+        assert!(decode_thread(&code(&[0xd65f_0020]), None).unwrap_err().contains("RET X1"));
+        // MOV X30, X0
+        let e = decode_thread(&code(&[0xaa00_03fe, RET_X30]), None).unwrap_err();
+        assert!(e.contains("writes X30"), "{}", e);
+        assert!(decode_thread(&code(&[0xaa00_03fe]), None).is_ok());
     }
 
     #[test]

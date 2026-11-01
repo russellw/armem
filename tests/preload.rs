@@ -1,7 +1,8 @@
-//! Tests that start from the memory of a loaded ELF image.
+//! Tests that start from the memory of a loaded ELF image, and threads that
+//! run its functions.
 //!
-//! The ELF tests assemble a data-only object with `llvm-mc` and are
-//! skipped (with a message) when it is not installed.
+//! The ELF tests assemble objects with `llvm-mc` (and compile C with
+//! `clang`) and are skipped (with a message) when they are not installed.
 
 use armem::elf::Elf;
 use armem::image::{Image, LoadOptions};
@@ -25,6 +26,7 @@ fn manual_preload() -> Preload {
             PreSym { name: "a".into(), addr: 0x8000, size: 4, ty: int },
             PreSym { name: "b".into(), addr: 0x8004, size: 4, ty: int },
         ],
+        functions: Default::default(),
     }
 }
 
@@ -187,4 +189,142 @@ fn command_line() {
     let out = Command::new(env!("CARGO_BIN_EXE_armem")).args(["--elf-base", "0x1000", "--elf"]).arg(&obj).arg(&test).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("overlap"));
+}
+
+#[test]
+fn function_threads() {
+    let mut pre = manual_preload();
+    let x = |i| armem::isa::RegOp { idx: i, wide: true };
+    let w = |i| armem::isa::RegOp { idx: i, wide: false };
+    let addr = |r| armem::isa::Addr { base: x(r), offset: armem::isa::Offset::Imm(0), writeback: armem::isa::Writeback::None };
+    use armem::isa::{Instr, LoadKind};
+    // load_b: LDR W0,[X1]
+    let load = Instr::Load { rt: w(0), addr: addr(1), size: Size::B4, signed: false, kind: LoadKind::Plain, excl: false };
+    pre.functions.insert("load_b".into(), Ok(vec![load]));
+    pre.functions.insert("broken".into(), Err("function 'broken': unsupported".into()));
+    let parse = |src: &str| litmus::parse_with(src, &pre);
+    let t = parse("AArch64 t\n{ 0:X1=b; 1:X3=a; }\n P0 = load_b | P1 ;\n | LDR W2,[X3] ;\nforall (0:X0=9 /\\ 1:X2=1)").unwrap();
+    assert_eq!(t.functions, [Some("load_b".to_string()), None]);
+    assert!(t.code[0].is_empty());
+    assert!(observed(&t, Model::Arm));
+    // Only a header and a condition.
+    let t = parse("AArch64 t\n{ 0:X1=a; }\n P0=load_b ;\nforall (0:X0=1)").unwrap();
+    assert!(observed(&t, Model::Tso));
+    let err = |src: &str| parse(src).unwrap_err();
+    assert!(err("AArch64 t\n{ }\n P0 = load_b ;\n NOP ;\n").contains("must be empty"));
+    assert!(err("AArch64 t\n{ }\n P0 = nope ;\n").contains("no function 'nope'"));
+    assert!(err("AArch64 t\n{ }\n P0 = broken ;\n").contains("P0: function 'broken': unsupported"));
+    assert!(err("AArch64 t\n{ }\n P0 = 1x ;\n").contains("bad thread header"));
+    assert!(err("AArch64 t\n{ }\n P1 = load_b ;\n").contains("bad thread header"));
+    let e = litmus::parse("AArch64 t\n{ }\n P0 = load_b ;\n").unwrap_err();
+    assert!(e.contains("needs an ELF file"), "{}", e);
+}
+
+const FUNCS: &str = "
+	.text
+	.globl writer, reader, bad_ret, clobbers_lr
+	.type writer,%function
+writer:
+	adrp x1, data
+	add x1, x1, :lo12:data
+	mov w0, #42
+	str w0, [x1]
+	adrp x2, flag
+	mov w3, #1
+	str w3, [x2, :lo12:flag]
+	ret
+	.size writer, .-writer
+	.type reader,%function
+reader:
+	adrp x1, flag
+	ldr w2, [x1, :lo12:flag]
+	cbz w2, 1f
+	adrp x3, data
+	ldr w0, [x3, :lo12:data]
+	ret
+1:	mov w0, #-1
+	ret
+	.size reader, .-reader
+	.type bad_ret,%function
+bad_ret:
+	ret x1
+	.size bad_ret, .-bad_ret
+	.type clobbers_lr,%function
+clobbers_lr:
+	mov x30, x0
+	ret
+	.size clobbers_lr, .-clobbers_lr
+	.bss
+	.globl data, flag
+	.p2align 2
+	.type data,%object
+	.size data, 4
+data:	.zero 4
+	.type flag,%object
+	.size flag, 4
+flag:	.zero 4
+";
+
+#[test]
+fn assembled_functions_as_threads() {
+    let Some(mc) = llvm_mc() else { return };
+    let (s, o) = (scratch("funcs.s"), scratch("funcs.o"));
+    std::fs::write(&s, FUNCS).unwrap();
+    let out = Command::new(&mc).args(["-triple=aarch64", "-filetype=obj", "-o"]).arg(&o).arg(&s).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let data = std::fs::read(&o).unwrap();
+    let elf = Elf::parse(&data).unwrap();
+    let image = Image::load(&elf, &LoadOptions::default()).unwrap();
+    let pre = image.preload().unwrap();
+    let t = litmus::parse_with("AArch64 MP-fn\n{ }\n P0 = writer | P1 = reader ;\nexists (1:X0=0)", &pre).unwrap();
+    assert!(observed(&t, Model::Arm));
+    assert!(!observed(&t, Model::Tso));
+    // The reader sees the flag and then the data, or neither.
+    let t = litmus::parse_with("AArch64 MP-fn\n{ }\n P0 = writer | P1 = reader ;\nforall (1:X0=-1 \\/ 1:X0=42 \\/ 1:X0=0)", &pre).unwrap();
+    assert!(observed(&t, Model::Arm));
+    let e = litmus::parse_with("AArch64 t\n{ }\n P0 = bad_ret ;\n", &pre).unwrap_err();
+    assert!(e.contains("RET X1"), "{}", e);
+    let e = litmus::parse_with("AArch64 t\n{ }\n P0 = clobbers_lr ;\n", &pre).unwrap_err();
+    assert!(e.contains("writes X30"), "{}", e);
+}
+
+const C_MP: &str = r#"
+int data, flag;
+void writer(void) { data = 42; __atomic_store_n(&flag, 1, __ATOMIC_RELAXED); }
+int reader(void) { while (!__atomic_load_n(&flag, __ATOMIC_RELAXED)) {} return data; }
+void writer_rel(void) { data = 42; __atomic_store_n(&flag, 1, __ATOMIC_RELEASE); }
+int reader_acq(void) { while (!__atomic_load_n(&flag, __ATOMIC_ACQUIRE)) {} return data; }
+"#;
+
+/// Compiled C: relaxed message passing goes wrong on ARM only, and
+/// release/acquire fixes it.
+#[test]
+fn compiled_functions_as_threads() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let (c, o) = (scratch("mp.c"), scratch("mp.o"));
+    std::fs::write(&c, C_MP).unwrap();
+    let out = Command::new(&clang)
+        .args(["--target=aarch64-linux-gnu", "-O2", "-fno-pic", "-c", "-o"])
+        .arg(&o)
+        .arg(&c)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let check = |header: &str, arm_only: bool| {
+        let test = scratch("mp-c.litmus");
+        std::fs::write(&test, format!("AArch64 MP-c\n{{ }}\n {} ;\nexists (1:X0=0)\n", header)).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_armem")).arg("--elf").arg(&o).arg(&test).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(text.contains("reachable on ARM only"), arm_only, "{}:\n{}", header, text);
+        assert!(!text.contains("fuel"), "{}", text);
+    };
+    check("P0 = writer | P1 = reader", true);
+    check("P0 = writer_rel | P1 = reader_acq", false);
+    check("P0 = writer_rel | P1 = reader", true);
 }

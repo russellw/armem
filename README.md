@@ -181,6 +181,36 @@ overlap the file's memory. In the library this is `Image::preload` and
 `litmus::parse_with`. Memory permissions are not enforced: a store to
 read-only data or code succeeds.
 
+A thread can run a function of the file: write `P0 = name` in the
+thread header and leave that thread's column empty (an armem extension;
+herd7 does not accept it). Arguments go in registers as usual
+(`0:X0=...`), and the return value can be checked in `X0`. For example,
+with this C compiled by `clang --target=aarch64-linux-gnu -O2 -fno-pic
+-c mp.c`:
+
+```c
+int data, flag;
+void writer(void) { data = 42; __atomic_store_n(&flag, 1, __ATOMIC_RELAXED); }
+int reader(void) { while (!__atomic_load_n(&flag, __ATOMIC_RELAXED)) {} return data; }
+```
+
+```
+AArch64 MP-c
+{ }
+ P0 = writer | P1 = reader ;
+exists (1:X0=0)
+```
+
+`armem --elf mp.o MP-c.litmus` reports that the reader can return 0 on
+ARM only. With `__ATOMIC_RELEASE` / `__ATOMIC_ACQUIRE` it cannot.
+
+Calls are not supported yet, so a `RET` in the function returns from the
+thread and ends it. That is only right while X30 holds the thread's
+return address, so a function that writes X30, or returns through
+another register, is rejected. The function must use only supported
+instructions. In particular it must not use SP, which rules out most
+code compiled at `-O0` and functions that need a stack frame.
+
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
 object file as a function, and extracting and decoding it must give the
@@ -349,8 +379,8 @@ lets a lone `LDXP` be torn.
 1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
 2. Run real compiled code: the binary decoder, an ELF loader and
    static relocation are done, and a loaded image can be a test's initial
-   memory (see [Machine code](#machine-code)); next come a way for tests
-   to name ELF functions as threads, SP and a stack, calls and returns, and the
+   memory (see [Machine code](#machine-code)); tests can run ELF functions as
+   threads (`P0 = name`); next come SP and a stack, calls and returns, and the
    instructions compilers commonly emit (`MOVK`, `TBZ`, `UBFX`, ...),
    starting with user-mode functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random

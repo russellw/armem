@@ -270,3 +270,42 @@ impl RmwOp {
         size.mask(r)
     }
 }
+
+impl Instr {
+    /// The general-purpose registers (0..=30) the instruction writes,
+    /// including base register writeback.
+    pub fn writes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut reg = |r: RegOp| {
+            if r.idx != ZR {
+                out.push(r.idx)
+            }
+        };
+        let wb = |a: Addr| (a.writeback != Writeback::None).then_some(a.base);
+        let mut base = None;
+        match *self {
+            Instr::Nop | Instr::B { .. } | Instr::BCond { .. } | Instr::Cbz { .. } | Instr::Barrier(_) => {}
+            Instr::MovImm { rd, .. } | Instr::MovReg { rd, .. } | Instr::Alu { rd, .. } | Instr::Csel { rd, .. } => reg(rd),
+            Instr::Load { rt, addr, .. } => {
+                reg(rt);
+                base = wb(addr);
+            }
+            Instr::Store { addr, .. } | Instr::StorePair { addr, .. } => base = wb(addr),
+            Instr::StoreExcl { rs, .. } | Instr::StoreExclPair { rs, .. } | Instr::Cas { rs, .. } => reg(rs),
+            Instr::LoadExclPair { rt, rt2, .. } => {
+                reg(rt);
+                reg(rt2);
+            }
+            Instr::LoadPair { rt, rt2, addr, .. } => {
+                reg(rt);
+                reg(rt2);
+                base = wb(addr);
+            }
+            Instr::Rmw { rt, .. } => reg(rt),
+        }
+        if let Some(b) = base {
+            reg(b);
+        }
+        out
+    }
+}

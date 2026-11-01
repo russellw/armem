@@ -78,10 +78,13 @@ exists (1:X2=0)
 
 ### Supported instructions
 
-`MOV/MOVZ`, `ADD(S)`, `SUB(S)`, `AND(S)`, `ORR`, `EOR`, `LSL`, `LSR`, `ASR`,
-`MUL`, `SXTW`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`, `CSET`, `B`,
-`B.cond`, `CBZ/CBNZ`, `NOP`, and these memory accesses (ALU instructions
-also accept an extended register operand, as in `ADD X7,X6,W4,SXTW`):
+`MOV/MOVZ/MOVN`, `ADD(S)`, `SUB(S)`, `NEG(S)`, `AND(S)`, `ORR`, `EOR`,
+`LSL`, `LSR`, `ASR`, `MUL`, `SXTW`, `CMP`, `CMN`, `TST`, `CSEL`, `CSINC`,
+`CINC`, `CSET`, `B`, `B.cond`, `CBZ/CBNZ`, `NOP` (and the hints `YIELD`,
+`WFE`, `WFI`, `SEV`, `SEVL`, run as `NOP`), and these memory accesses. ALU
+instructions also accept a shifted or extended register operand, as in
+`ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSL #2`, and `ADD`/`SUB` accept
+`#imm,LSL #12`.
 
 * loads/stores: `LDR`, `STR`, `LDUR`, `STUR`, with byte/halfword forms
   (`LDRB`, `LDRH`, `STRB`, `STRH`) and sign-extending forms (`LDRSB`,
@@ -98,6 +101,36 @@ also accept an extended register operand, as in `ADD X7,X6,W4,SXTW`):
 Addressing modes: `[Xn]`, `[Xn,#imm]`, `[Xn,Xm]`, `[Xn,Xm,LSL #k]`,
 `[Xn,Wm,SXTW|UXTW #k]`, pre-index `[Xn,#imm]!`, and post-index
 `[Xn],#imm` (writeback forms for `LDR`/`STR`/`LDP`/`STP`).
+
+Register combinations that the architecture makes CONSTRAINED
+UNPREDICTABLE are rejected: for example, a writeback base register that is
+also the data register, or an `STXR` status register that is also the data
+or base register.
+
+### Machine code
+
+`src/decode.rs` decodes A64 machine code into the same instructions the
+assembly parser produces (`decode::decode_program` for a block of
+little-endian code). It covers exactly the instructions listed above.
+Anything else, including UNPREDICTABLE encodings, is an error. This is
+the first step toward running compiled code (see [Roadmap](#roadmap)).
+Instructions that use SP (register 31 as a base register, or in
+`ADD`/`SUB` immediate) are not supported yet, because the emulator has
+no stack pointer.
+
+`tests/decode_llvm.rs` checks the decoder against LLVM, when `llvm-mc`
+is installed:
+* every thread in `litmus/` is assembled with `llvm-mc`, and decoding it
+  must give the program the assembly parser produces;
+* random words from each relevant encoding class (96,000 by default; set
+  `ARMEM_DECODE_SAMPLES` for more per class) are disassembled by
+  `llvm-mc`, and the text is parsed by armem's assembler. The decoder
+  must accept a word exactly when the parser accepts its disassembly,
+  with the same result, and must reject every word LLVM rejects or flags
+  as potentially undefined. The one documented exception: LLVM silently
+  ignores a non-ones should-be-one `Rt2` field in `STXR`, which armem
+  rejects. A run of 1.2 million words (409,568 decoded) found no other
+  differences.
 
 ## How it works
 
@@ -232,9 +265,11 @@ lets a lone `LDXP` be torn.
 ## Roadmap
 
 1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
-2. A binary instruction decoder producing the same `isa::Instr`, so real
-   compiled code can be loaded (ELF), starting with user-mode functions
-   extracted from real programs.
+2. Run real compiled code: the binary decoder is done (see
+   [Machine code](#machine-code)); next come an ELF loader, SP and a stack,
+   calls and returns, and the instructions compilers commonly emit
+   (`ADRP`, `MOVK`, `TBZ`, `UBFX`, ...), starting with user-mode
+   functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
    and prioritizing reads that disagree with what TSO would return.

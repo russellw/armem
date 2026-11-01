@@ -81,6 +81,8 @@ pub struct Condition {
 pub struct Test {
     pub name: String,
     pub threads: Vec<Vec<Instr>>,
+    /// Source lines of each thread's code (labels included).
+    pub code: Vec<Vec<String>>,
     pub init_regs: Vec<[u64; 31]>,
     /// Initial memory contents, byte by byte (absent bytes are 0).
     pub init_mem: BTreeMap<u64, u8>,
@@ -473,6 +475,7 @@ pub fn parse(src: &str) -> Result<Test> {
     Ok(Test {
         name,
         threads,
+        code,
         init_regs,
         init_mem,
         loc_types,

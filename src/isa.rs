@@ -1,8 +1,8 @@
 //! Instruction set representation.
 //!
 //! This is the decoded form of AArch64 instructions that the emulator
-//! executes. Today it is produced by the assembly parser in `asm.rs`; a
-//! binary decoder for real machine code can later produce the same form.
+//! executes. It is produced by the assembly parser in `asm.rs` and by the
+//! machine-code decoder in `decode.rs`.
 
 use std::fmt;
 

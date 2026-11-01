@@ -81,6 +81,20 @@ fn parse_operand(s: &str) -> Result<Operand> {
     }
 }
 
+/// Parse a second ALU operand from one or two operand strings: `Rm`,
+/// `#imm`, `Rm, <extend or LSL>` or `#imm, LSL #12`.
+fn parse_op2(ops: &[String], mnem: &str) -> Result<Operand> {
+    match ops {
+        [o] => parse_operand(o),
+        [i, e] if i.starts_with('#') => match parse_extend(e)? {
+            Extend::Lsl(s @ (0 | 12)) => Ok(Operand::Imm((parse_imm(i)? as u64) << s)),
+            _ => Err(format!("{}: bad immediate shift '{}'", mnem, e)),
+        },
+        [r, e] => Ok(Operand::RegExt(parse_reg(r)?, parse_extend(e)?)),
+        _ => Err(format!("{}: bad operands", mnem)),
+    }
+}
+
 fn parse_shift_amount(s: &str) -> Result<u8> {
     let s = s.trim();
     if s.is_empty() {
@@ -98,7 +112,8 @@ fn parse_extend(s: &str) -> Result<Extend> {
     };
     let amt = parse_shift_amount(&amt)?;
     Ok(match kind.as_str() {
-        "LSL" => Extend::Lsl(amt),
+        // UXTX/SXTX of a 64-bit register is a plain shift.
+        "LSL" | "UXTX" | "SXTX" => Extend::Lsl(amt),
         "UXTW" => Extend::Uxtw(amt),
         "SXTW" => Extend::Sxtw(amt),
         _ => return Err(format!("bad extend '{}'", s)),
@@ -117,6 +132,9 @@ fn parse_addr(s: &str) -> Result<Addr> {
         .ok_or_else(|| format!("bad address '{}'", s))?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
     let base = parse_reg(parts[0])?;
+    if base.idx == ZR {
+        return Err(format!("base register cannot be XZR: '{}'", s));
+    }
     if !base.wide {
         return Err(format!("base register must be X: '{}'", s));
     }
@@ -201,7 +219,7 @@ fn parse_cond(s: &str) -> Result<Cond> {
         "LT" => Cond::Lt,
         "GT" => Cond::Gt,
         "LE" => Cond::Le,
-        "AL" => Cond::Al,
+        "AL" | "NV" => Cond::Al,
         _ => return Err(format!("bad condition '{}'", s)),
     })
 }
@@ -264,6 +282,31 @@ const RMW_OPS: &[(&str, RmwOp)] = &[
 
 /// Parse one instruction (without label).
 pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr> {
+    let ins = parse_instr_unchecked(line, labels)?;
+    if unpredictable(&ins) {
+        return Err(format!("UNPREDICTABLE register combination in '{}'", line.trim()));
+    }
+    Ok(ins)
+}
+
+/// Register combinations the architecture makes CONSTRAINED UNPREDICTABLE.
+fn unpredictable(ins: &Instr) -> bool {
+    let wb = |a: &Addr| a.writeback != Writeback::None;
+    let same = |a: RegOp, b: RegOp| a.idx == b.idx;
+    match *ins {
+        Instr::Load { rt, addr, .. } | Instr::Store { rt, addr, .. } => wb(&addr) && same(rt, addr.base),
+        Instr::LoadPair { rt, rt2, addr, .. } => {
+            same(rt, rt2) || (wb(&addr) && (same(rt, addr.base) || same(rt2, addr.base)))
+        }
+        Instr::StorePair { rt, rt2, addr, .. } => wb(&addr) && (same(rt, addr.base) || same(rt2, addr.base)),
+        Instr::StoreExcl { rs, rt, addr, .. } => same(rs, rt) || same(rs, addr.base),
+        Instr::LoadExclPair { rt, rt2, .. } => same(rt, rt2),
+        Instr::StoreExclPair { rs, rt, rt2, addr, .. } => same(rs, rt) || same(rs, rt2) || same(rs, addr.base),
+        _ => false,
+    }
+}
+
+fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<Instr> {
     let line = line.trim();
     let (mnem, rest) = match line.split_once(char::is_whitespace) {
         Some((m, r)) => (m.to_ascii_uppercase(), r.trim()),
@@ -280,17 +323,34 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
     }
 
     let alu = |op: AluOp, flags: bool| -> Result<Instr> {
-        let op2 = match ops.len() {
-            3 => parse_operand(&ops[2])?,
-            4 => Operand::RegExt(parse_reg(&ops[2])?, parse_extend(&ops[3])?),
-            _ => return Err(format!("{} expects 3 or 4 operands, got {}", m, ops.len())),
-        };
+        if !(3..=4).contains(&ops.len()) {
+            return Err(format!("{} expects 3 or 4 operands, got {}", m, ops.len()));
+        }
+        let op2 = parse_op2(&ops[2..], m)?;
         Ok(Instr::Alu { op, rd: reg(0)?, rn: reg(1)?, op2, flags })
     };
 
     let ins = match m {
-        "NOP" => Instr::Nop,
-        "MOV" | "MOVZ" => {
+        // Hints that may be implemented as NOP, which is all the emulator needs.
+        "NOP" | "YIELD" | "WFE" | "WFI" | "SEV" | "SEVL" => Instr::Nop,
+        "MOVZ" | "MOVN" => {
+            if !(2..=3).contains(&ops.len()) {
+                return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
+            }
+            let rd = reg(0)?;
+            let imm = parse_imm(&ops[1])?;
+            let shift = match ops.get(2).map(|e| parse_extend(e)).transpose()? {
+                None => 0,
+                Some(Extend::Lsl(s)) if s % 16 == 0 && (s as u64) < 8 * Size::of(rd).bytes() => s,
+                Some(_) => return Err(format!("{}: bad shift '{}'", m, ops[2])),
+            };
+            if !(0..=0xffff).contains(&imm) {
+                return Err(format!("{}: immediate out of range", m));
+            }
+            let v = (imm as u64) << shift;
+            Instr::MovImm { rd, imm: Size::of(rd).mask(if m == "MOVN" { !v } else { v }) }
+        }
+        "MOV" => {
             want(&ops, 2, m)?;
             let rd = reg(0)?;
             if ops[1].starts_with('#') {
@@ -323,8 +383,18 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
         "LSR" => alu(AluOp::Lsr, false)?,
         "ASR" => alu(AluOp::Asr, false)?,
         "MUL" => alu(AluOp::Mul, false)?,
+        "NEG" | "NEGS" => {
+            if !(2..=3).contains(&ops.len()) {
+                return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
+            }
+            let rd = reg(0)?;
+            let op2 = parse_op2(&ops[1..], m)?;
+            Instr::Alu { op: AluOp::Sub, rd, rn: RegOp { idx: ZR, wide: rd.wide }, op2, flags: m == "NEGS" }
+        }
         "CMP" | "CMN" | "TST" => {
-            want(&ops, 2, m)?;
+            if !(2..=3).contains(&ops.len()) {
+                return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
+            }
             let rn = reg(0)?;
             let op = match m {
                 "CMP" => AluOp::Sub,
@@ -335,13 +405,18 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
                 op,
                 rd: RegOp { idx: ZR, wide: rn.wide },
                 rn,
-                op2: parse_operand(&ops[1])?,
+                op2: parse_op2(&ops[1..], m)?,
                 flags: true,
             }
         }
         "CSEL" | "CSINC" => {
             want(&ops, 4, m)?;
             Instr::Csel { rd: reg(0)?, rn: reg(1)?, rm: reg(2)?, cond: parse_cond(&ops[3])?, inc: m == "CSINC" }
+        }
+        "CINC" => {
+            want(&ops, 3, m)?;
+            let rn = reg(1)?;
+            Instr::Csel { rd: reg(0)?, rn, rm: rn, cond: invert(parse_cond(&ops[2])?), inc: true }
         }
         "CSET" => {
             want(&ops, 2, m)?;
@@ -415,7 +490,9 @@ pub fn parse_instr(line: &str, labels: &HashMap<String, usize>) -> Result<Instr>
             };
             Instr::Barrier(b)
         }
-        "ISB" => Instr::Barrier(Barrier::Isb),
+        "ISB" if ops.is_empty() || (ops.len() == 1 && ops[0].eq_ignore_ascii_case("SY")) => {
+            Instr::Barrier(Barrier::Isb)
+        }
         _ => {
             // LSE atomics, with an optional B/H size suffix.
             let (m, size) = match m.strip_suffix('B') {
@@ -611,6 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn aliases() {
+        let x = |i| RegOp { idx: i, wide: true };
+        let w = |i| RegOp { idx: i, wide: false };
+        assert_eq!(p("MOVN W0,#0xffff,LSL #16").unwrap(), Instr::MovImm { rd: w(0), imm: 0xffff });
+        assert_eq!(p("MOVZ X0,#1,LSL #48").unwrap(), Instr::MovImm { rd: x(0), imm: 1 << 48 });
+        assert_eq!(
+            p("NEG X0,X1").unwrap(),
+            Instr::Alu { op: AluOp::Sub, rd: x(0), rn: x(ZR), op2: Operand::Reg(x(1)), flags: false }
+        );
+        assert_eq!(
+            p("CINC W0,W1,EQ").unwrap(),
+            Instr::Csel { rd: w(0), rn: w(1), rm: w(1), cond: Cond::Ne, inc: true }
+        );
+        assert_eq!(
+            p("CMP X0,#1,LSL #12").unwrap(),
+            Instr::Alu { op: AluOp::Sub, rd: x(ZR), rn: x(0), op2: Operand::Imm(4096), flags: true }
+        );
+        assert!(matches!(p("CMP X0,X1,LSL #2").unwrap(), Instr::Alu { op2: Operand::RegExt(_, Extend::Lsl(2)), .. }));
+        assert_eq!(p("WFE").unwrap(), Instr::Nop);
+        assert_eq!(p("ISB SY").unwrap(), Instr::Barrier(Barrier::Isb));
+    }
+
+    #[test]
     fn rejects_bad_forms() {
         for bad in [
             "STRB X0,[X1]",
@@ -623,6 +723,19 @@ mod tests {
             "LDXP W0,X1,[X2]",
             "STXP X0,X1,X2,[X3]",
             "LDXP X0,X1,[X2,#16]",
+            "LDR X1,[X1],#8",
+            "STRB W2,[X2,#1]!",
+            "LDP X0,X0,[X1]",
+            "STP X0,X1,[X1,#16]!",
+            "STXR W0,W0,[X1]",
+            "STXR W1,W0,[X1]",
+            "STXP W1,X1,X2,[X3]",
+            "LDXP X0,X0,[X2]",
+            "LDR X0,[XZR]",
+            "ISB #3",
+            "MOVZ X0,#1,LSL #8",
+            "MOVN W0,#1,LSL #32",
+            "ADD X0,X1,#1,LSL #4",
         ] {
             assert!(p(bad).is_err(), "accepted {}", bad);
         }

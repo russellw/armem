@@ -1,0 +1,43 @@
+AArch64 ALU-arith
+"Single-threaded check of multiply-add, division, inverted logical operations, conditional select, conditional compare, long multiplies and rotated operands"
+{ }
+ P0                     ;
+ MOV X0,#100            ;
+ MOV X1,#7              ;
+ UDIV X2,X0,X1          ;
+ MSUB X3,X2,X1,X0       ;
+ MADD X4,X2,X1,X3       ;
+ MNEG X5,X1,X1          ;
+ MOV W6,#-100           ;
+ SDIV W7,W6,W1          ;
+ UDIV W8,W6,WZR         ;
+ MOVZ X9,#0x8000,LSL #48 ;
+ MOV X10,#-1            ;
+ SDIV X11,X9,X10        ;
+ BIC X12,X0,X1          ;
+ MVN W13,W1             ;
+ EON X14,X0,X1,LSL #2   ;
+ BICS X15,X1,X1         ;
+ CSETM X16,EQ           ;
+ CSNEG X17,X0,X1,NE     ;
+ CINV W18,W1,EQ         ;
+ CNEG X19,X1,NE         ;
+ CMP X0,X1              ;
+ CCMP X1,#7,#0,HI       ;
+ CSET W20,EQ            ;
+ CCMN X0,X10,#8,LO      ;
+ CSET W21,MI            ;
+ CCMP W1,W0,#4,NE       ;
+ CSET W22,LO            ;
+ CSINV X23,X0,X1,GE     ;
+ CCMN X10,#1,#0,LO      ;
+ CSET W24,CS            ;
+ CSET W25,EQ            ;
+ MOVZ W26,#0x8000,LSL #16 ;
+ MOV W27,#-1            ;
+ SDIV W28,W26,W27       ;
+ UMULL X6,W10,W0        ;
+ UMSUBL X9,W10,W10,XZR  ;
+ EON X26,X0,X1,ROR #4   ;
+ EOR W27,W0,W1,ROR #31  ;
+forall (0:X2=14 /\ 0:X3=2 /\ 0:X4=100 /\ 0:X5=-49 /\ 0:X7=0xfffffff2 /\ 0:X8=0 /\ 0:X11=0x8000000000000000 /\ 0:X12=96 /\ 0:X13=0xfffffff8 /\ 0:X14=0xffffffffffffff87 /\ 0:X15=0 /\ 0:X16=-1 /\ 0:X17=-7 /\ 0:X18=0xfffffff8 /\ 0:X19=7 /\ 0:X20=1 /\ 0:X21=1 /\ 0:X22=1 /\ 0:X23=-8 /\ 0:X24=1 /\ 0:X25=1 /\ 0:X28=0x80000000 /\ 0:X6=429496729500 /\ 0:X9=0x1ffffffff /\ 0:X26=0x8fffffffffffff9b /\ 0:X27=106)

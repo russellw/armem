@@ -1,0 +1,21 @@
+AArch64 ALU-mul-logic
+"Single-threaded check of signed multiply-adds, inverted logical operations, LSL/LSR/ASR operands and CSINV/CSNEG, as herd7 computes them"
+{ 0:X0=100; 0:X1=-7; }
+ P0                       ;
+ MADD X2,X0,X1,X0         ;
+ MSUB W3,W0,W1,W0         ;
+ MNEG X4,X1,X1            ;
+ SMADDL X5,W1,W0,X0       ;
+ SMULL X8,W1,W1           ;
+ BIC X9,X0,X1,ASR #1      ;
+ ORN X10,X0,X1,LSR #60    ;
+ ORN X11,X0,X1,ASR #1     ;
+ MVN W12,W1               ;
+ ADD W13,W0,W1,ASR #1     ;
+ SUB X14,X0,X1,LSR #60    ;
+ CMP X0,X1                ;
+ CSINV X16,X0,X1,LT       ;
+ CSNEG W17,W0,W1,GE       ;
+ CSETM X18,GT             ;
+ CSNEG X19,X1,X0,EQ       ;
+forall (0:X2=-600 /\ 0:X3=800 /\ 0:X4=-49 /\ 0:X5=-600 /\ 0:X8=49 /\ 0:X9=0 /\ 0:X10=-12 /\ 0:X11=103 /\ 0:X12=6 /\ 0:X13=96 /\ 0:X14=85 /\ 0:X16=6 /\ 0:X17=100 /\ 0:X18=-1 /\ 0:X19=-100)

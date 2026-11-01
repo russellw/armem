@@ -79,15 +79,39 @@ exists (1:X2=0)
 
 ### Supported instructions
 
-`MOV/MOVZ/MOVN`, `ADD(S)`, `SUB(S)`, `NEG(S)`, `AND(S)`, `ORR`, `EOR`,
-`LSL`, `LSR`, `ASR`, `MUL`, `SXTW`, `MOVK`, `CMP`, `CMN`, `TST`, `CSEL`,
-`CSINC`, `CINC`, `CSET`, `B`, `B.cond`, `CBZ/CBNZ`, `TBZ/TBNZ`, calls and
-returns (`BL`, `BLR`, `BR`, `RET`; see [Calls](#calls)), `NOP` (and the
-hints `YIELD`, `WFE`, `WFI`, `SEV`, `SEVL`, run as `NOP`), and these memory
-accesses. ALU
-instructions also accept a shifted or extended register operand, as in
-`ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSL #2`, and `ADD`/`SUB` accept
-`#imm,LSL #12`.
+`MOV/MOVZ/MOVN`, `MOVK`, `ADD(S)`, `SUB(S)`, `NEG(S)`, `CMP`, `CMN`, and
+`B`, `B.cond`, `CBZ/CBNZ`, `TBZ/TBNZ`, calls and returns (`BL`, `BLR`, `BR`,
+`RET`; see [Calls](#calls)), `NOP` (and the hints `YIELD`, `WFE`, `WFI`,
+`SEV`, `SEVL`, run as `NOP`), and:
+
+* logical: `AND(S)`, `ORR`, `EOR`, `TST`, and with the second operand
+  inverted `BIC(S)`, `ORN`, `EON`, `MVN`
+* shifts: `LSL`, `LSR`, `ASR` (immediate or register)
+* multiply and divide: `MUL`, `MADD`, `MSUB`, `MNEG`; the long forms
+  `SMADDL`, `SMSUBL`, `UMADDL`, `UMSUBL`, `SMULL`, `UMULL`, `SMNEGL`,
+  `UMNEGL`; `SMULH`, `UMULH`; and `UDIV`, `SDIV` (division by zero gives 0)
+* bitfield moves: `UBFM`, `SBFM`, `BFM` and their aliases `UBFX`, `SBFX`,
+  `UBFIZ`, `SBFIZ`, `BFI`, `BFXIL`, `BFC`, `UXTB`, `UXTH`, `SXTB`, `SXTH`,
+  `SXTW`
+* conditional: `CSEL`, `CSINC`, `CSINV`, `CSNEG` and their aliases `CINC`,
+  `CINV`, `CNEG`, `CSET`, `CSETM`; and the conditional compares `CCMP`,
+  `CCMN` (register or 5-bit immediate)
+* memory accesses, below.
+
+ALU instructions also accept a shifted or extended register operand, as
+in `ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSR #2` (`LSL`, `LSR`, `ASR`, and for
+logical instructions `ROR`), and `ADD`/`SUB` accept `#imm,LSL #12`.
+
+herd7 (7.58) does not accept the bitfield moves, `UDIV`/`SDIV`, `SMULH`/
+`UMULH`, `CCMP`/`CCMN` or `CNEG`, so tests that use them run
+only in armem. It also computes some results differently from the
+architecture: `UMULL`/`UMSUBL` as if signed, `EON` as `EOR`, and some
+W-register results sign-extended rather than zero-extended. The test it
+checks, `ALU-mul-logic`, avoids these.
+
+Like `CSEL`, a `CCMP` gives the flags it sets a data dependency on its
+operands (when its condition holds) and only a pick dependency on the
+flags that it tested.
 
 * loads/stores: `LDR`, `STR`, `LDUR`, `STUR`, with byte/halfword forms
   (`LDRB`, `LDRH`, `STRB`, `STRH`) and sign-extending forms (`LDRSB`,
@@ -225,7 +249,10 @@ from its function to an exit address just past the code (see
 outside the code, for example through a bad return address, faults.
 `tests/preload.rs` runs the example above at `-O0` and `-O2`, and a
 spinlock whose functions call each other at `-O0`, `-O2` and
-`-O2 -mcmodel=large`.
+`-O2 -mcmodel=large`. It also runs integer arithmetic (bitfields,
+division by variables and constants, conditional selects and compares)
+compiled at `-O0` to `-Os`, and checks the result against the same C
+compiled for the host and run natively.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -391,7 +418,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 65 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 74 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
@@ -433,7 +460,7 @@ Current results (herdtools7 7.58):
 | diy7, basic edges, 3 threads | 5428 | all match |
 | diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
 | diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
-| `litmus/` | 65 | 57 match, 1 known difference; herd7 times out or rejects 7 |
+| `litmus/` | 74 | 62 match, 1 known difference; herd7 times out or rejects 11 |
 
 The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
 a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when
@@ -463,9 +490,10 @@ lets a lone `LDXP` be torn.
    static relocation are done, and a loaded image can be a test's initial
    memory (see [Machine code](#machine-code)); tests can run ELF functions as
    threads (`P0 = name`), with SP and a private stack per thread, and
-   they can make calls (`BL`, `BLR`, `RET`); next come more of the
-   instructions compilers commonly emit (`UBFX`, `CSNEG`, `MADD`, `UDIV`,
-   ...), starting with user-mode functions extracted from real programs.
+   they can make calls (`BL`, `BLR`, `RET`) and use the integer
+   instructions compilers commonly emit (bitfield moves, multiply-add,
+   division, conditional compare, ...); next come user-mode functions
+   extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
    and prioritizing reads that disagree with what TSO would return.

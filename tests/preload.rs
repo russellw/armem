@@ -407,3 +407,127 @@ fn compiled_calls() {
         }
     }
 }
+
+/// Arithmetic that compilers turn into bitfield moves (UBFX, BFI, SXTH,
+/// ...), multiply-adds and high multiplies (division by a constant),
+/// divisions, inverted logical operations, shifted operands, CSINV/CSNEG
+/// and CCMP. The hash of the results must be the same as when the code is
+/// compiled for the host and run natively.
+const C_ARITH: &str = r#"typedef __UINT8_TYPE__ uint8_t;
+typedef __INT8_TYPE__ int8_t;
+typedef __INT16_TYPE__ int16_t;
+#define INT64_MIN (-__INT64_MAX__ - 1)
+#define INT32_MIN (-__INT32_MAX__ - 1)
+typedef __UINT64_TYPE__ u64;
+typedef __INT64_TYPE__ i64;
+typedef __UINT32_TYPE__ u32;
+typedef __INT32_TYPE__ i32;
+struct bits { u32 lo : 5, mid : 11, hi : 16; };
+u64 in[] = { 0, 1, 7, 100, 0x8000000000f0a5c3, -1, -100, 0x7fffffff, 0x80000000, 0x123456789abcdef0 };
+#define N (sizeof in / sizeof in[0])
+u64 h;
+
+/* FNV-1a style; x must not depend on *h, or the mix can lose its bits. */
+static inline __attribute__((always_inline)) void mix(u64 *h, u64 x) { *h = (*h ^ x) * 0x100000001b3; }
+
+__attribute__((noinline)) void ops(u64 a, u64 b, u64 *h) {
+  i64 sa = a, sb = b; u32 wa = a, wb = b; i32 swa = a, swb = b;
+  struct bits f; __builtin_memcpy(&f, &wa, 4);
+  mix(h, (a >> 4) & 0xff);
+  mix(h, (u64)((i64)(a << 2) >> 59));
+  mix(h, (a & 0xff) << 24);
+  mix(h, (u64)(i64)(int8_t)a << 8);
+  mix(h, (b & ~0xf00ull) | ((a & 0xf) << 8));
+  mix(h, f.lo + f.mid * 3 + f.hi);
+  f.mid = wb; u32 fw; __builtin_memcpy(&fw, &f, 4); mix(h, fw);
+  mix(h, (int16_t)a); mix(h, (uint8_t)b); mix(h, (u32)(int8_t)wa);
+  mix(h, b ? a / b : 1); mix(h, b ? a % b : 2);
+  mix(h, wb ? wa / wb : 3); mix(h, wb ? wa % wb : 4);
+  mix(h, sb && !(sa == INT64_MIN && sb == -1) ? sa / sb : 5);
+  mix(h, sb && !(sa == INT64_MIN && sb == -1) ? sa % sb : 6);
+  mix(h, swb && !(swa == INT32_MIN && swb == -1) ? swa / swb : 7);
+  mix(h, swb && !(swa == INT32_MIN && swb == -1) ? swa % swb : 8);
+  mix(h, a / 10); mix(h, sa / 7); mix(h, wa / 3);
+  mix(h, a * b + (b >> 3)); mix(h, (a << 5) - a * b); mix(h, -(a * b)); mix(h, wa * wb + wa);
+  mix(h, (i64)swa * swb); mix(h, sa - (i64)swa * (i64)(i32)(b >> 32));
+  mix(h, wa + (u32)(swb >> 7)); mix(h, wa ^ ((wb >> 13) | (wb << 19))); mix(h, a ^ ((b >> 13) | (b << 51)));
+  mix(h, a & ~b); mix(h, a | ~b); mix(h, a ^ ~b); mix(h, wa & ~(wb << 3)); mix(h, ~a);
+  mix(h, sa < 0 ? -sa : sa); mix(h, swa < 5 ? ~swb : swa); mix(h, a > b ? -a : b);
+  mix(h, a == b ? -1 : 0); mix(h, a == 3 ? b : ~b); mix(h, (a < b) ? a + 1 : b);
+  mix(h, (a > 5 && b < 9) ? 11 : 13); mix(h, (sa < sb || a == 100) ? 17 : 19);
+  mix(h, (wa != 0 && wb == wa) ? 23 : 29); mix(h, (a == b || a == -b) ? 31 : 37);
+}
+
+void run(void) {
+  u64 x = 0xcbf29ce484222325;
+  for (unsigned i = 0; i < N; i++)
+    for (unsigned j = 0; j < N; j++)
+      ops(in[i], in[j], &x);
+  h = x;
+}
+
+#ifdef NATIVE
+int printf(const char *, ...);
+int main(void) { run(); printf("%lld\n", (long long)h); }
+#endif
+"#;
+
+#[test]
+fn compiled_arithmetic() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let c = scratch("arith.c");
+    std::fs::write(&c, C_ARITH).unwrap();
+    let native = scratch("arith-native");
+    let out = Command::new(&clang).args(["-O2", "-DNATIVE", "-o"]).arg(&native).arg(&c).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let Ok(out) = Command::new(&native).output() else {
+        eprintln!("skipping: cannot run natively compiled code");
+        return;
+    };
+    let want = String::from_utf8(out.stdout).unwrap();
+    let test = scratch("arith.litmus");
+    std::fs::write(&test, format!("AArch64 arith\n{{ }}\n P0 = run ;\nforall (h={})\n", want.trim())).unwrap();
+    for opt in ["-O0", "-O1", "-O2", "-Os"] {
+        let o = scratch(&format!("arith{}.o", opt));
+        let out = Command::new(&clang)
+            .args(["--target=aarch64-linux-gnu", opt, "-fno-pic", "-c", "-o"])
+            .arg(&o)
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        if opt == "-O2" {
+            use armem::isa::{Extend, Instr, MulKind, Operand, AluOp};
+            let data = std::fs::read(&o).unwrap();
+            let elf = Elf::parse(&data).unwrap();
+            let code = Image::load(&elf, &LoadOptions::default()).unwrap().code().unwrap().unwrap();
+            let kinds: [(&str, fn(&Instr) -> bool); 12] = [
+                ("bitfield", |i| matches!(i, Instr::Bitfield { .. })),
+                ("MADD/MSUB", |i| matches!(i, Instr::Madd { kind: MulKind::Plain, .. })),
+                ("UMULL", |i| matches!(i, Instr::Madd { kind: MulKind::UnsignedLong, .. })),
+                ("SMULL/SMSUBL", |i| matches!(i, Instr::Madd { kind: MulKind::SignedLong, .. })),
+                ("SMULH", |i| matches!(i, Instr::Mulh { signed: true, .. })),
+                ("UMULH", |i| matches!(i, Instr::Mulh { signed: false, .. })),
+                ("UDIV/SDIV", |i| matches!(i, Instr::Alu { op: AluOp::Udiv | AluOp::Sdiv, .. })),
+                ("BIC/ORN/EON", |i| matches!(i, Instr::Alu { op: AluOp::Bic | AluOp::Orn | AluOp::Eon, .. })),
+                ("CSINV/CSNEG", |i| matches!(i, Instr::Csel { inv: true, .. })),
+                ("CCMP/CCMN", |i| matches!(i, Instr::Ccmp { .. })),
+                ("ASR operand", |i| matches!(i, Instr::Alu { op2: Operand::RegExt(_, Extend::Asr(_)), .. })),
+                ("ROR operand", |i| matches!(i, Instr::Alu { op2: Operand::RegExt(_, Extend::Ror(_)), .. })),
+            ];
+            for (name, f) in kinds {
+                assert!(code.instrs.iter().any(f), "no {} in the -O2 code", name);
+            }
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_armem")).args(["-f", "300000", "--elf"]).arg(&o).arg(&test).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("condition forall: Always"), "{}:\n{}", opt, text);
+        assert!(!text.contains("fuel") && !text.contains("FAULT"), "{}:\n{}", opt, text);
+    }
+}

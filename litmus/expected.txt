@@ -41,6 +41,9 @@ MP+dmb.sy+swp          yes  no
 MP-spin                yes  no
 MP-spin-acq            no   no
 ALU                    yes  yes
+ALU-bitfield           yes  yes
+ALU-arith              yes  yes
+ALU-mul-logic          yes  yes
 LDST                   yes  yes
 SCA-H                  no   no
 MP-bytes               yes  no
@@ -72,5 +75,9 @@ MP+dmb.sy+ldp          no   no   lse2
 MP+stp+dmb.sy          no   no   lse2
 MP+dmb.sy+csel-addr    yes  no
 LB+csel-datas          no   no
+LB+madd-datas          no   no
+LB+ubfx-datas          no   no
+LB+ccmp-ctrls          no   no
+MP+dmb.sy+csneg-addr   yes  no
 MP+rel+ldaddnoret-dmb.ld yes no
 MP+rel+cas-addr        yes  no

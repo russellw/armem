@@ -42,7 +42,7 @@ fn tool(suffix: &str, name: &str) -> Command {
 /// Make semantically identical forms compare equal.
 fn normalize(i: Instr) -> Instr {
     let op2 = |o: Operand| match o {
-        Operand::RegExt(r, Extend::Lsl(0)) => Operand::Reg(r),
+        Operand::RegExt(r, Extend::Lsl(0) | Extend::Lsr(0) | Extend::Asr(0) | Extend::Ror(0)) => Operand::Reg(r),
         // UXTW of a W register is a plain shift (LLVM prints it as LSL when
         // SP is an operand).
         Operand::RegExt(r, Extend::Uxtw(0)) if !r.wide => Operand::Reg(r),
@@ -174,6 +174,7 @@ const CLASSES: &[(&str, u32, u32)] = &[
     ("dp 2-source", 0x7fe0_0000, 0x1ac0_0000),
     ("dp 3-source", 0x7f00_0000, 0x1b00_0000),
     ("csel", 0x3fe0_0000, 0x1a80_0000),
+    ("cond compare", 0x3fe0_0000, 0x3a40_0000),
     ("exclusive/ordered", 0x3f00_0000, 0x0800_0000),
     ("atomic", 0x3f20_0c00, 0x3820_0000),
     ("ld/st reg offset", 0x3f20_0c00, 0x3820_0800),

@@ -22,7 +22,9 @@
 //!
 //! Some encodings decode to the same `Instr` as a different but equivalent
 //! source form: `ORR Xd, XZR, ...` becomes `MovImm` or `MovReg`, and `UXTX`
-//! or `SXTX` extends become `LSL`. The hints `YIELD`, `WFE`, `WFI`, `SEV`
+//! or `SXTX` extends become `LSL`. Bitfield moves and `MADD` become the
+//! `Alu` form of an alias where they have one (`Instr::bitfield`,
+//! `Instr::madd`), as the assembler's do. The hints `YIELD`, `WFE`, `WFI`, `SEV`
 //! and `SEVL` become `Nop`, which is a valid implementation of each.
 
 use crate::isa::*;
@@ -261,31 +263,19 @@ fn data_imm(w: u32) -> Result<Instr> {
             };
             Ok(Instr::MovImm { rd: zr(rd, wide), imm })
         }
-        // Bitfield: only the LSL/LSR/ASR #imm and SXTW aliases.
+        // Bitfield: SBFM, BFM, UBFM.
         0b110 => {
-            if bit(w, 22) != wide {
-                return unsupported();
-            }
             let (immr, imms) = (bits(w, 21, 16), bits(w, 15, 10));
-            let top = if wide { 63 } else { 31 };
-            if !wide && (immr > 31 || imms > 31) {
+            if bit(w, 22) != wide || (!wide && (immr > 31 || imms > 31)) {
                 return unsupported();
             }
-            let (rd, rn) = (zr(rd, wide), zr(rn, wide));
-            let shift = |op: AluOp, amt: u32| Instr::Alu { op, rd, rn, op2: Operand::Imm(amt as u64), flags: false };
-            match bits(w, 30, 29) {
-                0b10 if imms == top => Ok(shift(AluOp::Lsr, immr)),
-                0b10 if imms + 1 == immr => Ok(shift(AluOp::Lsl, top - imms)),
-                0b00 if imms == top => Ok(shift(AluOp::Asr, immr)),
-                0b00 if wide && immr == 0 && imms == 31 => Ok(Instr::Alu {
-                    op: AluOp::Orr,
-                    rd,
-                    rn: zr(31, true),
-                    op2: Operand::RegExt(RegOp { idx: rn.idx, wide: false }, Extend::Sxtw(0)),
-                    flags: false,
-                }),
-                _ => unsupported(),
-            }
+            let kind = match bits(w, 30, 29) {
+                0b00 => BfKind::Signed,
+                0b01 => BfKind::Insert,
+                0b10 => BfKind::Unsigned,
+                _ => return unsupported(),
+            };
+            Ok(Instr::bitfield(kind, zr(rd, wide), zr(rn, wide), immr as u8, imms as u8))
         }
         _ => unsupported(),
     }
@@ -355,28 +345,35 @@ fn branch_system(w: u32, index: usize) -> Result<Instr> {
     unsupported()
 }
 
-/// The second operand of a shifted-register instruction (LSL only).
-fn shifted(w: u32, wide: bool) -> Result<Operand> {
+/// The second operand of a shifted-register instruction. ROR is allowed
+/// only for logical operations.
+fn shifted(w: u32, wide: bool, logical: bool) -> Result<Operand> {
     let amt = bits(w, 15, 10);
-    if bits(w, 23, 22) != 0 || (!wide && amt >= 32) {
+    if (!wide && amt >= 32) || (bits(w, 23, 22) == 0b11 && !logical) {
         return unsupported();
     }
     let rm = zr(bits(w, 20, 16), wide);
-    Ok(if amt == 0 { Operand::Reg(rm) } else { Operand::RegExt(rm, Extend::Lsl(amt as u8)) })
+    let amt = amt as u8;
+    let shift = [Extend::Lsl(amt), Extend::Lsr(amt), Extend::Asr(amt), Extend::Ror(amt)][bits(w, 23, 22) as usize];
+    Ok(if amt == 0 { Operand::Reg(rm) } else { Operand::RegExt(rm, shift) })
 }
 
 fn data_reg(w: u32) -> Result<Instr> {
     let wide = bit(w, 31);
     let (rd, rn, rm) = (bits(w, 4, 0), bits(w, 9, 5), bits(w, 20, 16));
-    // Logical (shifted register), without the inverting forms (BIC, ORN, ...).
+    // Logical (shifted register); N (bit 21) inverts the second operand.
     if bits(w, 28, 24) == 0b01010 {
-        if bit(w, 21) {
-            return unsupported();
-        }
         let opc = bits(w, 30, 29);
-        let op2 = shifted(w, wide)?;
+        let op2 = shifted(w, wide, true)?;
         let (rd, rn) = (zr(rd, wide), zr(rn, wide));
-        let op = [AluOp::And, AluOp::Orr, AluOp::Eor, AluOp::And][opc as usize];
+        let op = match (opc, bit(w, 21)) {
+            (0b00 | 0b11, false) => AluOp::And,
+            (0b01, false) => AluOp::Orr,
+            (0b10, false) => AluOp::Eor,
+            (0b00 | 0b11, true) => AluOp::Bic,
+            (0b01, true) => AluOp::Orn,
+            _ => AluOp::Eon,
+        };
         if let (AluOp::Orr, ZR, Operand::Reg(rm)) = (op, rn.idx, op2) {
             return Ok(Instr::MovReg { rd, rn: rm });
         }
@@ -387,7 +384,7 @@ fn data_reg(w: u32) -> Result<Instr> {
         let flags = bit(w, 29);
         let op = if bit(w, 30) { AluOp::Sub } else { AluOp::Add };
         if !bit(w, 21) {
-            let op2 = shifted(w, wide)?;
+            let op2 = shifted(w, wide, false)?;
             return Ok(Instr::Alu { op, rd: zr(rd, wide), rn: zr(rn, wide), op2, flags });
         }
         let amt = bits(w, 12, 10);
@@ -405,9 +402,11 @@ fn data_reg(w: u32) -> Result<Instr> {
         let rd = if flags { zr(rd, wide) } else { sp(rd, wide) };
         return Ok(Instr::Alu { op, rd, rn: sp(rn, wide), op2: Operand::RegExt(rm, ext), flags });
     }
-    // Data-processing (2 source): LSLV, LSRV, ASRV.
+    // Data-processing (2 source): UDIV, SDIV, LSLV, LSRV, ASRV.
     if bits(w, 30, 21) == 0b0011010110 {
         let op = match bits(w, 15, 10) {
+            0b000010 => AluOp::Udiv,
+            0b000011 => AluOp::Sdiv,
             0b001000 => AluOp::Lsl,
             0b001001 => AluOp::Lsr,
             0b001010 => AluOp::Asr,
@@ -415,23 +414,30 @@ fn data_reg(w: u32) -> Result<Instr> {
         };
         return Ok(Instr::Alu { op, rd: zr(rd, wide), rn: zr(rn, wide), op2: Operand::Reg(zr(rm, wide)), flags: false });
     }
-    // Data-processing (3 source): only MADD with XZR, i.e. MUL.
+    // Data-processing (3 source): MADD, MSUB, the long multiply-adds and
+    // the high multiplies.
     if bits(w, 30, 24) == 0b0011011 {
-        if bits(w, 23, 21) != 0 || bit(w, 15) || bits(w, 14, 10) != 31 {
-            return unsupported();
-        }
-        return Ok(Instr::Alu {
-            op: AluOp::Mul,
-            rd: zr(rd, wide),
-            rn: zr(rn, wide),
-            op2: Operand::Reg(zr(rm, wide)),
-            flags: false,
-        });
+        let (ra, sub) = (bits(w, 14, 10), bit(w, 15));
+        let (x, wr) = (|i| zr(i, true), |i| zr(i, false));
+        let long = |kind| Ok(Instr::madd(kind, x(rd), wr(rn), wr(rm), x(ra), sub));
+        return match (wide, bits(w, 23, 21)) {
+            (_, 0b000) => Ok(Instr::madd(MulKind::Plain, zr(rd, wide), zr(rn, wide), zr(rm, wide), zr(ra, wide), sub)),
+            (true, 0b001) => long(MulKind::SignedLong),
+            (true, 0b101) => long(MulKind::UnsignedLong),
+            (true, op @ (0b010 | 0b110)) if !sub => {
+                // Ra is should-be-one.
+                if ra != 31 {
+                    return unpredictable();
+                }
+                Ok(Instr::Mulh { rd: x(rd), rn: x(rn), rm: x(rm), signed: op == 0b010 })
+            }
+            _ => unsupported(),
+        };
     }
-    // Conditional select: CSEL, CSINC.
+    // Conditional select: CSEL, CSINC, CSINV, CSNEG.
     if bits(w, 29, 21) == 0b011010100 {
         let op2 = bits(w, 11, 10);
-        if bit(w, 30) || op2 > 1 {
+        if op2 > 1 {
             return unsupported();
         }
         return Ok(Instr::Csel {
@@ -439,7 +445,22 @@ fn data_reg(w: u32) -> Result<Instr> {
             rn: zr(rn, wide),
             rm: zr(rm, wide),
             cond: CONDS[bits(w, 15, 12) as usize],
+            inv: bit(w, 30),
             inc: op2 == 1,
+        });
+    }
+    // Conditional compare (register or immediate): CCMN, CCMP.
+    if bits(w, 29, 21) == 0b111010010 {
+        if bit(w, 10) || bit(w, 4) {
+            return unsupported();
+        }
+        let op2 = if bit(w, 11) { Operand::Imm(rm as u64) } else { Operand::Reg(zr(rm, wide)) };
+        return Ok(Instr::Ccmp {
+            rn: zr(rn, wide),
+            op2,
+            nzcv: bits(w, 3, 0) as u8,
+            cond: CONDS[bits(w, 15, 12) as usize],
+            cmn: !bit(w, 30),
         });
     }
     unsupported()
@@ -716,6 +737,60 @@ mod tests {
         // authentication); MOVK W with LSL #32.
         for w in [0xd67f_0000u32, 0xd65f_0bff, 0x72c0_0000] {
             assert!(decode(w, 0).is_err(), "{:#x}", w);
+        }
+    }
+
+    #[test]
+    fn integer_instructions() {
+        let (x, w) = (|i| RegOp { idx: i, wide: true }, |i| RegOp { idx: i, wide: false });
+        // Encodings from llvm-mc.
+        let cases = [
+            (0xd343_1820u32, Instr::Bitfield { kind: BfKind::Unsigned, rd: x(0), rn: x(1), immr: 3, imms: 6 }),
+            (0xb37d_0fe0, Instr::Bitfield { kind: BfKind::Insert, rd: x(0), rn: x(ZR), immr: 61, imms: 3 }),
+            (0x937c_fc02, Instr::Alu { op: AluOp::Asr, rd: x(2), rn: x(0), op2: Operand::Imm(60), flags: false }),
+            (0xda82_b420, Instr::Csel { rd: x(0), rn: x(1), rm: x(2), cond: Cond::Lt, inv: true, inc: true }),
+            (0x5a81_1020, Instr::Csel { rd: w(0), rn: w(1), rm: w(1), cond: Cond::Ne, inv: true, inc: false }),
+            (0x9b02_0c20, Instr::Madd { kind: MulKind::Plain, rd: x(0), rn: x(1), rm: x(2), ra: x(3), sub: false }),
+            (0x9b2b_b149, Instr::Madd { kind: MulKind::SignedLong, rd: x(9), rn: w(10), rm: w(11), ra: x(12), sub: true }),
+            (0x9b42_7c20, Instr::Mulh { rd: x(0), rn: x(1), rm: x(2), signed: true }),
+            (0x9ac2_0c20, Instr::Alu { op: AluOp::Sdiv, rd: x(0), rn: x(1), op2: Operand::Reg(x(2)), flags: false }),
+            (0x2a21_03e0, Instr::Alu { op: AluOp::Orn, rd: w(0), rn: w(ZR), op2: Operand::Reg(w(1)), flags: false }),
+            (0xcac2_3420, Instr::Alu { op: AluOp::Eor, rd: x(0), rn: x(1), op2: Operand::RegExt(x(2), Extend::Ror(13)), flags: false }),
+            (0xfa45_1824, Instr::Ccmp { rn: x(1), op2: Operand::Imm(5), nzcv: 4, cond: Cond::Ne, cmn: false }),
+            (0x3a42_a02f, Instr::Ccmp { rn: w(1), op2: Operand::Reg(w(2)), nzcv: 15, cond: Cond::Ge, cmn: true }),
+        ];
+        for (word, want) in cases {
+            assert_eq!(decode(word, 0), Ok(want), "{:#x}", word);
+        }
+        // The assembler gives the same instructions for llvm-mc's text.
+        let text = [
+            (0x131d_0c20u32, "SBFIZ W0,W1,#3,#4"),
+            (0xb344_0c20, "BFI X0,X1,#60,#4"),
+            (0x3300_7c62, "BFXIL W2,W3,#0,#32"),
+            (0xb37d_0fe0, "BFC X0,#3,#4"),
+            (0x5300_1c20, "UXTB W0,W1"),
+            (0x9340_3c20, "SXTH X0,W1"),
+            (0x5a81_1420, "CNEG W0,W1,EQ"),
+            (0xda9f_93e0, "CSETM X0,HI"),
+            (0x1b02_8c20, "MSUB W0,W1,W2,W3"),
+            (0x9b02_fc20, "MNEG X0,X1,X2"),
+            (0x9b02_7c20, "MADD X0,X1,X2,XZR"),
+            (0x1ac2_0820, "UDIV W0,W1,W2"),
+            (0x8a22_0c20, "BIC X0,X1,X2,LSL #3"),
+            (0x6a22_0020, "BICS W0,W1,W2"),
+            (0xca22_0020, "EON X0,X1,X2"),
+            (0x9bc5_7c83, "UMULH X3,X4,X5"),
+            (0x9ba8_7ce6, "UMULL X6,W7,W8"),
+            (0x0b82_1c20, "ADD W0,W1,W2,ASR #7"),
+            (0xcb42_fc20, "SUB X0,X1,X2,LSR #63"),
+        ];
+        for (word, src) in text {
+            assert_eq!(decode(word, 0), crate::asm::parse_instr(src, &Default::default()), "{}", src);
+        }
+        // SMULH with Ra != 31; CCMP with o3 set; UMULL with sf = 0; CSEL
+        // with op2 = 10; ADD with ROR.
+        for word in [0x9b42_7820u32, 0xfa45_1834, 0x1ba8_7ce6, 0x9a82_0820, 0x8bc2_3420] {
+            assert!(decode(word, 0).is_err(), "{:#x}", word);
         }
     }
 

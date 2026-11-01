@@ -1,0 +1,10 @@
+AArch64 MP+dmb.sy+csneg-addr
+"A CSNEG (pick) dependency does not order a later read"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0          | P1                  ;
+ MOV W0,#1   | LDR W0,[X1]         ;
+ STR W0,[X1] | CMP W0,#1           ;
+ DMB SY      | CSNEG W4,WZR,WZR,EQ ;
+ MOV W2,#1   | LDR W2,[X3,W4,SXTW] ;
+ STR W2,[X3] |                     ;
+exists (1:X0=1 /\ 1:X2=0)

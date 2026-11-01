@@ -94,8 +94,24 @@ fn parse_operand(s: &str) -> Result<Operand> {
 }
 
 /// Parse a second ALU operand from one or two operand strings: `Rm`,
-/// `#imm`, `Rm, <extend or LSL>` or `#imm, LSL #12`.
-fn parse_op2(ops: &[String], mnem: &str) -> Result<Operand> {
+/// `#imm`, `Rm, <extend or shift>` or `#imm, LSL #12`. A shift must be
+/// less than the size of `rm`, and ROR is allowed only if `ror`.
+fn parse_op2(ops: &[String], mnem: &str, ror: bool) -> Result<Operand> {
+    let op2 = parse_op2_unchecked(ops, mnem)?;
+    if let Operand::RegExt(r, e) = op2 {
+        let ok = match e {
+            Extend::Lsl(s) | Extend::Lsr(s) | Extend::Asr(s) => (s as u64) < 8 * Size::of(r).bytes(),
+            Extend::Ror(s) => ror && (s as u64) < 8 * Size::of(r).bytes(),
+            Extend::Uxtw(_) | Extend::Sxtw(_) => true,
+        };
+        if !ok {
+            return Err(format!("{}: bad shift '{}'", mnem, ops[1].trim()));
+        }
+    }
+    Ok(op2)
+}
+
+fn parse_op2_unchecked(ops: &[String], mnem: &str) -> Result<Operand> {
     match ops {
         [o] => parse_operand(o),
         [i, e] if i.starts_with('#') => match parse_extend(e)? {
@@ -128,6 +144,9 @@ fn parse_extend(s: &str) -> Result<Extend> {
         "LSL" | "UXTX" | "SXTX" => Extend::Lsl(amt),
         "UXTW" => Extend::Uxtw(amt),
         "SXTW" => Extend::Sxtw(amt),
+        "LSR" => Extend::Lsr(amt),
+        "ASR" => Extend::Asr(amt),
+        "ROR" => Extend::Ror(amt),
         _ => return Err(format!("bad extend '{}'", s)),
     })
 }
@@ -154,7 +173,10 @@ fn parse_addr(s: &str) -> Result<Addr> {
         1 => Offset::Imm(0),
         2 if parts[1].starts_with('#') => Offset::Imm(parse_imm(parts[1])? as i64),
         2 => Offset::Reg(parse_reg(parts[1])?, Extend::Lsl(0)),
-        3 => Offset::Reg(parse_reg(parts[1])?, parse_extend(parts[2])?),
+        3 => match parse_extend(parts[2])? {
+            Extend::Lsr(_) | Extend::Asr(_) | Extend::Ror(_) => return Err(format!("bad address '{}'", s)),
+            e => Offset::Reg(parse_reg(parts[1])?, e),
+        },
         _ => return Err(format!("bad address '{}'", s)),
     };
     if pre && !matches!(offset, Offset::Imm(_)) {
@@ -257,6 +279,23 @@ fn invert(c: Cond) -> Cond {
     }
 }
 
+/// The condition of a CSEL alias such as CINC, which is the inverse of
+/// the one written. AL and NV are not allowed.
+fn alias_cond(s: &str, mnem: &str) -> Result<Cond> {
+    match parse_cond(s)? {
+        Cond::Al => Err(format!("{}: condition '{}' is not allowed", mnem, s.trim())),
+        c => Ok(invert(c)),
+    }
+}
+
+fn same_width(regs: &[RegOp], mnem: &str) -> Result<()> {
+    if regs.iter().all(|r| r.wide == regs[0].wide) {
+        Ok(())
+    } else {
+        Err(format!("{}: registers must be the same width", mnem))
+    }
+}
+
 fn want(ops: &[String], n: usize, mnem: &str) -> Result<()> {
     if ops.len() != n {
         Err(format!("{} expects {} operands, got {}", mnem, n, ops.len()))
@@ -340,7 +379,8 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         if !(3..=4).contains(&ops.len()) {
             return Err(format!("{} expects 3 or 4 operands, got {}", m, ops.len()));
         }
-        let op2 = parse_op2(&ops[2..], m)?;
+        let logical = matches!(op, AluOp::And | AluOp::Orr | AluOp::Eor | AluOp::Bic | AluOp::Orn | AluOp::Eon);
+        let op2 = parse_op2(&ops[2..], m, logical)?;
         let add_sub = matches!(op, AluOp::Add | AluOp::Sub);
         let logical_imm = matches!(op, AluOp::And | AluOp::Orr | AluOp::Eor) && matches!(op2, Operand::Imm(_));
         let rd = if !flags && (add_sub || logical_imm) { parse_reg_sp(&ops[0])? } else { reg(0)? };
@@ -422,12 +462,131 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
         "LSR" => alu(AluOp::Lsr, false)?,
         "ASR" => alu(AluOp::Asr, false)?,
         "MUL" => alu(AluOp::Mul, false)?,
+        "BIC" | "BICS" | "ORN" | "EON" => {
+            let op = match m {
+                "ORN" => AluOp::Orn,
+                "EON" => AluOp::Eon,
+                _ => AluOp::Bic,
+            };
+            let ins = alu(op, m == "BICS")?;
+            if let Instr::Alu { op2: Operand::Imm(_), .. } = ins {
+                return Err(format!("{}: the second operand must be a register", m));
+            }
+            ins
+        }
+        "MVN" => {
+            if !(2..=3).contains(&ops.len()) {
+                return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
+            }
+            let rd = reg(0)?;
+            let op2 = match parse_op2(&ops[1..], m, true)? {
+                Operand::Imm(_) => return Err(format!("{}: the operand must be a register", m)),
+                o => o,
+            };
+            Instr::Alu { op: AluOp::Orn, rd, rn: RegOp { idx: ZR, wide: rd.wide }, op2, flags: false }
+        }
+        "UDIV" | "SDIV" | "MNEG" => {
+            want(&ops, 3, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            same_width(&[rd, rn, rm], m)?;
+            match m {
+                "UDIV" => Instr::Alu { op: AluOp::Udiv, rd, rn, op2: Operand::Reg(rm), flags: false },
+                "SDIV" => Instr::Alu { op: AluOp::Sdiv, rd, rn, op2: Operand::Reg(rm), flags: false },
+                _ => Instr::madd(MulKind::Plain, rd, rn, rm, RegOp { idx: ZR, wide: rd.wide }, true),
+            }
+        }
+        "MADD" | "MSUB" => {
+            want(&ops, 4, m)?;
+            let (rd, rn, rm, ra) = (reg(0)?, reg(1)?, reg(2)?, reg(3)?);
+            same_width(&[rd, rn, rm, ra], m)?;
+            Instr::madd(MulKind::Plain, rd, rn, rm, ra, m == "MSUB")
+        }
+        // Xd, Wn, Wm{, Xa}
+        "SMADDL" | "SMSUBL" | "UMADDL" | "UMSUBL" | "SMULL" | "SMNEGL" | "UMULL" | "UMNEGL" => {
+            let acc = m.ends_with("DDL") || m.ends_with("UBL");
+            want(&ops, if acc { 4 } else { 3 }, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            let ra = if acc { reg(3)? } else { RegOp { idx: ZR, wide: true } };
+            if !rd.wide || rn.wide || rm.wide || !ra.wide {
+                return Err(format!("{}: bad register widths", m));
+            }
+            let kind = if m.starts_with('S') { MulKind::SignedLong } else { MulKind::UnsignedLong };
+            Instr::madd(kind, rd, rn, rm, ra, m.contains("SUB") || m.contains("NEG"))
+        }
+        "SMULH" | "UMULH" => {
+            want(&ops, 3, m)?;
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            if !(rd.wide && rn.wide && rm.wide) {
+                return Err(format!("{}: registers must be X", m));
+            }
+            Instr::Mulh { rd, rn, rm, signed: m == "SMULH" }
+        }
+        "SBFM" | "BFM" | "UBFM" | "SBFX" | "BFXIL" | "UBFX" | "SBFIZ" | "BFI" | "UBFIZ" | "BFC" => {
+            let kind = match m.as_bytes()[0] {
+                b'S' => BfKind::Signed,
+                b'U' => BfKind::Unsigned,
+                _ => BfKind::Insert,
+            };
+            let rd = reg(0)?;
+            let (rn, imms) = if m == "BFC" {
+                want(&ops, 3, m)?;
+                (RegOp { idx: ZR, wide: rd.wide }, &ops[1..])
+            } else {
+                want(&ops, 4, m)?;
+                (reg(1)?, &ops[2..])
+            };
+            same_width(&[rd, rn], m)?;
+            let bits = 8 * Size::of(rd).bytes() as i128;
+            let (a, b) = (parse_imm(&imms[0])?, parse_imm(&imms[1])?);
+            let (immr, imms) = match m {
+                "SBFM" | "BFM" | "UBFM" => (a, b),
+                // #lsb, #width: extract a field to the bottom...
+                "SBFX" | "BFXIL" | "UBFX" if a >= 0 && b >= 1 && a + b <= bits => (a, a + b - 1),
+                // ... or insert one at bit lsb.
+                "SBFIZ" | "BFI" | "UBFIZ" | "BFC" if a >= 0 && b >= 1 && a + b <= bits => ((bits - a) % bits, b - 1),
+                _ => return Err(format!("{}: bad bitfield '{}'", m, rest)),
+            };
+            if !(0..bits).contains(&immr) || !(0..bits).contains(&imms) {
+                return Err(format!("{}: bad bitfield '{}'", m, rest));
+            }
+            Instr::bitfield(kind, rd, rn, immr as u8, imms as u8)
+        }
+        "SXTB" | "SXTH" | "UXTB" | "UXTH" => {
+            want(&ops, 2, m)?;
+            let (rd, rn) = (reg(0)?, reg(1)?);
+            if rn.wide || (rd.wide && m.starts_with('U')) {
+                return Err(format!("{}: bad register widths", m));
+            }
+            let kind = if m.starts_with('S') { BfKind::Signed } else { BfKind::Unsigned };
+            let imms = if m.ends_with('B') { 7 } else { 15 };
+            Instr::bitfield(kind, rd, RegOp { idx: rn.idx, wide: rd.wide }, 0, imms)
+        }
+        "CCMP" | "CCMN" => {
+            want(&ops, 4, m)?;
+            let rn = reg(0)?;
+            let op2 = if ops[1].starts_with('#') {
+                let i = parse_imm(&ops[1])?;
+                if !(0..=31).contains(&i) {
+                    return Err(format!("{}: immediate out of range", m));
+                }
+                Operand::Imm(i as u64)
+            } else {
+                let rm = reg(1)?;
+                same_width(&[rn, rm], m)?;
+                Operand::Reg(rm)
+            };
+            let nzcv = parse_imm(&ops[2])?;
+            if !(0..=15).contains(&nzcv) {
+                return Err(format!("{}: bad flags '{}'", m, ops[2]));
+            }
+            Instr::Ccmp { rn, op2, nzcv: nzcv as u8, cond: parse_cond(&ops[3])?, cmn: m == "CCMN" }
+        }
         "NEG" | "NEGS" => {
             if !(2..=3).contains(&ops.len()) {
                 return Err(format!("{} expects 2 or 3 operands, got {}", m, ops.len()));
             }
             let rd = reg(0)?;
-            let op2 = parse_op2(&ops[1..], m)?;
+            let op2 = parse_op2(&ops[1..], m, false)?;
             Instr::Alu { op: AluOp::Sub, rd, rn: RegOp { idx: ZR, wide: rd.wide }, op2, flags: m == "NEGS" }
         }
         "CMP" | "CMN" | "TST" => {
@@ -444,24 +603,31 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
                 op,
                 rd: RegOp { idx: ZR, wide: rn.wide },
                 rn,
-                op2: parse_op2(&ops[1..], m)?,
+                op2: parse_op2(&ops[1..], m, m == "TST")?,
                 flags: true,
             }
         }
-        "CSEL" | "CSINC" => {
+        "CSEL" | "CSINC" | "CSINV" | "CSNEG" => {
             want(&ops, 4, m)?;
-            Instr::Csel { rd: reg(0)?, rn: reg(1)?, rm: reg(2)?, cond: parse_cond(&ops[3])?, inc: m == "CSINC" }
+            let (rd, rn, rm) = (reg(0)?, reg(1)?, reg(2)?);
+            same_width(&[rd, rn, rm], m)?;
+            let (inv, inc) = (matches!(m, "CSINV" | "CSNEG"), matches!(m, "CSINC" | "CSNEG"));
+            Instr::Csel { rd, rn, rm, cond: parse_cond(&ops[3])?, inv, inc }
         }
-        "CINC" => {
+        // CINC rd, rn, cond is CSINC rd, rn, rn, !cond, and so on.
+        "CINC" | "CINV" | "CNEG" => {
             want(&ops, 3, m)?;
-            let rn = reg(1)?;
-            Instr::Csel { rd: reg(0)?, rn, rm: rn, cond: invert(parse_cond(&ops[2])?), inc: true }
+            let (rd, rn) = (reg(0)?, reg(1)?);
+            same_width(&[rd, rn], m)?;
+            let (inv, inc) = (m != "CINC", m != "CINV");
+            Instr::Csel { rd, rn, rm: rn, cond: alias_cond(&ops[2], m)?, inv, inc }
         }
-        "CSET" => {
+        "CSET" | "CSETM" => {
             want(&ops, 2, m)?;
             let rd = reg(0)?;
             let z = RegOp { idx: ZR, wide: rd.wide };
-            Instr::Csel { rd, rn: z, rm: z, cond: invert(parse_cond(&ops[1])?), inc: true }
+            let m1 = m == "CSETM";
+            Instr::Csel { rd, rn: z, rm: z, cond: alias_cond(&ops[1], m)?, inv: m1, inc: !m1 }
         }
         "B" | "BL" => {
             want(&ops, 1, m)?;
@@ -764,7 +930,7 @@ mod tests {
         );
         assert_eq!(
             p("CINC W0,W1,EQ").unwrap(),
-            Instr::Csel { rd: w(0), rn: w(1), rm: w(1), cond: Cond::Ne, inc: true }
+            Instr::Csel { rd: w(0), rn: w(1), rm: w(1), cond: Cond::Ne, inv: false, inc: true }
         );
         assert_eq!(
             p("CMP X0,#1,LSL #12").unwrap(),
@@ -791,6 +957,60 @@ mod tests {
         assert_eq!(q("CLREX #3"), Instr::Clrex);
         for bad in ["RET W0", "BR", "BLR X1,X2", "TBZ W0,#32,f", "MOVK X0,#1,LSL #8", "MOVK W0,#1,LSL #32", "CLREX #16"] {
             assert!(parse_instr(bad, &labels).is_err(), "accepted {}", bad);
+        }
+    }
+
+    #[test]
+    fn integer_aliases() {
+        let x = |i| RegOp { idx: i, wide: true };
+        let w = |i| RegOp { idx: i, wide: false };
+        let bf = |kind, rd, rn, immr, imms| Instr::Bitfield { kind, rd, rn, immr, imms };
+        assert_eq!(p("UBFX X0,X1,#4,#8").unwrap(), bf(BfKind::Unsigned, x(0), x(1), 4, 11));
+        assert_eq!(p("UBFIZ W0,W1,#20,#8").unwrap(), bf(BfKind::Unsigned, w(0), w(1), 12, 7));
+        assert_eq!(p("BFC X0,#4,#56").unwrap(), bf(BfKind::Insert, x(0), x(ZR), 60, 55));
+        assert_eq!(p("BFI X0,X1,#0,#4").unwrap(), bf(BfKind::Insert, x(0), x(1), 0, 3));
+        assert_eq!(p("SXTB X0,W1").unwrap(), bf(BfKind::Signed, x(0), x(1), 0, 7));
+        // Aliases with an `Alu` form.
+        assert_eq!(p("UBFIZ X0,X1,#3,#61").unwrap(), p("LSL X0,X1,#3").unwrap());
+        assert_eq!(p("SBFX W0,W1,#3,#29").unwrap(), p("ASR W0,W1,#3").unwrap());
+        assert_eq!(p("SBFM X0,X1,#0,#31").unwrap(), p("SXTW X0,W1").unwrap());
+        assert_eq!(p("MADD W0,W1,W2,WZR").unwrap(), p("MUL W0,W1,W2").unwrap());
+        assert_eq!(
+            p("CSETM W0,EQ").unwrap(),
+            Instr::Csel { rd: w(0), rn: w(ZR), rm: w(ZR), cond: Cond::Ne, inv: true, inc: false }
+        );
+        assert_eq!(
+            p("SMNEGL X0,W1,W2").unwrap(),
+            Instr::Madd { kind: MulKind::SignedLong, rd: x(0), rn: w(1), rm: w(2), ra: x(ZR), sub: true }
+        );
+        assert_eq!(
+            p("CCMN X1,#31,#15,AL").unwrap(),
+            Instr::Ccmp { rn: x(1), op2: Operand::Imm(31), nzcv: 15, cond: Cond::Al, cmn: true }
+        );
+        for bad in [
+            "UBFX X0,X1,#60,#8",
+            "UBFX W0,W1,#0,#0",
+            "BFI W0,X1,#0,#4",
+            "UBFM W0,W1,#32,#0",
+            "UXTB X0,W1",
+            "SXTH W0,X1",
+            "CINC W0,W1,AL",
+            "CSETM X0,NV",
+            "CNEG W0,X1,EQ",
+            "UDIV X0,X1,W2",
+            "SDIV X0,X1,#2",
+            "MADD X0,X1,X2",
+            "SMULL X0,X1,X2",
+            "UMULH W0,W1,W2",
+            "BIC X0,X1,#1",
+            "ADD X0,X1,X2,ROR #3",
+            "AND W0,W1,W2,LSR #32",
+            "LDR X0,[X1,X2,LSR #3]",
+            "CCMP X0,#32,#0,EQ",
+            "CCMP X0,X1,#16,EQ",
+            "CCMP X0,W1,#0,EQ",
+        ] {
+            assert!(p(bad).is_err(), "accepted {}", bad);
         }
     }
 

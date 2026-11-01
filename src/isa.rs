@@ -90,6 +90,11 @@ pub enum Extend {
     Lsl(u8),
     Uxtw(u8),
     Sxtw(u8),
+    /// Shifts of a shifted register operand only (ROR only for logical
+    /// operations), within the operation's size.
+    Lsr(u8),
+    Asr(u8),
+    Ror(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -132,10 +137,29 @@ pub enum AluOp {
     And,
     Orr,
     Eor,
+    /// AND, ORR and EOR with the second operand inverted (BIC, ORN, EON).
+    Bic,
+    Orn,
+    Eon,
     Lsl,
     Lsr,
     Asr,
     Mul,
+    /// Division rounds toward zero; dividing by zero gives 0.
+    Udiv,
+    Sdiv,
+}
+
+/// Bitfield moves: UBFM, SBFM and BFM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BfKind {
+    /// UBFM: the other bits of the result are zero.
+    Unsigned,
+    /// SBFM: the bits above the field are copies of its top bit, those
+    /// below it zero.
+    Signed,
+    /// BFM: the other bits of the result are those of the destination.
+    Insert,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -193,6 +217,17 @@ pub enum RmwOp {
     Swp,
 }
 
+/// Multiply-add kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MulKind {
+    /// MADD / MSUB: all registers are the same size.
+    Plain,
+    /// UMADDL / UMSUBL, SMADDL / SMSUBL: W registers rn and rm are zero-
+    /// (sign-) extended, and their 64-bit product added to X register ra.
+    UnsignedLong,
+    SignedLong,
+}
+
 /// Kinds of branch to a register. They differ only in that `BLR` writes
 /// the return address to X30 (`RET` merely hints that it is a return).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -216,8 +251,26 @@ pub enum Instr {
     MovReg { rd: RegOp, rn: RegOp },
     /// ADD/SUB/AND/...; `flags` for ADDS/SUBS/ANDS (and CMP/CMN/TST).
     Alu { op: AluOp, rd: RegOp, rn: RegOp, op2: Operand, flags: bool },
-    /// CSEL rd, rn, rm, cond (and CSINC when `inc`)
-    Csel { rd: RegOp, rn: RegOp, rm: RegOp, cond: Cond, inc: bool },
+    /// CSEL rd, rn, rm, cond: rd := cond ? rn : rm', where rm' is rm, or
+    /// for CSINC rm + 1 (`inc`), CSINV !rm (`inv`) and CSNEG !rm + 1
+    /// (both).
+    Csel { rd: RegOp, rn: RegOp, rm: RegOp, cond: Cond, inv: bool, inc: bool },
+    /// UBFM / SBFM / BFM rd, rn, #immr, #imms, and their aliases (UBFX,
+    /// SBFIZ, BFI, UXTB, ...). If imms >= immr, bits imms..immr of rn go to
+    /// the bottom of rd; otherwise the low imms + 1 bits of rn go to bit
+    /// (datasize - immr). The aliases LSL, LSR, ASR (immediate) and SXTW
+    /// are `Alu` instead (see `Instr::bitfield`).
+    Bitfield { kind: BfKind, rd: RegOp, rn: RegOp, immr: u8, imms: u8 },
+    /// MADD / MSUB rd, rn, rm, ra: rd := ra + rn * rm (ra - rn * rm when
+    /// `sub`), and the long forms (`kind`). MADD with ra = the zero
+    /// register is `Alu` MUL instead (see `Instr::madd`).
+    Madd { kind: MulKind, rd: RegOp, rn: RegOp, rm: RegOp, ra: RegOp, sub: bool },
+    /// UMULH / SMULH rd, rn, rm: the high 64 bits of the 128-bit product.
+    Mulh { rd: RegOp, rn: RegOp, rm: RegOp, signed: bool },
+    /// CCMP / CCMN rn, op2, #nzcv, cond: if cond holds, set the flags as
+    /// CMP (CMN when `cmn`) rn, op2 would; otherwise set them to `nzcv`.
+    /// `op2` is a register or an immediate 0..=31.
+    Ccmp { rn: RegOp, op2: Operand, nzcv: u8, cond: Cond, cmn: bool },
     /// B label
     B { target: usize },
     /// BL label: X30 := the address of the next instruction.
@@ -300,6 +353,38 @@ impl RmwOp {
 }
 
 impl Instr {
+    /// UBFM / SBFM / BFM rd, rn, #immr, #imms, as the `Alu` instruction of
+    /// its LSL, LSR, ASR or SXTW alias if it has one. `immr` and `imms`
+    /// must be less than the register size. The assembler and the decoder
+    /// both use this, so they agree.
+    pub fn bitfield(kind: BfKind, rd: RegOp, rn: RegOp, immr: u8, imms: u8) -> Instr {
+        let top = 8 * Size::of(rd).bytes() as u8 - 1;
+        let shift = |op: AluOp, amt: u8| Instr::Alu { op, rd, rn, op2: Operand::Imm(amt as u64), flags: false };
+        match kind {
+            BfKind::Unsigned if imms == top => shift(AluOp::Lsr, immr),
+            BfKind::Unsigned if imms + 1 == immr => shift(AluOp::Lsl, top - imms),
+            BfKind::Signed if imms == top => shift(AluOp::Asr, immr),
+            BfKind::Signed if rd.wide && immr == 0 && imms == 31 => Instr::Alu {
+                op: AluOp::Orr,
+                rd,
+                rn: RegOp { idx: ZR, wide: true },
+                op2: Operand::RegExt(RegOp { idx: rn.idx, wide: false }, Extend::Sxtw(0)),
+                flags: false,
+            },
+            _ => Instr::Bitfield { kind, rd, rn, immr, imms },
+        }
+    }
+
+    /// MADD / MSUB rd, rn, rm, ra (or a long form), as `Alu` MUL if it is
+    /// one.
+    pub fn madd(kind: MulKind, rd: RegOp, rn: RegOp, rm: RegOp, ra: RegOp, sub: bool) -> Instr {
+        if kind == MulKind::Plain && ra.idx == ZR && !sub {
+            Instr::Alu { op: AluOp::Mul, rd, rn, op2: Operand::Reg(rm), flags: false }
+        } else {
+            Instr::Madd { kind, rd, rn, rm, ra, sub }
+        }
+    }
+
     /// The registers (0..=30, or `SP`) the instruction writes, including
     /// base register writeback.
     pub fn writes(&self) -> Vec<u8> {
@@ -319,11 +404,18 @@ impl Instr {
             | Instr::Cbz { .. }
             | Instr::Tbz { .. }
             | Instr::BrReg { kind: BrKind::Br | BrKind::Ret, .. }
+            | Instr::Ccmp { .. }
             | Instr::Barrier(_)
             | Instr::Clrex => {}
             Instr::Bl { .. } | Instr::BrReg { kind: BrKind::Blr, .. } => reg(RegOp { idx: 30, wide: true }),
             Instr::MovImm { rd, .. }
-            | Instr::Movk { rd, .. } | Instr::MovReg { rd, .. } | Instr::Alu { rd, .. } | Instr::Csel { rd, .. } => reg(rd),
+            | Instr::Movk { rd, .. }
+            | Instr::MovReg { rd, .. }
+            | Instr::Alu { rd, .. }
+            | Instr::Csel { rd, .. }
+            | Instr::Bitfield { rd, .. }
+            | Instr::Madd { rd, .. }
+            | Instr::Mulh { rd, .. } => reg(rd),
             Instr::Load { rt, addr, .. } => {
                 reg(rt);
                 base = wb(addr);

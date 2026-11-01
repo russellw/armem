@@ -1,0 +1,22 @@
+AArch64 ALU-bitfield
+"Single-threaded check of bitfield moves and extends"
+{ 0:X0=0x8000000000f0a5c3; }
+ P0                   ;
+ UBFX X1,X0,#4,#8     ;
+ SBFX X2,X0,#60,#4    ;
+ UBFIZ W3,W0,#24,#8   ;
+ SBFIZ X4,X0,#8,#8    ;
+ MOV X5,#0x1111       ;
+ BFI X5,X0,#8,#4      ;
+ MOV W6,#-1           ;
+ BFXIL W6,W0,#8,#8    ;
+ MOV X7,#-1           ;
+ BFC X7,#4,#56        ;
+ UXTB W8,W0           ;
+ SXTH X9,W0           ;
+ SXTB W10,W0          ;
+ SBFX W11,W0,#8,#8    ;
+ UBFM X12,X0,#62,#1   ;
+ MOV W13,#0           ;
+ BFM W13,W0,#28,#3    ;
+forall (0:X1=0x5c /\ 0:X2=-8 /\ 0:X3=0xc3000000 /\ 0:X4=0xffffffffffffc300 /\ 0:X5=0x1311 /\ 0:X6=0xffffffa5 /\ 0:X7=0xf00000000000000f /\ 0:X8=0xc3 /\ 0:X9=0xffffffffffffa5c3 /\ 0:X10=0xffffffc3 /\ 0:X11=0xffffffa5 /\ 0:X12=0xc /\ 0:X13=0x30)

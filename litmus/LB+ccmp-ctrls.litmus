@@ -1,0 +1,13 @@
+AArch64 LB+ccmp-ctrls
+"A control dependency through CCMP's flags orders a later write"
+{ 0:X1=x; 0:X3=y; 1:X1=y; 1:X3=x; }
+ P0                | P1                ;
+ LDR W0,[X1]       | LDR W0,[X1]       ;
+ MOV W5,#0         | MOV W5,#0         ;
+ CMP W5,#0         | CMP W5,#0         ;
+ CCMP W0,#1,#0,EQ  | CCMP W0,#1,#0,EQ  ;
+ B.NE LC00         | B.NE LC01         ;
+ LC00:             | LC01:             ;
+ MOV W2,#1         | MOV W2,#1         ;
+ STR W2,[X3]       | STR W2,[X3]       ;
+exists (0:X0=1 /\ 1:X0=1)

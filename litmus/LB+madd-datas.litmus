@@ -1,0 +1,8 @@
+AArch64 LB+madd-datas
+"A data dependency through MADD orders a later write"
+{ 0:X1=x; 0:X3=y; 0:X5=1; 1:X1=y; 1:X3=x; 1:X5=1; }
+ P0                | P1                ;
+ LDR W0,[X1]       | LDR W0,[X1]       ;
+ MADD W2,W0,W4,W5  | MADD W2,W0,W4,W5  ;
+ STR W2,[X3]       | STR W2,[X3]       ;
+exists (0:X0=1 /\ 1:X0=1)

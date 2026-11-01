@@ -197,13 +197,41 @@ pub enum Step {
     Mem(MemOp),
 }
 
-/// Apply a register extend/shift.
-fn extend(v: u64, e: Extend) -> u64 {
+/// Apply a register extend/shift to `v`, a register value of the
+/// operation's size (64 bits if `wide`, else 32).
+fn extend(v: u64, e: Extend, wide: bool) -> u64 {
     match e {
         Extend::Lsl(s) => v << s,
         Extend::Uxtw(s) => (v & 0xffff_ffff) << s,
         Extend::Sxtw(s) => ((v as u32 as i32 as i64) as u64) << s,
+        Extend::Lsr(s) => v >> s,
+        Extend::Asr(s) if wide => ((v as i64) >> s) as u64,
+        Extend::Asr(s) => ((v as u32 as i32) >> s) as u32 as u64,
+        Extend::Ror(s) if wide => v.rotate_right(s as u32),
+        Extend::Ror(s) => (v as u32).rotate_right(s as u32) as u64,
     }
+}
+
+/// The NZCV flags (N=8, Z=4, C=2, V=1) set by `op` on `x` and `y`, whose
+/// result is `r`, all of them masked to the operation's size.
+fn nzcv(op: AluOp, x: u64, y: u64, r: u64, wide: bool) -> u64 {
+    let sign = if wide { 1u64 << 63 } else { 1 << 31 };
+    let n = r & sign != 0;
+    let z = r == 0;
+    let (c, v) = match op {
+        AluOp::Add => {
+            let c = if wide { x.checked_add(y).is_none() } else { x + y > 0xffff_ffff };
+            let v = (x & sign == y & sign) && (r & sign != x & sign);
+            (c, v)
+        }
+        AluOp::Sub => {
+            let c = x >= y;
+            let v = (x & sign != y & sign) && (r & sign != x & sign);
+            (c, v)
+        }
+        _ => (false, false),
+    };
+    (n as u64) << 3 | (z as u64) << 2 | (c as u64) << 1 | v as u64
 }
 
 impl Core {
@@ -242,7 +270,7 @@ impl Core {
             Operand::Imm(i) => RV::imm(if wide { i } else { i & 0xffff_ffff }),
             Operand::RegExt(r, e) => {
                 let v = self.get(r);
-                RV { val: extend(v.val, e), ..v }
+                RV { val: extend(v.val, e, wide), ..v }
             }
         }
     }
@@ -257,7 +285,7 @@ impl Core {
             Offset::Imm(i) => RV::imm(i as u64),
             Offset::Reg(r, e) => {
                 let v = self.get(r);
-                RV { val: extend(v.val, e), ..v }
+                RV { val: extend(v.val, e, true), ..v }
             }
         };
         RV::joined(b.val.wrapping_add(off.val), b, off)
@@ -391,6 +419,9 @@ impl Core {
                     AluOp::And => x & y,
                     AluOp::Orr => x | y,
                     AluOp::Eor => x ^ y,
+                    AluOp::Bic => x & !y,
+                    AluOp::Orn => x | !y,
+                    AluOp::Eon => x ^ !y,
                     AluOp::Lsl => x << (y % bits),
                     AluOp::Lsr => x >> (y % bits),
                     AluOp::Asr => {
@@ -401,41 +432,82 @@ impl Core {
                         }
                     }
                     AluOp::Mul => x.wrapping_mul(y),
+                    AluOp::Udiv => x.checked_div(y).unwrap_or(0),
+                    AluOp::Sdiv => {
+                        let (x, y) = (size.extend(x, true) as i64, size.extend(y, true) as i64);
+                        // i64::MIN / -1 wraps, as INT_MIN / -1 does at either size.
+                        if y == 0 { 0 } else { x.wrapping_div(y) as u64 }
+                    }
                 };
                 let r = size.mask(r);
                 if flags {
-                    let sign = 1u64 << (bits - 1);
-                    let n = r & sign != 0;
-                    let z = r == 0;
-                    let (c, v) = match op {
-                        AluOp::Add => {
-                            let c = if wide { x.checked_add(y).is_none() } else { x + y > 0xffff_ffff };
-                            let v = (x & sign == y & sign) && (r & sign != x & sign);
-                            (c, v)
-                        }
-                        AluOp::Sub => {
-                            let c = x >= y;
-                            let v = (x & sign != y & sign) && (r & sign != x & sign);
-                            (c, v)
-                        }
-                        _ => (false, false),
-                    };
-                    let nzcv = (n as u64) << 3 | (z as u64) << 2 | (c as u64) << 1 | v as u64;
+                    let nzcv = nzcv(op, x, y, r, wide);
                     self.flags = RV::joined(nzcv, a, b);
                 }
                 self.set(rd, RV::joined(r, a, b));
             }
-            Instr::Csel { rd, rn, rm, cond, inc } => {
+            Instr::Csel { rd, rn, rm, cond, inv, inc } => {
                 let f = self.flags;
                 let v = if cond.holds(f.val) {
                     self.get(rn)
                 } else {
                     let m = self.get(rm);
-                    RV { val: if inc { m.val.wrapping_add(1) } else { m.val }, ..m }
+                    let val = if inv { !m.val } else { m.val };
+                    RV { val: val.wrapping_add(inc as u64), ..m }
                 };
                 // The result has a data dependency on the chosen operand and
                 // only a pick dependency on the flags.
                 self.set(rd, RV { pick: v.pick.max(f.pick), ..v });
+            }
+            Instr::Bitfield { kind, rd, rn, immr, imms } => {
+                let src = self.get(rn);
+                let dst = self.get(rd);
+                let bits = 8 * Size::of(rd).bytes() as u32;
+                let (immr, imms) = (immr as u32, imms as u32);
+                // The field's width and where it comes from and goes to.
+                let (width, from, to) = if imms >= immr { (imms - immr + 1, immr, 0) } else { (imms + 1, 0, bits - immr) };
+                let mask = u64::MAX >> (64 - width);
+                let field = src.val >> from & mask;
+                let mut r = match kind {
+                    BfKind::Insert => dst.val & !(mask << to),
+                    _ => 0,
+                } | field << to;
+                if kind == BfKind::Signed && field >> (width - 1) & 1 != 0 {
+                    r |= u64::MAX << (to + width - 1);
+                }
+                let v = if kind == BfKind::Insert { RV::joined(r, src, dst) } else { RV { val: r, ..src } };
+                self.set(rd, v);
+            }
+            Instr::Madd { kind, rd, rn, rm, ra, sub } => {
+                let (a, b, c) = (self.get(rn), self.get(rm), self.get(ra));
+                let signed = kind == MulKind::SignedLong;
+                let (x, y) = (Size::of(rn).extend(a.val, signed), Size::of(rm).extend(b.val, signed));
+                let p = x.wrapping_mul(y);
+                let r = if sub { c.val.wrapping_sub(p) } else { c.val.wrapping_add(p) };
+                self.set(rd, RV::joined(r, RV::joined(0, a, b), c));
+            }
+            Instr::Mulh { rd, rn, rm, signed } => {
+                let (a, b) = (self.get(rn), self.get(rm));
+                let r = if signed {
+                    ((a.val as i64 as i128 * b.val as i64 as i128) >> 64) as u64
+                } else {
+                    ((a.val as u128 * b.val as u128) >> 64) as u64
+                };
+                self.set(rd, RV::joined(r, a, b));
+            }
+            Instr::Ccmp { rn, op2, nzcv: imm, cond, cmn } => {
+                let f = self.flags;
+                let v = if cond.holds(f.val) {
+                    let (a, b) = (self.get(rn), self.operand(op2, rn.wide));
+                    let size = Size::of(rn);
+                    let (op, r) = if cmn { (AluOp::Add, a.val.wrapping_add(b.val)) } else { (AluOp::Sub, a.val.wrapping_sub(b.val)) };
+                    RV::joined(nzcv(op, a.val, b.val, size.mask(r), rn.wide), a, b)
+                } else {
+                    RV::imm(imm as u64)
+                };
+                // Like CSEL, the new flags depend on the chosen operands and
+                // are only picked by the old flags.
+                self.flags = RV { pick: v.pick.max(f.pick), ..v };
             }
             Instr::B { target } => next = target,
             Instr::Tbz { rt, bit, nonzero, target } => {

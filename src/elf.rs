@@ -183,16 +183,26 @@ pub struct Reloc {
 pub struct Function<'a> {
     pub name: String,
     pub section: usize,
-    /// The symbol value: section offset in an object file, else address.
-    pub addr: u64,
+    /// The address the code runs at, if known: in a linked file or a
+    /// loaded `Image`. Not known for code read directly from an object file.
+    pub load_addr: Option<u64>,
     pub code: &'a [u8],
 }
 
 impl Function<'_> {
-    /// Decode the code. Branches must stay within the function.
+    /// Decode the code. Branches must stay within the function. `ADR` and
+    /// `ADRP` need `load_addr`.
     pub fn decode(&self) -> Result<Vec<Instr>> {
-        decode::decode_program(self.code).map_err(|e| format!("function '{}': {}", self.name, e))
+        decode::decode_program_at(self.code, self.load_addr).map_err(|e| format!("function '{}': {}", self.name, e))
     }
+}
+
+/// Where a function's code is: its section and its byte range within it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionRange {
+    pub section: usize,
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +266,9 @@ pub fn reloc_name(kind: u32) -> Option<&'static str> {
         267 => "R_AARCH64_MOVW_UABS_G2",
         268 => "R_AARCH64_MOVW_UABS_G2_NC",
         269 => "R_AARCH64_MOVW_UABS_G3",
+        270 => "R_AARCH64_MOVW_SABS_G0",
+        271 => "R_AARCH64_MOVW_SABS_G1",
+        272 => "R_AARCH64_MOVW_SABS_G2",
         273 => "R_AARCH64_LD_PREL_LO19",
         274 => "R_AARCH64_ADR_PREL_LO21",
         275 => "R_AARCH64_ADR_PREL_PG_HI21",
@@ -272,6 +285,7 @@ pub fn reloc_name(kind: u32) -> Option<&'static str> {
         299 => "R_AARCH64_LDST128_ABS_LO12_NC",
         311 => "R_AARCH64_ADR_GOT_PAGE",
         312 => "R_AARCH64_LD64_GOT_LO12_NC",
+        314 => "R_AARCH64_PLT32",
         1024 => "R_AARCH64_COPY",
         1025 => "R_AARCH64_GLOB_DAT",
         1026 => "R_AARCH64_JUMP_SLOT",
@@ -279,6 +293,11 @@ pub fn reloc_name(kind: u32) -> Option<&'static str> {
         1032 => "R_AARCH64_IRELATIVE",
         _ => return None,
     })
+}
+
+/// A relocation type's name, or its number if unknown.
+pub fn reloc_display(kind: u32) -> String {
+    reloc_name(kind).map_or_else(|| format!("relocation type {}", kind), String::from)
 }
 
 impl<'a> Elf<'a> {
@@ -518,7 +537,7 @@ impl<'a> Elf<'a> {
     }
 
     /// The name of a relocation's symbol, for messages.
-    fn reloc_symbol(&self, r: &Reloc) -> String {
+    pub fn reloc_symbol(&self, r: &Reloc) -> String {
         let link = self.sections[r.from].link as usize;
         if Some(link) != self.symtab || r.symbol == 0 {
             return format!("symbol {}", r.symbol);
@@ -550,8 +569,10 @@ impl<'a> Elf<'a> {
         }
     }
 
-    /// The machine code of the function called `name`.
-    pub fn function(&self, name: &str) -> Result<Function<'a>> {
+    /// Find the function called `name` and check that its code can be
+    /// extracted: it lies within an executable section, is aligned, and
+    /// contains no data according to the mapping symbols.
+    pub fn function_range(&self, name: &str) -> Result<FunctionRange> {
         let sym = self.function_symbol(name)?;
         let SymSection::Index(si) = sym.section else {
             return Err(format!("function '{}' is not in a section", name));
@@ -571,19 +592,6 @@ impl<'a> Elf<'a> {
         if start % 4 != 0 {
             return Err(format!("function '{}' is not 4-byte aligned", name));
         }
-        // In an object file, relocations patch the code at link time.
-        if self.kind == FileKind::Relocatable {
-            if let Some(r) = self.relocs.iter().filter(|r| r.target == Some(si) && (start..end).contains(&r.offset)).min_by_key(|r| r.offset) {
-                let kind = reloc_name(r.kind).map_or_else(|| format!("relocation type {}", r.kind), String::from);
-                return Err(format!(
-                    "function '{}': instruction at offset {:#x} needs relocation {} against {} (relocations are not supported yet)",
-                    name,
-                    r.offset - start,
-                    kind,
-                    self.reloc_symbol(r)
-                ));
-            }
-        }
         // Mapping symbols mark where code and data start within a section.
         let mut maps: Vec<(u64, bool)> = self
             .symbols
@@ -597,8 +605,29 @@ impl<'a> Elf<'a> {
         if let Some(d) = data {
             return Err(format!("function '{}' contains data (e.g. a literal pool) at offset {:#x}", name, d - start));
         }
+        Ok(FunctionRange { section: si, start, end })
+    }
+
+    /// The machine code of the function called `name`, as stored in the
+    /// file. In an object file, code that still needs relocation is an
+    /// error: load the file with `image::Image::load` to relocate it.
+    pub fn function(&self, name: &str) -> Result<Function<'a>> {
+        let FunctionRange { section: si, start, end } = self.function_range(name)?;
+        if self.kind == FileKind::Relocatable {
+            if let Some(r) = self.relocs.iter().filter(|r| r.target == Some(si) && (start..end).contains(&r.offset)).min_by_key(|r| r.offset) {
+                return Err(format!(
+                    "function '{}': instruction at offset {:#x} needs relocation {} against {} (load the file as an image to apply relocations)",
+                    name,
+                    r.offset - start,
+                    reloc_display(r.kind),
+                    self.reloc_symbol(r)
+                ));
+            }
+        }
         let code = &self.section_data(si)?[start as usize..end as usize];
-        Ok(Function { name: name.to_string(), section: si, addr: sym.value, code })
+        let addr = self.sections[si].addr + start;
+        let load_addr = (self.kind != FileKind::Relocatable).then_some(addr);
+        Ok(Function { name: name.to_string(), section: si, load_addr, code })
     }
 
     /// Decode the function called `name`.
@@ -722,7 +751,7 @@ mod tests {
         let x = |i| RegOp { idx: i, wide: true };
         assert_eq!(elf.decode_function("f").unwrap(), [Instr::Nop, Instr::MovImm { rd: x(0), imm: 1 }, Instr::B { target: 1 }]);
         assert_eq!(elf.decode_function("g").unwrap(), [Instr::Nop]);
-        assert_eq!(elf.function("f").unwrap().addr, 0x400078);
+        assert_eq!(elf.function("f").unwrap().load_addr, Some(0x400078));
     }
 
     #[test]
@@ -741,7 +770,7 @@ mod tests {
         assert!(err(dup, "f").contains("ambiguous"));
         // A unique global wins over a local of the same name.
         let shadow = build(&words(&[NOP, MOV_X0_1]), &[("f", 0x400078, 4, 0x02), ("f", 0x40007c, 4, FUNC)]);
-        assert_eq!(Elf::parse(&shadow).unwrap().function("f").unwrap().addr, 0x40007c);
+        assert_eq!(Elf::parse(&shadow).unwrap().function("f").unwrap().load_addr, Some(0x40007c));
         // A branch out of the function is a decoding error.
         let out = build(&words(&[NOP, B_BACK]), &[("f", 0x40007c, 4, FUNC)]);
         assert!(Elf::parse(&out).unwrap().decode_function("f").unwrap_err().contains("before the start"));

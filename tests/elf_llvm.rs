@@ -348,7 +348,8 @@ datum:
     let lines = |l: &[&str]| assemble(&l.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
     assert_eq!(elf.decode_function("writer").unwrap(), lines(&writer));
     assert_eq!(elf.decode_function("reader").unwrap(), lines(&reader));
-    assert_eq!(elf.function("reader").unwrap().addr, 16);
+    let reader_fn = elf.function("reader").unwrap();
+    assert_eq!((reader_fn.load_addr, elf.function_range("reader").unwrap().start), (None, 16));
     assert_eq!(elf.decode_function("other").unwrap(), lines(&["NOP"]));
     let err = elf.function("pool").unwrap_err();
     assert!(err.contains("contains data") && err.contains("offset 0x4"), "{}", err);

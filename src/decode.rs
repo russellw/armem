@@ -10,6 +10,11 @@
 //! (base registers, and the destination and first source of `ADD`/`SUB`
 //! immediate), decoding fails, because the emulator does not model SP yet.
 //!
+//! `ADR` and `ADRP` compute an address from the PC, so they decode only when
+//! the code's load address is known (`decode_at`, `decode_program_at`), and
+//! become `MovImm` of the computed address: the result is a constant with
+//! no dependencies.
+//!
 //! Some encodings decode to the same `Instr` as a different but equivalent
 //! source form: `ORR Xd, XZR, ...` becomes `MovImm` or `MovReg`, and `UXTX`
 //! or `SXTX` extends become `LSL`. The hints `YIELD`, `WFE`, `WFI`, `SEV`
@@ -103,19 +108,31 @@ fn bitmask_imm(n: bool, immr: u32, imms: u32, wide: bool) -> Option<u64> {
 /// Decode one instruction. `index` is its position in the program, in
 /// instructions; branch targets are returned as instruction indexes.
 pub fn decode(word: u32, index: usize) -> Result<Instr> {
-    decode_inner(word, index).map_err(|e| format!("{:#010x}: {}", word, e))
+    decode_at(word, index, None)
+}
+
+/// Decode one instruction of code loaded at `base` (if known): the
+/// instruction's address is `base + 4 * index`.
+pub fn decode_at(word: u32, index: usize, base: Option<u64>) -> Result<Instr> {
+    decode_inner(word, index, base).map_err(|e| format!("{:#010x}: {}", word, e))
 }
 
 /// Decode little-endian A64 code. Branches must stay within the code
 /// (a branch to just past the end is allowed: it ends the thread).
 pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>> {
+    decode_program_at(code, None)
+}
+
+/// Decode little-endian A64 code loaded at address `base`, if known
+/// (needed for `ADR`/`ADRP`).
+pub fn decode_program_at(code: &[u8], base: Option<u64>) -> Result<Vec<Instr>> {
     if code.len() % 4 != 0 {
         return Err(format!("code size {} is not a multiple of 4", code.len()));
     }
     let prog: Vec<Instr> = code
         .chunks_exact(4)
         .enumerate()
-        .map(|(i, c)| decode(u32::from_le_bytes(c.try_into().unwrap()), i))
+        .map(|(i, c)| decode_at(u32::from_le_bytes(c.try_into().unwrap()), i, base))
         .collect::<Result<_>>()?;
     for (i, ins) in prog.iter().enumerate() {
         if let Instr::B { target } | Instr::BCond { target, .. } | Instr::Cbz { target, .. } = *ins {
@@ -127,15 +144,27 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>> {
     Ok(prog)
 }
 
-fn decode_inner(w: u32, index: usize) -> Result<Instr> {
+fn decode_inner(w: u32, index: usize, base: Option<u64>) -> Result<Instr> {
     let op0 = bits(w, 28, 25);
     match op0 {
+        0b1000 | 0b1001 if bits(w, 25, 24) == 0 => pc_rel(w, index, base),
         0b1000 | 0b1001 => data_imm(w),
         0b1010 | 0b1011 => branch_system(w, index),
         0b0101 | 0b1101 => data_reg(w),
         _ if op0 & 0b0101 == 0b0100 => load_store(w),
         _ => unsupported(),
     }
+}
+
+/// ADR / ADRP.
+fn pc_rel(w: u32, index: usize, base: Option<u64>) -> Result<Instr> {
+    let Some(base) = base else {
+        return Err("ADR/ADRP needs the code's load address".into());
+    };
+    let pc = base.wrapping_add(4 * index as u64);
+    let imm = sext(bits(w, 23, 5) << 2 | bits(w, 30, 29), 21) as u64;
+    let imm = if bit(w, 31) { (pc & !0xfff).wrapping_add(imm << 12) } else { pc.wrapping_add(imm) };
+    Ok(Instr::MovImm { rd: zr(bits(w, 4, 0), true), imm })
 }
 
 fn data_imm(w: u32) -> Result<Instr> {
@@ -565,6 +594,22 @@ mod tests {
         assert_eq!(bitmask_imm(false, 1, 0, false), Some(0x8000_0000));
         assert_eq!(bitmask_imm(true, 0, 0b111111, true), None);
         assert_eq!(bitmask_imm(true, 0, 0, false), None);
+    }
+
+    #[test]
+    fn pc_relative_addresses() {
+        let x = |i| RegOp { idx: i, wide: true };
+        // Encodings from llvm-mc: ADRP X1,#0x3000; ADR X2,#-4; ADR XZR,#0.
+        let code: Vec<u8> = [0xf000_0001u32, 0x10ff_ffe2, 0x1000_001f].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(
+            decode_program_at(&code, Some(0x1_0ffc)).unwrap(),
+            [
+                Instr::MovImm { rd: x(1), imm: 0x1_3000 },
+                Instr::MovImm { rd: x(2), imm: 0x1_0ffc },
+                Instr::MovImm { rd: x(ZR), imm: 0x1_1004 },
+            ]
+        );
+        assert!(decode_program(&code).unwrap_err().contains("load address"));
     }
 
     #[test]

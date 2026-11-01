@@ -116,7 +116,9 @@ Anything else, including UNPREDICTABLE encodings, is an error. This is
 the first step toward running compiled code (see [Roadmap](#roadmap)).
 Instructions that use SP (register 31 as a base register, or in
 `ADD`/`SUB` immediate) are not supported yet, because the emulator has
-no stack pointer.
+no stack pointer. `ADR` and `ADRP` are decoded when the code's load
+address is known (`decode::decode_program_at`), as a `MOV` of the
+address they compute.
 
 ### ELF files
 
@@ -129,11 +131,32 @@ decode it. Branches must stay inside the function. Every offset and size
 in the file is checked, so a malformed file gives an error, not a panic.
 
 A function is rejected, rather than decoded wrongly, when:
-* in an object file, an instruction in it still needs a relocation
-  (a call, or the address of a global, is a placeholder until link
-  time); relocations are not applied yet;
+* read directly from an object file, an instruction in it still needs a
+  relocation (a call, or the address of a global, is a placeholder until
+  link time); load the file as an image instead (below);
 * it contains data, such as a literal pool, marked by a `$d` mapping
   symbol.
+
+`src/image.rs` loads a file into memory (`Image::load`). An object file
+is linked on its own, like a static link. Allocated sections are placed
+in order from a base address, or at addresses given by name. Common
+symbols get space, and a GOT is built if the code uses one. The caller
+gives addresses for the symbols the file uses but does not define. The
+relocations are then applied. `Image::function` / `decode_function` give
+a function's relocated code at its final address. These relocations are
+supported:
+* data: `ABS64/32/16`, `PREL64/32/16`, `PLT32`;
+* instructions: `ADR_PREL_PG_HI21(_NC)`, `ADR_PREL_LO21`,
+  `ADD_ABS_LO12_NC`, `LDST{8,16,32,64,128}_ABS_LO12_NC`, `CALL26`,
+  `JUMP26`, `CONDBR19`, `TSTBR14`, `LD_PREL_LO19`, `MOVW_UABS_G0..G3`;
+* GOT: `ADR_GOT_PAGE`, `LD64_GOT_LO12_NC`.
+
+As in lld, values are checked for range and alignment, and an undefined
+weak symbol is 0 for absolute relocations, the place itself for
+PC-relative ones, and the next instruction for branches. Any other
+relocation (TLS, for example) is an error. A linked executable or
+shared object is loaded from its `PT_LOAD` segments. Its dynamic
+relocations are not applied yet.
 
 `tests/elf_llvm.rs` checks the loader against LLVM, when `llvm-mc` and
 `llvm-readobj` are installed: every litmus thread is assembled into an
@@ -141,8 +164,18 @@ object file as a function, and extracting and decoding it must give the
 parsed program. The sections, symbols and relocations armem reads must
 match `llvm-readobj` for assembled objects, for `clang` output (`-O2`,
 and `-O0 -g` with per-function sections), and for an object with more
-than 0xff00 sections (extended section numbering). No AArch64 linker is
-assumed, so executables are covered only by unit tests.
+than 0xff00 sections (extended section numbering).
+
+`tests/image_lld.rs` checks relocation against lld, when `llvm-mc` and
+lld are installed (`ld.lld`, `$ARMEM_LLD`, or the `rust-lld` that comes
+with Rust toolchains). Each object is loaded by armem, then linked by lld
+with a linker script that uses the same section, GOT and external symbol
+addresses. Every section's bytes and every symbol's address must agree,
+and each function must decode the same from both. The objects are an
+assembly file using every supported relocation type (in a compact layout
+and with data more than 1 GiB from the code) and `clang` output (`-O0`,
+`-O2`, per-function sections, `-mcmodel=large`, `-fPIC`), each at two
+base addresses.
 
 `tests/decode_llvm.rs` checks the decoder against LLVM, when `llvm-mc`
 is installed:
@@ -291,13 +324,12 @@ lets a lone `LDXP` be torn.
 ## Roadmap
 
 1. More of the ISA: more ALU operations, SIMD/FP loads/stores.
-2. Run real compiled code: the binary decoder and a first ELF
-   loader are done (see [Machine code](#machine-code)); next come
-   applying relocations, loading data segments as initial memory, a way
-   for tests to name ELF functions as threads, SP and a stack,
-   calls and returns, and the instructions compilers commonly emit
-   (`ADRP`, `MOVK`, `TBZ`, `UBFX`, ...), starting with user-mode
-   functions extracted from real programs.
+2. Run real compiled code: the binary decoder, an ELF loader and
+   static relocation are done (see [Machine code](#machine-code)); next
+   come using a loaded image as initial memory, a way for tests to name
+   ELF functions as threads, SP and a stack, calls and returns, and the
+   instructions compilers commonly emit (`MOVK`, `TBZ`, `UBFX`, ...),
+   starting with user-mode functions extracted from real programs.
 3. Scalable exploration for large programs: deterministic pseudo-random
    (seeded) sampling of promise/read choices, partial-order reduction,
    and prioritizing reads that disagree with what TSO would return.

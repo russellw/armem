@@ -90,15 +90,18 @@ pub fn stack_range(tid: usize) -> (u64, u64) {
     (lo, lo + STACK_SIZE)
 }
 
-/// A thread's stack, which is private to the thread.
+/// A thread's stack, which is private to the thread, and any other memory
+/// found private to it (see `set_private`).
 ///
 /// Plain loads and stores within it are performed by the core itself,
 /// without the memory model: no other thread can observe them, so they
 /// need no place in the order of memory writes. This keeps compiled code's
-/// stack traffic from multiplying the states the models explore. A load
-/// reads the thread's latest store to each byte (or 0) and, as when a
-/// load is satisfied by forwarding from a store, takes on the store's
-/// address and data dependencies (Arm's `(addr | data); rfi`).
+/// stack traffic, and its private variables, from multiplying the states
+/// the models explore. A load reads the thread's latest store to each byte
+/// (or its initial value: 0 on the stack) and, as when a load is satisfied
+/// by forwarding from a store, takes on the store's address and data
+/// dependencies (Arm's `(addr | data); rfi`). A store still orders what it
+/// depends on before later writes after a `DMB ST` (see `Step::Local`).
 ///
 /// It is a fault for a thread to access the stack area outside its own
 /// stack (another thread's stack, a guard slot, or across the edge of its
@@ -112,6 +115,26 @@ pub struct Stack {
     pub area: (u64, u64),
     /// Bytes stored so far, with the views of the store (as in `RV`).
     bytes: BTreeMap<u64, (u8, View, View)>,
+    /// Memory outside the stack that is private to the thread (see
+    /// `set_private`).
+    private: Private,
+}
+
+/// Sorted, disjoint byte ranges. The same for every state of a thread, so
+/// they take no part in comparing or hashing states.
+#[derive(Clone, Debug, Default)]
+struct Private(Arc<Vec<(u64, u64)>>);
+
+impl PartialEq for Private {
+    fn eq(&self, _: &Private) -> bool {
+        true
+    }
+}
+
+impl Eq for Private {}
+
+impl std::hash::Hash for Private {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 /// Where an access goes.
@@ -124,7 +147,27 @@ enum Place {
 impl Stack {
     pub fn new(tid: usize, threads: usize) -> Stack {
         let (lo, hi) = stack_range(tid);
-        Stack { lo, hi, area: stack_area(threads), bytes: BTreeMap::new() }
+        Stack { lo, hi, area: stack_area(threads), bytes: BTreeMap::new(), private: Private::default() }
+    }
+
+    /// Treat `ranges` (sorted and disjoint) as private to the thread: memory
+    /// that no other thread reads or writes, and that this thread accesses
+    /// only with plain loads and stores, each one wholly inside the ranges
+    /// or wholly outside them. Such accesses are performed like those to
+    /// the stack. `init` gives the initial value of each byte.
+    pub fn set_private(&mut self, ranges: Arc<Vec<(u64, u64)>>, init: &dyn Fn(u64) -> u8) {
+        for &(a, b) in ranges.iter() {
+            for x in a..b {
+                self.bytes.insert(x, (init(x), 0, 0));
+            }
+        }
+        self.private = Private(ranges);
+    }
+
+    /// The current value of byte `b` of the stack or private memory, if it
+    /// has been stored to or is private.
+    pub fn byte(&self, b: u64) -> Option<u8> {
+        self.bytes.get(&b).map(|e| e.0)
     }
 
     /// Classify an access of `len` bytes at `a`. `plain`: a load or store
@@ -141,6 +184,19 @@ impl Stack {
                 "exclusive, atomic, acquire or release access to its stack at {:#x}, which is not supported",
                 a
             ));
+        }
+        let ranges = &self.private.0;
+        if let Some(&(p, q)) = ranges.get(ranges.partition_point(|&(_, q)| q <= a)) {
+            if end > p {
+                return if a >= p && end <= q && plain {
+                    Place::Stack
+                } else {
+                    Place::Fault(format!(
+                        "internal error: {}-byte access at {:#x} to memory found private to the thread ({:#x}..{:#x})",
+                        len, a, p, q
+                    ))
+                };
+            }
         }
         if a < self.area.1 && end > self.area.0 {
             return Place::Fault(format!(
@@ -239,8 +295,13 @@ pub enum Step {
     Done,
     /// A local instruction was executed. `ctrl` is a (pick) view that later
     /// writes must be ordered after: that of a conditional branch's
-    /// condition, or of the address of a stack access.
-    Local { ctrl: Option<View> },
+    /// condition, or of the address of a stack access. `write` is set for a
+    /// store to the stack: the (pick) view of its address and data. The
+    /// memory model must treat the store as a write placed as early as it
+    /// may be, after everything it depends on, since barriers that order
+    /// writes (`DMB ST`) order it, and so order what it depends on, before
+    /// later writes.
+    Local { ctrl: Option<View>, write: Option<View> },
     /// The thread cannot continue: the message says why.
     Fault(String),
     /// The next instruction needs the memory model. The pc has not been
@@ -459,6 +520,7 @@ impl Core {
             Place::Fault(e) => return Some(Step::Fault(e)),
             Place::Stack => {}
         }
+        let mut write = None;
         match ins {
             Instr::Load { rt, size, signed, .. } => {
                 let v = self.stack_load(a, 0, size, signed);
@@ -466,6 +528,7 @@ impl Core {
             }
             Instr::Store { rt, size, .. } => {
                 let d = self.get(rt);
+                write = Some(d.pick.max(d.view));
                 self.stack_store(a, 0, size, d);
             }
             Instr::LoadPair { rt, rt2, size, signed, .. } => {
@@ -475,6 +538,7 @@ impl Core {
             }
             Instr::StorePair { rt, rt2, size, .. } => {
                 let (d1, d2) = (self.get(rt), self.get(rt2));
+                write = Some(d1.pick.max(d1.view).max(d2.pick).max(d2.view));
                 self.stack_store(a, 0, size, d1);
                 self.stack_store(a, size.bytes(), size, d2);
             }
@@ -488,6 +552,7 @@ impl Core {
                 let n = size.bytes();
                 for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
                     let d = self.vget(v);
+                    write = Some(write.unwrap_or(0).max(d.pick).max(d.view));
                     self.stack.write(a.val + i as u64 * n, n, d.val, a.view.max(d.view), a.pick.max(d.pick));
                 }
             }
@@ -496,7 +561,7 @@ impl Core {
         self.writeback(addr);
         self.pc += 1;
         self.steps += 1;
-        Some(Step::Local { ctrl: Some(a.pick) })
+        Some(Step::Local { ctrl: Some(a.pick), write: write.map(|w| w.max(a.pick)) })
     }
 
     /// Execute the next instruction if it is local, or describe the memory
@@ -834,7 +899,7 @@ impl Core {
         }
         self.pc = next;
         self.steps += 1;
-        Step::Local { ctrl }
+        Step::Local { ctrl, write: None }
     }
 }
 

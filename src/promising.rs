@@ -37,6 +37,7 @@ use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Msg {
@@ -141,17 +142,17 @@ impl TState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
-    /// Find the writes the thread might promise: explore like `Certify`
-    /// (without stopping) and record every newly appended write. Up to the
-    /// point where a promisable write executes, this exploration is at least
-    /// as permissive as any run certifying that promise, so no candidate is
-    /// missed.
+    /// Explore every run of the thread, and record:
+    /// - the writes it might promise: every newly appended write. Up to the
+    ///   point where a promisable write executes, this exploration is at
+    ///   least as permissive as any run certifying that promise, so no
+    ///   candidate is missed;
+    /// - its final states (and faults) with the memory as it is: those of
+    ///   the runs that fulfill all its promises and append no new write.
     Collect,
     /// Search for a run that fulfills all outstanding promises; new writes
     /// may be appended to (a local copy of) memory.
     Certify,
-    /// Run to completion fulfilling all promises, with no new writes.
-    Final,
 }
 
 /// How a read orders later accesses.
@@ -207,9 +208,12 @@ struct Solo<'a> {
     candidates: BTreeSet<Candidate>,
     finals: BTreeSet<Vec<u64>>,
     final_regs: &'a [u8],
+    /// Observed locations private to the thread (see `Projection`).
+    final_mems: &'a [u64],
     certified: bool,
     truncated: bool,
-    /// Faults reached (in `Final` mode, with every promise fulfilled).
+    /// Faults reached (in `Collect` mode, with every promise fulfilled and no
+    /// new write).
     faults: BTreeSet<String>,
 }
 
@@ -255,6 +259,7 @@ impl<'a> Solo<'a> {
             candidates: BTreeSet::new(),
             finals: BTreeSet::new(),
             final_regs: &proj.thread_regs[tid],
+            final_mems: &proj.thread_mems[tid],
             certified: false,
             truncated: false,
             faults: BTreeSet::new(),
@@ -506,17 +511,15 @@ impl<'a> Solo<'a> {
                 out.push((apply(t), ext.to_vec()));
             }
         }
-        // Or (except in the final phase) write a new message at the end of memory.
-        if self.mode != Mode::Final {
-            let t = self.len(ext) + 1;
-            if ok_atomic(t) {
-                if self.mode == Mode::Collect {
-                    self.candidates.insert((a, size, val));
-                }
-                let mut e = ext.to_vec();
-                e.push(new_msg);
-                out.push((apply(t), e));
+        // Or write a new message at the end of memory.
+        let t = self.len(ext) + 1;
+        if ok_atomic(t) {
+            if self.mode == Mode::Collect {
+                self.candidates.insert((a, size, val));
             }
+            let mut e = ext.to_vec();
+            e.push(new_msg);
+            out.push((apply(t), e));
         }
         out
     }
@@ -561,7 +564,14 @@ impl<'a> Solo<'a> {
         let mut s = st.clone();
         loop {
             match s.core.step(self.prog) {
-                Step::Local { ctrl } => {
+                Step::Local { ctrl, write } => {
+                    if let Some(w) = write {
+                        // A stack store, placed as early as it may be: right
+                        // after everything it must follow (as `do_write`'s
+                        // `vpre`). Timestamps are whole numbers, so "just
+                        // after `t`" compares like `t`.
+                        s.v_wold = s.v_wold.max(w).max(s.v_wnew).max(s.v_cap);
+                    }
                     if let Some(v) = ctrl {
                         s.v_cap = s.v_cap.max(v);
                     }
@@ -574,11 +584,24 @@ impl<'a> Solo<'a> {
         }
     }
 
+    /// Whether a run that ends in `s` completes an execution with the memory
+    /// as it is: the thread has fulfilled all its promises and appended no
+    /// new write.
+    fn complete(&self, s: &TState, ext: &[Msg]) -> bool {
+        self.mode == Mode::Collect && s.promises.is_empty() && ext.is_empty()
+    }
+
     fn nonlocal_successors(&mut self, s: TState, ext: &[Msg], step: Step) -> Vec<Succ> {
         match step {
             Step::Done => {
-                if self.mode == Mode::Final && s.promises.is_empty() {
-                    let regs = self.final_regs.iter().map(|&r| s.core.regs[r as usize].val).collect();
+                if self.complete(&s, ext) {
+                    let stack = &s.core.stack;
+                    let byte = |b: u64| stack.byte(b).expect("private memory has a value");
+                    let regs = self.final_regs
+                        .iter()
+                        .map(|&r| s.core.regs[r as usize].val)
+                        .chain(self.final_mems.iter().map(|&a| self.test.loc_value(a, &byte)))
+                        .collect();
                     self.finals.insert(regs);
                 }
                 vec![]
@@ -588,7 +611,7 @@ impl<'a> Solo<'a> {
             // A fault ends the execution. It is real if the thread's promises
             // are fulfilled, since the other threads' promises are certified.
             Step::Fault(e) => {
-                if self.mode == Mode::Final && s.promises.is_empty() {
+                if self.complete(&s, ext) {
                     self.faults.insert(format!("P{}: {}", self.tid, e));
                 }
                 vec![]
@@ -871,12 +894,40 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
         // are exactly the sequentially consistent ones.
         return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel);
     }
-    let proj = Projection::new(test);
+    let mut proj = Projection::new(test);
+    let analysis = if cfg.por || cfg.private { crate::reduce::analyze(test, cfg.fuel) } else { None };
+    let n = test.threads.len();
+    let private = match &analysis {
+        Some(r) if cfg.private => {
+            let observed: Vec<(u64, u64)> = proj
+                .obs
+                .iter()
+                .filter_map(|o| match *o {
+                    Obs::Mem(a) => Some((a, test.loc_type(a).size.bytes())),
+                    Obs::Reg(..) => None,
+                })
+                .collect();
+            r.private(&observed)
+        }
+        _ => vec![Vec::new(); n],
+    };
+    for (t, ranges) in private.iter().enumerate() {
+        proj.thread_mems[t] = proj
+            .obs
+            .iter()
+            .filter_map(|o| match *o {
+                Obs::Mem(a) if ranges.iter().any(|&(p, q)| p <= a && a < q) => Some(a),
+                _ => None,
+            })
+            .collect();
+    }
+    let proj = proj;
     let mut ex = Explorer {
         test,
         cfg,
         proj: &proj,
-        reduction: if cfg.por { crate::reduce::analyze(test, cfg.fuel) } else { None },
+        private: private.into_iter().map(Arc::new).collect(),
+        reduction: if cfg.por { analysis } else { None },
         results: Outcomes::new(test.observables()),
     };
     match cfg.sample {
@@ -891,6 +942,8 @@ struct Explorer<'a> {
     test: &'a Test,
     cfg: &'a Options,
     proj: &'a Projection,
+    /// Each thread's private memory (see `Reduction::private`).
+    private: Vec<Arc<Vec<(u64, u64)>>>,
     reduction: Option<crate::reduce::Reduction>,
     results: Outcomes,
 }
@@ -903,51 +956,51 @@ impl<'a> Explorer<'a> {
     fn start(&self, tid: usize, mem: &[Msg]) -> TState {
         let test = self.test;
         let mut st = TState::new(test.init_regs[tid], tid, test.threads.len(), test.threads[tid].entry);
+        st.core.stack.set_private(self.private[tid].clone(), &|b| test.init_byte(b));
         st.promises = (1..=mem.len() as View).filter(|&t| mem[t as usize - 1].tid == tid).collect();
         st
     }
 
-    /// Phase 2: run every thread to completion against `mem`, fulfilling
-    /// exactly its promises, and record the final states. Returns whether
-    /// any execution completed (or faulted) with this memory.
-    fn finish(&mut self, mem: &[Msg]) -> bool {
+    /// Explore `mem`: run each thread alone against it (`Mode::Collect`).
+    ///
+    /// Phase 2: record the final states of the executions that complete with
+    /// this memory, each thread fulfilling exactly its promises. Phase 1:
+    /// find every memory that extends `mem` by one certifiable promise,
+    /// except those that `skip` rejects (before certifying them) and those
+    /// the reduction prunes. Returns whether any execution completed (or
+    /// faulted) with this memory, and the extended memories.
+    fn visit(&mut self, mem: &[Msg], skip: &dyn Fn(&[Msg]) -> bool) -> (bool, Vec<Vec<Msg>>) {
         let test = self.test;
         self.results.stats.memories += 1;
         let mut per_thread = Vec::new();
         let mut faulted = false;
+        let mut candidates = Vec::new();
         for tid in 0..test.threads.len() {
-            let mut s = self.solo(tid, mem, Mode::Final);
-            s.run(self.start(tid, mem));
-            self.results.truncated |= s.truncated;
-            faulted |= !s.faults.is_empty();
-            self.results.faults.extend(std::mem::take(&mut s.faults));
-            per_thread.push(s.finals);
-        }
-        if per_thread.iter().any(|f| f.is_empty()) {
-            // Some thread cannot complete, so neither can the execution.
-            return faulted;
-        }
-        let byte =
-            |b: u64| mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b));
-        for state in self.proj.combine(&per_thread, &|o| match o {
-            Obs::Mem(a) => test.loc_value(a, &byte),
-            Obs::Reg(..) => unreachable!(),
-        }) {
-            self.results.insert(state);
-        }
-        true
-    }
-
-    /// Phase 1: every memory that extends `mem` by one certifiable promise,
-    /// except those that `skip` rejects (before certifying them) and those
-    /// the reduction prunes.
-    fn children(&mut self, mem: &[Msg], skip: &dyn Fn(&[Msg]) -> bool) -> Vec<Vec<Msg>> {
-        let mut out = Vec::new();
-        for tid in 0..self.test.threads.len() {
             let mut c = self.solo(tid, mem, Mode::Collect);
             c.run(self.start(tid, mem));
             self.results.truncated |= c.truncated;
-            for (addr, size, val) in c.candidates {
+            faulted |= !c.faults.is_empty();
+            self.results.faults.extend(std::mem::take(&mut c.faults));
+            per_thread.push(std::mem::take(&mut c.finals));
+            candidates.push(std::mem::take(&mut c.candidates));
+        }
+        // Phase 2. If some thread cannot complete, neither can the execution.
+        let mut found = faulted;
+        if per_thread.iter().all(|f| !f.is_empty()) {
+            let byte =
+                |b: u64| mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b));
+            for state in self.proj.combine(&per_thread, &|o| match o {
+                Obs::Mem(a) => test.loc_value(a, &byte),
+                Obs::Reg(..) => unreachable!(),
+            }) {
+                self.results.insert(state);
+            }
+            found = true;
+        }
+        // Phase 1.
+        let mut out = Vec::new();
+        for (tid, cands) in candidates.into_iter().enumerate() {
+            for (addr, size, val) in cands {
                 let msg = Msg { addr, size, val, tid };
                 if let (Some(r), Some(last)) = (&self.reduction, mem.last()) {
                     if r.prunable(last, &msg) {
@@ -969,7 +1022,7 @@ impl<'a> Explorer<'a> {
                 }
             }
         }
-        out
+        (found, out)
     }
 
     /// Explore every memory.
@@ -984,8 +1037,7 @@ impl<'a> Explorer<'a> {
                 self.results.over_budget = true;
                 return;
             }
-            self.finish(&mem);
-            let children = self.children(&mem, &|m| seen.contains(m));
+            let (_, children) = self.visit(&mem, &|m| seen.contains(m));
             stack.extend(children);
         }
     }
@@ -1005,11 +1057,8 @@ impl<'a> Explorer<'a> {
             let mut path: Vec<Vec<Msg>> = vec![Vec::new()];
             while let Some(mem) = path.last().cloned() {
                 if !finished.contains_key(&mem) {
-                    let found = self.finish(&mem);
+                    let (found, c) = self.visit(&mem, &|_| false);
                     finished.insert(mem.clone(), found);
-                }
-                if !children.contains_key(&mem) {
-                    let c = self.children(&mem, &|_| false);
                     children.insert(mem.clone(), c);
                 }
                 let c = &children[&mem];

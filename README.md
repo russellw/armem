@@ -31,6 +31,7 @@ cargo build --release
 ./target/release/armem --elf data.o FILE           # start from an ELF file's memory
 ./target/release/armem --sample 100 FILE           # 100 random paths, for big tests
 ./target/release/armem --no-por FILE               # without partial-order reduction
+./target/release/armem --no-private FILE           # without private memory
 cargo test --release                               # check the litmus suite
 ```
 
@@ -387,10 +388,11 @@ is an address: `out_a=out_b` means "`out_a` holds the address of
 `out_b`". To ask whether two locations differ, list the cases, as
 `seqlock.litmus` does.
 
-Each test takes 0.02-10 s. A ring of two slots sending three items is
-checked in 3 s, but with `head` or `tail` relaxed the exhaustive search
-does not finish in 5 minutes, because of the number of promise memories.
-`--sample 20` finds both bugs in under 5 s.
+Each test takes at most 0.3 s. Larger rings take longer, mostly because
+of the number of promise memories when `head` is relaxed: with one slot
+and three items, 197 memories in 5 s; with two slots and three items,
+2,745 memories in about 3 minutes (`tail` relaxed: 44 memories in 0.6
+s). `--sample 20` finds the bug in under 5 s.
 
 ### Calls
 
@@ -438,9 +440,15 @@ load reads the thread's latest store to each byte. The value keeps the
 address and data dependencies of the store, as a load that is forwarded
 a store's value does in Arm's model (`(addr | data); rfi` orders it). The
 address of a stack access still orders later writes (Arm's
-`addr; po; [W]`). No other thread can see these accesses, so this
-changes no outcome. It keeps compiled code's spills and stack frames
-from multiplying the states the models explore. `tests/stack.rs` checks
+`addr; po; [W]`). A store still counts as a write for barriers: after
+`DMB ST`, later writes are ordered after it, and so after the reads its
+address and data depend on. The ARM model treats it as a write placed as
+early in memory as it may be, right after everything it must follow. No
+other thread can see these accesses, so this changes no outcome. It keeps
+compiled code's spills and stack frames from multiplying the states the
+models explore. (Before this rule, a stack store between a load and
+`DMB ST` lost that ordering, and armem could report an ARM-only outcome
+that the architecture forbids.) `tests/stack.rs` checks
 this: each test runs again with its stacks replaced by ordinary memory
 locations that only one thread uses, and every model must give the same
 final states.
@@ -489,7 +497,9 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
 
   In phase 2 the threads cannot influence each other, so the final states
   are the product of the per-thread results. Candidate promises come from
-  a solo exploration of the thread under the same model. A
+  a solo exploration of the thread under the same model, the same one
+  that finds its final states: those of its runs that fulfill all its
+  promises without new writes. A
   single-threaded test is run as SC, which is exact for a lone thread.
 
   A solo exploration takes a thread's local steps (register operations,
@@ -500,7 +510,8 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   steps it can be reached in and never needs to be expanded again. On
   compiled code at `-O0` most instructions are local steps. With the
   widening in the reduction's pre-pass (below), this cut the `-O0`
-  seqlock of [C programs](#c-programs) from 20-63 s to 1-10 s.
+  seqlock of [C programs](#c-programs) from 20-63 s to 1-10 s, and
+  private memory (below) to 0.1-0.3 s.
 * **Partial-order reduction** (`src/reduce.rs`, on by default; `--no-por`
   turns it off). Every write another thread can see is a promise, so
   `n` writes that nothing orders give `n!` memories, although the order of
@@ -529,9 +540,33 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   after changing the model or the reduction. The pre-pass widens a
   byte whose set of values grows in three rounds in a row (a counter,
   such as a sequence number) to any value, rather than adding values
-  round after round. If the
-  pre-pass gets too big, or a thread accesses memory at an address it
+  round after round. A byte that only one thread writes is read by that
+  thread exactly as it last wrote it (by coherence, no other write to it
+  exists), so the indices and counters a thread owns stay precise; this
+  is what lets the analysis bound `buf[head % N]` in a ring buffer. If
+  the pre-pass gets too big, or a thread accesses memory at an address it
   cannot bound, it gives up and nothing is pruned.
+* **Private memory** (on by default; `--no-private` turns it off). Every
+  write another thread might see is a promise, and memories multiply with
+  each one, its value included. But a C program's results, and variables
+  only one thread uses, are often in memory that no other thread
+  accesses. The reduction's pre-pass finds each thread's private memory:
+  bytes that no other thread may read or write, and that the thread
+  accesses only with plain loads and stores. A byte is private only if
+  every access to it, and every location the test observes, lies wholly
+  in private memory or wholly outside it. The core performs accesses to
+  it like those to the stack (see [Stacks](#stacks)), so they make no
+  write messages, and a private location's final value comes from its
+  thread. A private store is placed as early as it may be, which allows
+  every behavior a later place would, since views only bound what a
+  thread may do. No other thread can see it, so its place matters to
+  nothing else. On the ring buffer with one slot and three items, with
+  `head` relaxed, this cut 538 memories to 197 (the consumer's `got`
+  results no longer make memories), and with four items and `tail`
+  relaxed, 301 memories to 13. `tests/por.rs` checks it too: on every
+  litmus test and random test, the final states with private memory
+  alone, and with private memory and the reduction, must equal those
+  with neither.
 * **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
   exhaustively, armem follows `N` random paths through the promise
   memories instead of all of them. Each path adds random certified
@@ -641,10 +676,11 @@ lets a lone `LDXP` be torn.
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
   atomics.
-* The exhaustive search suits tests with tens of writes, not thousands.
-  The reduction removes orders nothing can observe, but writes that
+* The exhaustive search suits tests with tens of shared writes, not
+  thousands. The reduction removes orders nothing can observe, and
+  private memory removes writes no other thread can see, but writes that
   other threads read in an order they can observe still multiply the
-  memories. Beyond that, `--sample` gives up completeness. Each memory
+  memories, and so does each prefix of every memory. Beyond that, `--sample` gives up completeness. Each memory
   also costs a solo exploration of every thread, which grows with
   the threads' own branching.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
@@ -670,12 +706,15 @@ lets a lone `LDXP` be torn.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
-   once and in order of steps used; next come exploring fewer memories
-   (a two-slot ring buffer with a relaxed index does not finish in 5
-   minutes, see [C programs](#c-programs)), reducing the cost of each
-   memory's solo explorations (each is about half certification), and
-   guiding the sampling towards reads that disagree with what TSO would
-   return.
+   once and in order of steps used, and private memory; next come a
+   finer analysis of which reads a thread orders before which (a thread
+   that orders any read before a later one by a dependency is taken to
+   order them all; in the ring buffer with `head` relaxed, where the
+   consumer's dependencies order only its index reads, ignoring them
+   cuts the memories 3-5 times),
+   reducing the cost of each memory's solo explorations (mostly
+   certification), and guiding the sampling towards reads that disagree
+   with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

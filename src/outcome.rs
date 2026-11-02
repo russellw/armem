@@ -3,11 +3,15 @@
 use crate::litmus::{Obs, Quant, Test};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Maps observables onto per-thread register lists.
+/// Maps observables onto per-thread lists of registers and of locations
+/// private to the thread.
 pub struct Projection {
     pub obs: Vec<Obs>,
     /// For each thread, the registers that are observed.
     pub thread_regs: Vec<Vec<u8>>,
+    /// For each thread, the observed locations private to it, whose final
+    /// values come from the thread rather than from memory.
+    pub thread_mems: Vec<Vec<u64>>,
 }
 
 impl Projection {
@@ -21,11 +25,13 @@ impl Projection {
                 }
             }
         }
-        Projection { obs, thread_regs }
+        let thread_mems = vec![Vec::new(); thread_regs.len()];
+        Projection { obs, thread_regs, thread_mems }
     }
 
-    /// Combine per-thread register outcomes (each a set of vectors aligned
-    /// with `thread_regs[t]`) and memory values into full final states.
+    /// Combine per-thread outcomes (each a set of vectors: the values of
+    /// `thread_regs[t]`, then of `thread_mems[t]`) and memory values into
+    /// full final states.
     pub fn combine(&self, per_thread: &[BTreeSet<Vec<u64>>], mem: &dyn Fn(Obs) -> u64) -> Vec<Vec<u64>> {
         let mut partial: Vec<Vec<Vec<u64>>> = vec![Vec::new()];
         for f in per_thread {
@@ -49,7 +55,10 @@ impl Projection {
                             let i = self.thread_regs[t].iter().position(|&x| x == r).unwrap();
                             p[t][i]
                         }
-                        Obs::Mem(_) => mem(*o),
+                        Obs::Mem(a) => match self.thread_mems.iter().enumerate().find_map(|(t, m)| Some((t, m.iter().position(|&x| x == a)?))) {
+                            Some((t, i)) => p[t][self.thread_regs[t].len() + i],
+                            None => mem(*o),
+                        },
                     })
                     .collect()
             })

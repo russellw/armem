@@ -50,6 +50,10 @@ pub struct Options {
     /// Prune memories that differ only in the order of writes nothing can
     /// observe the order of (see `reduce.rs`).
     pub por: bool,
+    /// In the ARM model, perform plain accesses to memory that only one
+    /// thread accesses like those to its stack, without write messages (see
+    /// `reduce::Reduction::private`).
+    pub private: bool,
     /// Instead of exploring every memory, follow this many random paths
     /// through them. The final states found are possible, but others may be
     /// missed.
@@ -64,7 +68,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, sample: None, seed: 0, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, private: true, sample: None, seed: 0, max_memories: None }
     }
 }
 

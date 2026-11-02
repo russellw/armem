@@ -21,6 +21,9 @@ options:
       --seed N       random seed for --sample (default: 0)
       --no-por       explore every order of writes, without partial-order
                      reduction (slower; for checking the reduction)
+      --no-private   give every write to memory a place in the order of
+                     writes, even to memory only one thread accesses
+                     (slower; for checking that optimization)
       --elf FILE     start from the memory of an AArch64 ELF file (an
                      object file is relocated first); its global variables
                      can be named in the tests
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
             "-s" | "--summary" => summary = true,
             "--lse2" => opts.lse2 = true,
             "--no-por" => opts.por = false,
+            "--no-private" => opts.private = false,
             "--sample" | "--seed" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) if a == "--sample" => opts.sample = Some(n),
                 Some(n) => opts.seed = n,

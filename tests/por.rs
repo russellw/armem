@@ -1,31 +1,36 @@
-//! Checks the partial-order reduction (`src/reduce.rs`): on every litmus
-//! test, and on randomly generated tests, the ARM model must reach exactly
-//! the same final states with and without it.
+//! Checks the partial-order reduction (`src/reduce.rs`), and the handling
+//! of memory private to one thread that relies on its analysis: on every
+//! litmus test, and on randomly generated tests, the ARM model must reach
+//! exactly the same final states with and without each of them.
 
 use armem::{Model, litmus, run};
 use std::path::Path;
 
-fn options(por: bool, lse2: bool) -> armem::Options {
-    armem::Options { por, lse2, ..Default::default() }
+fn options(por: bool, private: bool, lse2: bool) -> armem::Options {
+    armem::Options { por, private, lse2, ..Default::default() }
 }
 
-fn states(t: &litmus::Test, por: bool, lse2: bool) -> armem::outcome::Outcomes {
-    run(t, Model::Arm, &options(por, lse2))
-}
-
-/// Explore `t` with and without the reduction and check they agree.
-/// Returns the memories each explored, or None if the search without the
-/// reduction would explore more than `budget` memories.
+/// Explore `t` with neither the reduction nor private memory, and check
+/// that both together, and private memory alone, give the same results.
+/// Returns the memories explored without and with both, or None if the
+/// search without them would explore more than `budget` memories.
 fn check_within(t: &litmus::Test, src: &str, lse2: bool, budget: Option<u64>) -> Option<(u64, u64)> {
-    let full = run(t, Model::Arm, &armem::Options { max_memories: budget, ..options(false, lse2) });
+    let full = run(t, Model::Arm, &armem::Options { max_memories: budget, ..options(false, false, lse2) });
     if full.over_budget {
         return None;
     }
-    let reduced = states(t, true, lse2);
-    assert_eq!(full.states.keys().collect::<Vec<_>>(), reduced.states.keys().collect::<Vec<_>>(), "lse2={}\n{}", lse2, src);
-    assert_eq!(full.faults, reduced.faults, "{}", src);
-    assert_eq!(full.truncated, reduced.truncated, "{}", src);
-    Some((full.stats.memories, reduced.stats.memories))
+    let mut reduced_memories = 0;
+    for (por, private) in [(true, true), (false, true)] {
+        let reduced = run(t, Model::Arm, &options(por, private, lse2));
+        let what = format!("por={} private={} lse2={}", por, private, lse2);
+        assert_eq!(full.states.keys().collect::<Vec<_>>(), reduced.states.keys().collect::<Vec<_>>(), "{}\n{}", what, src);
+        assert_eq!(full.faults, reduced.faults, "{}\n{}", what, src);
+        assert_eq!(full.truncated, reduced.truncated, "{}\n{}", what, src);
+        if por {
+            reduced_memories = reduced.stats.memories;
+        }
+    }
+    Some((full.stats.memories, reduced_memories))
 }
 
 fn check(t: &litmus::Test, src: &str, lse2: bool) -> (u64, u64) {
@@ -207,7 +212,7 @@ fn random_tests(count: usize, seed: u64, large: bool, budget: u64) {
         }
     }
     eprintln!(
-        "{} random tests ({} skipped as over budget): {} memories without the reduction, {} with it",
+        "{} random tests ({} skipped as over budget): {} memories without the reduction and private memory, {} with them",
         count, skipped, full, reduced
     );
     assert!(skipped * 10 <= count, "too many tests over budget: {}", skipped);
@@ -275,7 +280,7 @@ fn sampling() {
     for name in ["MP", "IRIW", "spinlock-norelease", "LDXP-STXP-counter", "unaligned-in-block"] {
         let src = std::fs::read_to_string(dir.join(format!("{}.litmus", name))).unwrap();
         let t = litmus::parse(&src).unwrap();
-        let full = states(&t, true, false);
+        let full = run(&t, Model::Arm, &options(true, true, false));
         for seed in 0..3 {
             let sampled = run(&t, Model::Arm, &armem::Options { sample: Some(5), seed, ..Default::default() });
             assert!(sampled.sampled);

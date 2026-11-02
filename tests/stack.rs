@@ -123,6 +123,26 @@ fn dependencies_through_the_stack() {
     assert_eq!(addr, [false, false, false]);
     let none = lb(&["LDR W0,[X1]", "STR W0,[SP,#-8]", "LDR W4,[SP,#-8]", "MOV W2,#1", "STR W2,[X3]"]);
     assert_eq!(none, [true, false, false]);
+
+    // A stack store that depends on the read, then DMB ST: the barrier
+    // orders the store, and so the read it depends on, before the write.
+    // Each kind of store, by its data or its address.
+    let dmb_st = |store: &[&str]| {
+        let mut p0 = vec!["LDR W0,[X1]", "SUB SP,SP,#32"];
+        p0.extend(store);
+        p0.extend(["DMB ST", "MOV W2,#1", "STR W2,[X3]"]);
+        lb(&p0)
+    };
+    for store in [
+        &["STR W0,[SP]"][..],
+        &["STP W5,W0,[SP]"],
+        &["FMOV S0,W0", "STR Q0,[SP]"],
+        &["EOR W4,W0,W0", "STR WZR,[SP,W4,SXTW]"],
+    ] {
+        assert_eq!(dmb_st(store), [false, false, false], "{:?}", store);
+    }
+    // Without the dependency, the read and the write may be reordered.
+    assert_eq!(dmb_st(&["STR W5,[SP]"]), [true, false, false]);
 }
 
 /// The faults each model reports for a test.

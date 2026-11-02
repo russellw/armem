@@ -10,6 +10,10 @@ seqlock -O2 yes no -DW_SEQ=__ATOMIC_RELAXED
 seqlock -O2 yes no -DR_SEQ=__ATOMIC_RELAXED
 seqlock -O2 yes no -DR_FENCE=__ATOMIC_RELAXED
 seqlock -O0 no no
+seqlock -O0 yes no -DW_FENCE=__ATOMIC_RELAXED
+seqlock -O0 yes no -DW_SEQ=__ATOMIC_RELAXED
+seqlock -O0 yes no -DR_SEQ=__ATOMIC_RELAXED
+seqlock -O0 yes no -DR_FENCE=__ATOMIC_RELAXED
 
 spsc -O2 no no
 spsc -O2 yes no -DPUB=__ATOMIC_RELAXED

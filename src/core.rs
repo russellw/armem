@@ -863,3 +863,34 @@ pub fn rmw_result(op: RmwOp, old: u64, operand: u64, cmp: Option<u64>, size: Siz
         None => Some(op.apply(old, operand, size)),
     }
 }
+
+/// A work list for a search over a thread's states that expands them in
+/// order of steps used (fewest first). Steps never decrease along a path,
+/// so a state is first expanded with the fewest steps it can be reached
+/// in, and a search that skips states already seen with no more steps
+/// expands each state only once. (Depth-first order tends to reach a state
+/// first by a long path, around a spin loop, and must then expand it again
+/// for each shorter path found later.) The states reachable within the fuel
+/// limit are the same in any order.
+pub struct StepQueue<T> {
+    buckets: BTreeMap<u32, Vec<T>>,
+}
+
+impl<T> StepQueue<T> {
+    pub fn new() -> Self {
+        StepQueue { buckets: BTreeMap::new() }
+    }
+
+    pub fn push(&mut self, steps: u32, x: T) {
+        self.buckets.entry(steps).or_default().push(x);
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        let mut e = self.buckets.first_entry()?;
+        let x = e.get_mut().pop();
+        if e.get().is_empty() {
+            e.remove();
+        }
+        x
+    }
+}

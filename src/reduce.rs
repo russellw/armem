@@ -47,7 +47,8 @@
 //! Every real execution reads and writes only values found this way, so the
 //! footprints it records (of all reads, of acquire reads, of release
 //! writes and of atomic writes) cover every execution. A byte that may
-//! hold too many values becomes unknown. Anything computed from an unknown
+//! hold too many values, or whose values keep growing round after round
+//! (a counter), becomes unknown. Anything computed from an unknown
 //! value is tainted: a branch on it goes both ways, and an access at an
 //! address computed from it makes the analysis give up. Values loaded from
 //! memory are tainted too, so the analysis also finds address dependencies
@@ -55,7 +56,7 @@
 //! (such a read is ordered after the reads the store depends on). If the
 //! analysis gives up (or gets too big), nothing is pruned.
 
-use crate::core::{Core, MemOp, RV, Step, VR, View, low_bytes, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
 use crate::isa::{Addr, Barrier, Code, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::Test;
 use crate::promising::Msg;
@@ -72,6 +73,12 @@ const MAX_BYTE_VALUES: usize = 16;
 const MAX_STATES: usize = 300_000;
 /// Most rounds of the value fixpoint before the analysis gives up.
 const MAX_ROUNDS: usize = 64;
+/// A byte whose set of values grows in this many consecutive rounds is
+/// taken to hold any value (widening). A counter, such as a sequence
+/// number that each round's writes increase, would otherwise add values
+/// round after round until it reached `MAX_BYTE_VALUES`, while the runs
+/// that read it grew with every value.
+const WIDEN_AFTER: usize = 3;
 
 /// Memory footprints: (address, length) pairs.
 type Footprints = BTreeSet<(u64, u64)>;
@@ -277,8 +284,9 @@ impl Havoc<'_> {
     /// Explore every run of the thread. None if the analysis gives up.
     fn run(&mut self, start: Core) -> Option<()> {
         let mut visited: HashMap<HState, u32> = HashMap::new();
-        let mut stack: Vec<HState> = vec![(start, None)];
-        while let Some(st) = stack.pop() {
+        let mut queue = StepQueue::new();
+        queue.push(start.steps, (start, None));
+        while let Some(st) = queue.pop() {
             let mut key = st.clone();
             key.0.steps = 0;
             match visited.get(&key) {
@@ -291,39 +299,47 @@ impl Havoc<'_> {
             if st.0.steps >= self.fuel {
                 continue;
             }
-            stack.extend(self.successors(st)?);
+            for x in self.successors(st)? {
+                queue.push(x.0.steps, x);
+            }
         }
         Some(())
     }
 
+    /// The states after the next memory operation, or the next branch on an
+    /// unknown value. Other local steps have one successor, so they are
+    /// taken at once rather than each being a state of the search.
     fn successors(&mut self, (mut core, mon): HState) -> Option<Vec<HState>> {
         let prog = self.prog;
-        let pc = core.pc;
-        if let Some(a) = prog.instrs.get(pc).and_then(mem_addr) {
-            // An access at an unknown address could touch anything
-            // (including another thread's stack); give up.
-            if taint(core.addr(a)) >= UNKNOWN {
-                return None;
-            }
-        }
         let reg = |v: u64, t: View| RV { val: v, view: t, pick: t };
         let status = |v: u64| RV::imm(v);
-        let op = match core.step(prog) {
-            Step::Done | Step::Fault(_) => return Some(vec![]),
-            Step::Local { ctrl: Some(t) } if t >= UNKNOWN => {
-                // A branch on an unknown value: take both ways.
-                let other = match prog.instrs[pc] {
-                    Instr::BCond { target, .. } | Instr::Cbz { target, .. } | Instr::Tbz { target, .. } => {
-                        if core.pc == target { pc + 1 } else { target }
-                    }
-                    _ => return None,
-                };
-                let mut alt = core.clone();
-                alt.pc = other;
-                return Some(vec![(core, mon), (alt, mon)]);
+        let op = loop {
+            let pc = core.pc;
+            if let Some(a) = prog.instrs.get(pc).and_then(mem_addr) {
+                // An access at an unknown address could touch anything
+                // (including another thread's stack); give up.
+                if taint(core.addr(a)) >= UNKNOWN {
+                    return None;
+                }
             }
-            Step::Local { .. } => return Some(vec![(core, mon)]),
-            Step::Mem(op) => op,
+            match core.step(prog) {
+                Step::Done | Step::Fault(_) => return Some(vec![]),
+                Step::Local { ctrl: Some(t) } if t >= UNKNOWN => {
+                    // A branch on an unknown value: take both ways.
+                    let other = match prog.instrs[pc] {
+                        Instr::BCond { target, .. } | Instr::Cbz { target, .. } | Instr::Tbz { target, .. } => {
+                            if core.pc == target { pc + 1 } else { target }
+                        }
+                        _ => return None,
+                    };
+                    let mut alt = core.clone();
+                    alt.pc = other;
+                    return Some(vec![(core, mon), (alt, mon)]);
+                }
+                Step::Local { .. } if core.steps >= self.fuel => return Some(vec![(core, mon)]),
+                Step::Local { .. } => {}
+                Step::Mem(op) => break op,
+            }
         };
         let mut out = Vec::new();
         let mut push = |mut c: Core, m: Option<(u64, Size)>| {
@@ -480,8 +496,10 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
     let mut dep_writes = vec![Footprints::new(); n];
     let mut addr_dep = vec![false; n];
     let mut budget = MAX_STATES;
+    // Consecutive rounds in which each byte's values have grown.
+    let mut streaks: HashMap<u64, usize> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
-        let mut grew = false;
+        let mut grown: BTreeSet<u64> = BTreeSet::new();
         let mut new_vals = vals.clone();
         for (tid, th) in test.threads.iter().enumerate() {
             let mut h = Havoc {
@@ -517,11 +535,21 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
                     }
                     _ => *e = None,
                 }
-                grew |= e.as_ref().map(BTreeSet::len) != before;
+                if e.as_ref().map(BTreeSet::len) != before {
+                    grown.insert(b);
+                }
+            }
+        }
+        streaks.retain(|b, _| grown.contains(b));
+        for &b in &grown {
+            let n = streaks.entry(b).or_insert(0);
+            *n += 1;
+            if *n >= WIDEN_AFTER {
+                new_vals.insert(b, None);
             }
         }
         vals = new_vals;
-        if !grew {
+        if grown.is_empty() {
             for (tid, th) in test.threads.iter().enumerate() {
                 let (full, rr, st, acquire) = orderings(&th.code);
                 // A read of a write that depends on an earlier read is ordered

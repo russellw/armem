@@ -387,10 +387,10 @@ is an address: `out_a=out_b` means "`out_a` holds the address of
 `out_b`". To ask whether two locations differ, list the cases, as
 `seqlock.litmus` does.
 
-The tests take between 0.3 s and 10 s each, except the
-seqlock at `-O0` (20-55 s, nearly all in the ARM model); `c/expected.txt`
-includes only its correct version at `-O0`. A ring of two slots sending
-three items, with `head` relaxed, did not finish in 5 minutes.
+Each test takes 0.02-10 s. A ring of two slots sending three items is
+checked in 3 s, but with `head` or `tail` relaxed the exhaustive search
+does not finish in 5 minutes, because of the number of promise memories.
+`--sample 20` finds both bugs in under 5 s.
 
 ### Calls
 
@@ -491,6 +491,16 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   are the product of the per-thread results. Candidate promises come from
   a solo exploration of the thread under the same model. A
   single-threaded test is run as SC, which is exact for a lone thread.
+
+  A solo exploration takes a thread's local steps (register operations,
+  branches and private stack accesses) at once, from one memory
+  operation to the next, rather than making each one a state of the
+  search, since each has exactly one successor. It expands states in
+  order of steps used, so a state is first expanded with the fewest
+  steps it can be reached in and never needs to be expanded again. On
+  compiled code at `-O0` most instructions are local steps. With the
+  widening in the reduction's pre-pass (below), this cut the `-O0`
+  seqlock of [C programs](#c-programs) from 20-63 s to 1-10 s.
 * **Partial-order reduction** (`src/reduce.rs`, on by default; `--no-por`
   turns it off). Every write another thread can see is a promise, so
   `n` writes that nothing orders give `n!` memories, although the order of
@@ -516,7 +526,10 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   and atomics. `cargo test` runs 200 small random tests; larger ones,
   which can take hours, run with
   `cargo test --release --test por -- --ignored` and are worth running
-  after changing the model or the reduction. If the
+  after changing the model or the reduction. The pre-pass widens a
+  byte whose set of values grows in three rounds in a row (a counter,
+  such as a sequence number) to any value, rather than adding values
+  round after round. If the
   pre-pass gets too big, or a thread accesses memory at an address it
   cannot bound, it gives up and nothing is pruned.
 * **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
@@ -656,11 +669,13 @@ lets a lone `LDXP` be torn.
    code.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
-   [How it works](#how-it-works)); next come making the ARM model
-   faster on compiled code (the `-O0` seqlock takes 20-55 s, nearly all
-   in the ARM model), for example by reducing the cost of each memory's
-   solo explorations, and guiding the sampling towards reads that
-   disagree with what TSO would return.
+   [How it works](#how-it-works)), and so are taking local steps at
+   once and in order of steps used; next come exploring fewer memories
+   (a two-slot ring buffer with a relaxed index does not finish in 5
+   minutes, see [C programs](#c-programs)), reducing the cost of each
+   memory's solo explorations (each is about half certification), and
+   guiding the sampling towards reads that disagree with what TSO would
+   return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

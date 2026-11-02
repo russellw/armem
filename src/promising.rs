@@ -31,7 +31,7 @@
 //! includes dependencies through conditional selects and CAS comparisons.
 //! Pick dependencies order later writes, but not later reads.
 
-use crate::core::{Core, MemOp, RV, Step, VR, View, low_bytes, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
@@ -552,9 +552,30 @@ impl<'a> Solo<'a> {
         states
     }
 
+    /// The states after the next memory operation (or the end of the
+    /// thread). Local steps have exactly one successor and touch no memory,
+    /// so they are taken at once rather than each being a separate state of
+    /// the search: compiled code, especially at -O0, is mostly local steps.
+    /// A state whose fuel runs out partway is returned as it is.
     fn successors(&mut self, st: &TState, ext: &[Msg]) -> Vec<Succ> {
         let mut s = st.clone();
-        match s.core.step(self.prog) {
+        loop {
+            match s.core.step(self.prog) {
+                Step::Local { ctrl } => {
+                    if let Some(v) = ctrl {
+                        s.v_cap = s.v_cap.max(v);
+                    }
+                    if s.core.steps >= self.fuel {
+                        return vec![(s, ext.to_vec())];
+                    }
+                }
+                step => return self.nonlocal_successors(s, ext, step),
+            }
+        }
+    }
+
+    fn nonlocal_successors(&mut self, s: TState, ext: &[Msg], step: Step) -> Vec<Succ> {
+        match step {
             Step::Done => {
                 if self.mode == Mode::Final && s.promises.is_empty() {
                     let regs = self.final_regs.iter().map(|&r| s.core.regs[r as usize].val).collect();
@@ -562,12 +583,7 @@ impl<'a> Solo<'a> {
                 }
                 vec![]
             }
-            Step::Local { ctrl } => {
-                if let Some(v) = ctrl {
-                    s.v_cap = s.v_cap.max(v);
-                }
-                vec![(s, ext.to_vec())]
-            }
+            Step::Local { .. } => unreachable!("local steps are taken in `successors`"),
             Step::Mem(op) => self.mem_successors(s, ext, op),
             // A fault ends the execution. It is real if the thread's promises
             // are fulfilled, since the other threads' promises are certified.
@@ -820,8 +836,9 @@ impl<'a> Solo<'a> {
     }
 
     fn run(&mut self, start: TState) {
-        let mut stack: Vec<Succ> = vec![(start, Vec::new())];
-        while let Some((st, ext)) = stack.pop() {
+        let mut queue = StepQueue::new();
+        queue.push(start.core.steps, (start, Vec::new()));
+        while let Some((st, ext)) = queue.pop() {
             if self.mode == Mode::Certify && st.promises.is_empty() {
                 self.certified = true;
                 return;
@@ -841,8 +858,9 @@ impl<'a> Solo<'a> {
                 self.truncated = true;
                 continue;
             }
-            let succs = self.successors(&st, &ext);
-            stack.extend(succs);
+            for x in self.successors(&st, &ext) {
+                queue.push(x.0.core.steps, x);
+            }
         }
     }
 }

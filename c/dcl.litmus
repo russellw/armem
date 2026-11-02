@@ -1,0 +1,5 @@
+AArch64 dcl
+"Each thread must read 42, and only one may construct the object"
+{ }
+ P0 = t0 | P1 = t1 ;
+exists (~(out0=42 /\ out1=42) \/ made0=1 /\ made1=1)

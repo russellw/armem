@@ -27,3 +27,27 @@ spsc -O0 yes no -DPUB=__ATOMIC_RELAXED
 spsc -O0 yes no -DFREE=__ATOMIC_RELAXED
 spsc -O0 yes no -DSEE=__ATOMIC_RELAXED
 spsc -O0 no no -DROOM=__ATOMIC_RELAXED
+
+dcl -O2 no no
+dcl -O2 yes no -DPUB=__ATOMIC_RELAXED
+# Ordered on ARM by the address dependency from the load of inst.
+dcl -O2 no no -DSEE=__ATOMIC_RELAXED
+dcl -O2 yes no -DLOCK=__ATOMIC_RELAXED
+dcl -O2 yes no -DUNLOCK=__ATOMIC_RELAXED
+dcl -O2 no no -DFLAG
+dcl -O2 yes no -DFLAG -DPUB=__ATOMIC_RELAXED
+# With a flag, only a control dependency orders the read of the value.
+dcl -O2 yes no -DFLAG -DSEE=__ATOMIC_RELAXED
+dcl -O2 yes no -DFLAG -DLOCK=__ATOMIC_RELAXED
+dcl -O2 yes no -DFLAG -DUNLOCK=__ATOMIC_RELAXED
+dcl -O0 no no
+dcl -O0 yes no -DPUB=__ATOMIC_RELAXED
+dcl -O0 no no -DSEE=__ATOMIC_RELAXED
+# clang -O0 compiles every compare-and-swap with LDAXR/STLXR.
+dcl -O0 no no -DLOCK=__ATOMIC_RELAXED
+dcl -O0 yes no -DUNLOCK=__ATOMIC_RELAXED
+dcl -O0 no no -DFLAG
+dcl -O0 yes no -DFLAG -DPUB=__ATOMIC_RELAXED
+dcl -O0 yes no -DFLAG -DSEE=__ATOMIC_RELAXED
+dcl -O0 no no -DFLAG -DLOCK=__ATOMIC_RELAXED
+dcl -O0 yes no -DFLAG -DUNLOCK=__ATOMIC_RELAXED

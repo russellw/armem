@@ -543,7 +543,16 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   round after round. A byte that only one thread writes is read by that
   thread exactly as it last wrote it (by coherence, no other write to it
   exists), so the indices and counters a thread owns stay precise; this
-  is what lets the analysis bound `buf[head % N]` in a ring buffer. If
+  is what lets the analysis bound `buf[head % N]` in a ring buffer.
+  (It keeps such values only for bytes the thread reads; when a run
+  reads one it dropped, the thread's run is repeated.) Besides barriers,
+  a thread orders reads by dependencies: by an address dependency, by
+  reading back a write whose address or data depends on a read, and
+  after an acquire so ordered. Where a thread may do so, the pre-pass
+  runs it again once for each instruction that may read another
+  thread's writes, tracking which later reads depend on that one, so a
+  dependency that orders only a ring buffer's index reads does not count
+  as ordering its data reads. If
   the pre-pass gets too big, or a thread accesses memory at an address it
   cannot bound, it gives up and nothing is pruned.
 * **Private memory** (on by default; `--no-private` turns it off). Every
@@ -706,12 +715,10 @@ lets a lone `LDXP` be torn.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
-   once and in order of steps used, and private memory; next come a
-   finer analysis of which reads a thread orders before which (a thread
-   that orders any read before a later one by a dependency is taken to
-   order them all; in the ring buffer with `head` relaxed, where the
-   consumer's dependencies order only its index reads, ignoring them
-   cuts the memories 3-5 times),
+   once and in order of steps used, private memory, and finding which
+   reads each dependency orders (the last took the ring buffer with
+   `head` relaxed, 2 slots and 3 items, from 2,745 memories in 3 minutes
+   43 s to 583 in 20 s); next come
    reducing the cost of each memory's solo explorations (mostly
    certification), and guiding the sampling towards reads that disagree
    with what TSO would return.

@@ -60,7 +60,7 @@ use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_va
 use crate::isa::{Addr, Barrier, Code, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::Test;
 use crate::promising::Msg;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Most values the analysis lets one read return before it treats the
 /// value as unknown.
@@ -103,11 +103,15 @@ pub struct Reduction {
     release_writes: Vec<Footprints>,
     /// Writes of atomics and store-exclusives.
     atomic_writes: Vec<Footprints>,
-    /// The thread may order a read before a later read other than by
-    /// making the first an acquire: a full barrier, DMB LD, an ISB after a
-    /// control dependency, an address dependency, or reading back a write
-    /// that depends on the first read.
+    /// The thread may order any read before any later read: it has a full
+    /// barrier, DMB LD, or an ISB (after a control dependency), or its
+    /// dependencies were too costly to find.
     orders_rr: Vec<bool>,
+    /// For each instruction that may read another thread's writes, the
+    /// footprints of its reads and of the reads the thread orders after
+    /// them by dependencies (see `Dep`). (If these were too costly to find,
+    /// `orders_rr` is set instead.)
+    dep_rr: Vec<Vec<(Footprints, Footprints)>>,
     /// The thread has a full barrier or an acquire-release atomic, which
     /// order any earlier write before any later read.
     full: Vec<bool>,
@@ -138,6 +142,7 @@ impl Reduction {
                     || hits(&self.reads[c], y)
                         && (self.orders_rr[c]
                             || hits(&self.acquire_reads[c], x)
+                            || self.dep_rr[c].iter().any(|(s, a)| hits(s, x) && hits(a, y))
                             || self.reads[c].iter().any(|&(p, n)| {
                                 let f = BTreeSet::from([(p, n)]);
                                 hits(&f, x) && hits(&f, y)
@@ -244,15 +249,38 @@ fn orderings(code: &Code) -> (bool, bool, bool, bool) {
     (full, rr, st, acquire)
 }
 
-/// One thread's run in the analysis: a core, its exclusive monitor, and
-/// its own latest writes to the bytes that only it writes.
-type HState = (Core, Option<(u64, Size)>, Own);
+/// One thread's run in the analysis: a core, its exclusive monitor, its
+/// own latest writes to the bytes that only it writes, and (when finding
+/// dependencies, see `Dep`) whether it has passed an acquire read ordered
+/// after the source.
+type HState = (Core, Option<(u64, Size)>, Own, bool);
 
 /// A thread's latest write to each byte that no other thread writes (None:
-/// an unknown value). Coherence makes such a byte read exactly as the
+/// an unknown value), and (when finding dependencies) whether the write
+/// depends on the source. Coherence makes such a byte read exactly as the
 /// thread last wrote it: no other write to it exists, and a read cannot
 /// return a write that comes later in program order.
-type Own = BTreeMap<u64, Option<u8>>;
+type Own = BTreeMap<u64, (Option<u8>, bool)>;
+
+/// A run that finds which reads the thread orders after the reads of one
+/// instruction (the source), other than by barriers: reads whose address
+/// depends on it, reads of writes whose address or data depend on it
+/// (Arm's `(addr | data); rfi`), and every read after an acquire read so
+/// ordered. Only the source's reads, and reads ordered after them, give
+/// tainted values, so the taint follows these orders transitively.
+struct Dep {
+    /// The source instruction.
+    source: usize,
+    /// Bytes that writes depending on the source may have written, as found
+    /// by the previous run (a read of one may read such a write back).
+    tainted: BTreeSet<u64>,
+    /// The same, found by this run.
+    new_tainted: BTreeSet<u64>,
+    /// Footprints of the source's reads, and of the reads ordered after
+    /// them.
+    sources: Footprints,
+    after: Footprints,
+}
 
 /// Taint (dependency view) of a value loaded from memory in the analysis.
 const LOADED: View = 1;
@@ -295,6 +323,13 @@ struct Havoc<'a> {
     vals: &'a HashMap<u64, ByteVals>,
     /// The threads that may write each byte (none if absent).
     writers: &'a HashMap<u64, BTreeSet<usize>>,
+    /// The bytes the thread may read, as found so far: `Own` keeps the
+    /// values only of these (others it never reads back, so their values
+    /// would only split states).
+    read_bytes: &'a HashSet<u64>,
+    /// Bytes read whose values `Own` dropped, as they were not in
+    /// `read_bytes`: if any, the run must be repeated with them added.
+    missed: HashSet<u64>,
     /// States the analysis may still visit, over all threads and rounds.
     budget: &'a mut usize,
     reads: Footprints,
@@ -309,9 +344,62 @@ struct Havoc<'a> {
     /// Footprints of all writes, and of exclusive reads.
     write_fps: Footprints,
     exclusive_reads: Footprints,
+    /// Instructions that read memory, with the footprints of their reads.
+    read_pcs: BTreeMap<usize, Footprints>,
+    /// Set when finding dependencies.
+    dep: Option<Dep>,
+    /// The memory instruction being performed, whether its run has passed
+    /// an acquire ordered after the source, and whether one of its reads is
+    /// the source or is ordered after it.
+    pc: usize,
+    after: bool,
+    ordered: bool,
 }
 
-impl Havoc<'_> {
+impl<'a> Havoc<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        test: &'a Test,
+        tid: usize,
+        fuel: u32,
+        vals: &'a HashMap<u64, ByteVals>,
+        writers: &'a HashMap<u64, BTreeSet<usize>>,
+        read_bytes: &'a HashSet<u64>,
+        budget: &'a mut usize,
+        dep: Option<Dep>,
+    ) -> Havoc<'a> {
+        Havoc {
+            test,
+            prog: &test.threads[tid].code,
+            tid,
+            fuel,
+            vals,
+            writers,
+            read_bytes,
+            missed: HashSet::new(),
+            budget,
+            reads: Footprints::new(),
+            write_fps: Footprints::new(),
+            exclusive_reads: Footprints::new(),
+            acquire_reads: Footprints::new(),
+            release_writes: Footprints::new(),
+            atomic_writes: Footprints::new(),
+            writes: HashMap::new(),
+            dep_writes: Footprints::new(),
+            addr_dep: false,
+            read_pcs: BTreeMap::new(),
+            dep,
+            pc: 0,
+            after: false,
+            ordered: false,
+        }
+    }
+
+    fn start(&self) -> Core {
+        let th = &self.test.threads[self.tid];
+        Core::new(self.test.init_regs[self.tid], self.tid, self.test.threads.len(), th.entry)
+    }
+
     /// A read of `n` bytes at `addr`: every value it may return, with its
     /// taint; or one stand-in value tainted `UNKNOWN`, if some byte may hold
     /// any value or there are too many combinations.
@@ -321,14 +409,19 @@ impl Havoc<'_> {
         if acquire {
             self.acquire_reads.insert((a, n));
         }
-        self.addr_dep |= addr.view != 0;
         let mut out = vec![0u128];
         for b in (a..a + n).rev() {
             let init = self.test.init_byte(b);
             if self.own_only(b) {
                 match own.get(&b) {
-                    Some(None) => return vec![(self.stand_in(a, n), UNKNOWN)],
-                    Some(Some(v)) => out.iter_mut().for_each(|x| *x = (*x << 8) | *v as u128),
+                    Some((None, _)) => {
+                        if !self.read_bytes.contains(&b) {
+                            self.missed.extend(a..a + n);
+                        }
+                        self.dep_taint(own, addr, n);
+                        return vec![(self.stand_in(a, n), UNKNOWN)];
+                    }
+                    Some((Some(v), _)) => out.iter_mut().for_each(|x| *x = (*x << 8) | *v as u128),
                     None => out.iter_mut().for_each(|x| *x = (*x << 8) | init as u128),
                 }
                 continue;
@@ -336,15 +429,46 @@ impl Havoc<'_> {
             let mut byte = match self.vals.get(&b) {
                 None => BTreeSet::new(),
                 Some(Some(v)) => v.clone(),
-                Some(None) => return vec![(self.stand_in(a, n), UNKNOWN)],
+                Some(None) => {
+                    self.dep_taint(own, addr, n);
+                    return vec![(self.stand_in(a, n), UNKNOWN)];
+                }
             };
             byte.insert(init);
             if out.len() * byte.len() > MAX_READ_VALUES {
+                self.dep_taint(own, addr, n);
                 return vec![(self.stand_in(a, n), UNKNOWN)];
             }
             out = out.iter().flat_map(|v| byte.iter().map(move |&x| (v << 8) | x as u128)).collect();
         }
-        out.into_iter().map(|v| (v, LOADED)).collect()
+        let t = self.dep_taint(own, addr, n);
+        out.into_iter().map(|v| (v, t)).collect()
+    }
+
+    /// The taint of a value read from `n` bytes at `addr`: `LOADED`, or when
+    /// finding dependencies, `LOADED` only if the read is the source or is
+    /// ordered after it.
+    fn dep_taint(&mut self, own: &Own, addr: RV, n: u64) -> View {
+        let a = addr.val;
+        self.read_pcs.entry(self.pc).or_default().insert((a, n));
+        self.addr_dep |= taint(addr) != 0;
+        let after = self.after;
+        let Some(d) = &mut self.dep else { return LOADED };
+        let ordered = after
+            || taint(addr) >= LOADED
+            || (a..a + n).any(|b| d.tainted.contains(&b) || own.get(&b).is_some_and(|e| e.1));
+        if ordered {
+            d.after.insert((a, n));
+        }
+        if self.pc == d.source {
+            d.sources.insert((a, n));
+        }
+        if ordered || self.pc == d.source {
+            self.ordered = true;
+            LOADED
+        } else {
+            0
+        }
     }
 
     /// Whether no other thread may write byte `b`.
@@ -361,13 +485,21 @@ impl Havoc<'_> {
     fn write(&mut self, own: &mut Own, addr: RV, n: u64, v: u128, data: View) {
         let a = addr.val;
         self.write_fps.insert((a, n));
+        if taint(addr) != 0 || data != 0 {
+            self.dep_writes.insert((a, n));
+        }
+        let depends = match &mut self.dep {
+            Some(d) if data >= LOADED || taint(addr) >= LOADED => {
+                d.new_tainted.extend(a..a + n);
+                true
+            }
+            _ => false,
+        };
         for i in 0..n {
             if self.own_only(a + i) {
-                own.insert(a + i, (data < UNKNOWN).then_some((v >> (8 * i)) as u8));
+                let e = if self.read_bytes.contains(&(a + i)) { ((data < UNKNOWN).then_some((v >> (8 * i)) as u8), depends) } else { (None, false) };
+                own.insert(a + i, e);
             }
-        }
-        if addr.view != 0 || data != 0 {
-            self.dep_writes.insert((a, n));
         }
         for i in 0..n {
             let e = self.writes.entry(a + i).or_insert_with(|| Some(BTreeSet::new()));
@@ -384,7 +516,7 @@ impl Havoc<'_> {
     fn run(&mut self, start: Core) -> Option<()> {
         let mut visited: HashMap<HState, u32> = HashMap::new();
         let mut queue = StepQueue::new();
-        queue.push(start.steps, (start, None, Own::new()));
+        queue.push(start.steps, (start, None, Own::new(), false));
         while let Some(st) = queue.pop() {
             let mut key = st.clone();
             key.0.steps = 0;
@@ -408,7 +540,7 @@ impl Havoc<'_> {
     /// The states after the next memory operation, or the next branch on an
     /// unknown value. Other local steps have one successor, so they are
     /// taken at once rather than each being a state of the search.
-    fn successors(&mut self, (mut core, mon, mut own): HState) -> Option<Vec<HState>> {
+    fn successors(&mut self, (mut core, mon, mut own, after): HState) -> Option<Vec<HState>> {
         let prog = self.prog;
         let reg = |v: u64, t: View| RV { val: v, view: t, pick: t };
         let status = |v: u64| RV::imm(v);
@@ -433,9 +565,9 @@ impl Havoc<'_> {
                     };
                     let mut alt = core.clone();
                     alt.pc = other;
-                    return Some(vec![(core, mon, own.clone()), (alt, mon, own)]);
+                    return Some(vec![(core, mon, own.clone(), after), (alt, mon, own, after)]);
                 }
-                Step::Local { .. } if core.steps >= self.fuel => return Some(vec![(core, mon, own)]),
+                Step::Local { .. } if core.steps >= self.fuel => return Some(vec![(core, mon, own, after)]),
                 Step::Local { .. } => {}
                 Step::Mem(op) => break op,
             }
@@ -443,7 +575,13 @@ impl Havoc<'_> {
         let mut out = Vec::new();
         let mut push = |mut c: Core, m: Option<(u64, Size)>, o: Own| {
             c.retire(prog);
-            out.push((c, m, o));
+            out.push((c, m, o, after));
+        };
+        (self.pc, self.after, self.ordered) = (core.pc, after, false);
+        let acquire = match op {
+            MemOp::Load { kind, .. } => kind != LoadKind::Plain,
+            MemOp::LoadExclPair { acquire, .. } | MemOp::Rmw { acquire, .. } => acquire,
+            _ => false,
         };
         match op {
             MemOp::Load { addr, rt, size, signed, excl, kind } => {
@@ -566,12 +704,12 @@ impl Havoc<'_> {
                     if known {
                         if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
                             // The new value may depend on the old one.
-                            self.write(&mut o, addr, n, new as u128, taint(operand).max(LOADED));
+                            self.write(&mut o, addr, n, new as u128, taint(operand).max(t.min(LOADED)));
                         }
                     } else if cmp.is_some() || op == RmwOp::Swp {
                         // A CAS may succeed (or fail); either way only the
                         // operand can be written.
-                        self.write(&mut o, addr, n, size.mask(operand.val) as u128, taint(operand).max(LOADED));
+                        self.write(&mut o, addr, n, size.mask(operand.val) as u128, taint(operand).max(t.min(LOADED)));
                     } else {
                         self.write(&mut o, addr, n, 0, UNKNOWN);
                     }
@@ -583,8 +721,49 @@ impl Havoc<'_> {
             MemOp::Barrier(_) => push(core, mon, own),
             MemOp::Clrex => push(core, None, own),
         }
+        // An acquire read ordered after the source orders every later read.
+        if acquire && self.ordered {
+            for s in &mut out {
+                s.3 = true;
+            }
+        }
         Some(out)
     }
+}
+
+/// For each instruction of thread `tid` that reads memory, the footprints
+/// of its reads and of the reads the thread orders after them other than
+/// by barriers (see `Dep`), or None if that is too costly to find.
+fn dep_orders(
+    test: &Test,
+    tid: usize,
+    fuel: u32,
+    vals: &HashMap<u64, ByteVals>,
+    writers: &HashMap<u64, BTreeSet<usize>>,
+    read_bytes: &HashSet<u64>,
+    pcs: &BTreeSet<usize>,
+) -> Option<Vec<(Footprints, Footprints)>> {
+    let mut budget = MAX_STATES;
+    let mut out = Vec::new();
+    'pcs: for &source in pcs {
+        let mut tainted = BTreeSet::new();
+        for _ in 0..MAX_ROUNDS {
+            let dep = Dep { source, tainted: tainted.clone(), new_tainted: BTreeSet::new(), sources: Footprints::new(), after: Footprints::new() };
+            let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep));
+            h.run(h.start())?;
+            if !h.missed.is_empty() {
+                return None;
+            }
+            let d = h.dep.take().unwrap();
+            if d.new_tainted.is_subset(&tainted) {
+                out.push((d.sources, d.after));
+                continue 'pcs;
+            }
+            tainted.extend(d.new_tainted);
+        }
+        return None;
+    }
+    Some(out)
 }
 
 /// Compute what the reduction needs for `test`, or None if the analysis
@@ -601,8 +780,10 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
         atomic_writes: vec![Footprints::new(); n],
         ..Reduction::default()
     };
+    let mut read_pcs: Vec<BTreeMap<usize, Footprints>> = vec![BTreeMap::new(); n];
     let mut dep_writes = vec![Footprints::new(); n];
     let mut addr_dep = vec![false; n];
+    let mut read_bytes = vec![HashSet::new(); n];
     let mut budget = MAX_STATES;
     // Consecutive rounds in which each byte's values have grown.
     let mut streaks: HashMap<u64, usize> = HashMap::new();
@@ -612,34 +793,28 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
         let mut new_vals = vals.clone();
         let mut new_writers = writers.clone();
         let mut new_writer = false;
-        for (tid, th) in test.threads.iter().enumerate() {
-            let mut h = Havoc {
-                test,
-                prog: &th.code,
-                tid,
-                fuel,
-                vals: &vals,
-                writers: &writers,
-                budget: &mut budget,
-                reads: Footprints::new(),
-                write_fps: Footprints::new(),
-                exclusive_reads: Footprints::new(),
-                acquire_reads: Footprints::new(),
-                release_writes: Footprints::new(),
-                atomic_writes: Footprints::new(),
-                writes: HashMap::new(),
-                dep_writes: Footprints::new(),
-                addr_dep: false,
+        for tid in 0..n {
+            let mut h = loop {
+                let mut h = Havoc::new(test, tid, fuel, &vals, &writers, &read_bytes[tid], &mut budget, None);
+                let r = h.run(h.start());
+                if h.missed.is_empty() {
+                    r?;
+                    break h;
+                }
+                let missed = std::mem::take(&mut h.missed);
+                read_bytes[tid].extend(missed);
             };
-            h.run(Core::new(test.init_regs[tid], tid, n, th.entry))?;
+            for (pc, mut f) in std::mem::take(&mut h.read_pcs) {
+                read_pcs[tid].entry(pc).or_default().append(&mut f);
+            }
+            dep_writes[tid].append(&mut h.dep_writes);
+            addr_dep[tid] |= h.addr_dep;
             red.reads[tid].append(&mut h.reads);
             red.writes[tid].append(&mut h.write_fps);
             red.exclusive_reads[tid].append(&mut h.exclusive_reads);
             red.acquire_reads[tid].append(&mut h.acquire_reads);
             red.release_writes[tid].append(&mut h.release_writes);
             red.atomic_writes[tid].append(&mut h.atomic_writes);
-            dep_writes[tid].append(&mut h.dep_writes);
-            addr_dep[tid] |= h.addr_dep;
             for (b, vs) in h.writes {
                 new_writer |= new_writers.entry(b).or_default().insert(tid);
                 let e = new_vals.entry(b).or_insert_with(|| Some(BTreeSet::new()));
@@ -671,12 +846,25 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
         if grown.is_empty() && !new_writer {
             for (tid, th) in test.threads.iter().enumerate() {
                 let (full, rr, st, acquire) = orderings(&th.code);
-                // A read of a write that depends on an earlier read is ordered
-                // after that read.
+                // Whether the thread may order reads by dependencies at all:
+                // by an address dependency, or by reading back a write that
+                // depends on a read.
                 let read_back = dep_writes[tid]
                     .iter()
                     .any(|&(a, len)| red.reads[tid].iter().any(|&(p, m)| a < p + m && p < a + len));
-                red.orders_rr.push(full || rr || addr_dep[tid] || read_back);
+                let deps = if addr_dep[tid] || read_back {
+                    // Only reads of other threads' writes matter (as `x` in
+                    // `prunable`).
+                    let others = |f: &Footprints| {
+                        f.iter().any(|&(a, len)| (a..a + len).any(|b| writers.get(&b).is_some_and(|w| w.iter().any(|&t| t != tid))))
+                    };
+                    let pcs: BTreeSet<usize> = read_pcs[tid].iter().filter(|(_, f)| others(f)).map(|(&pc, _)| pc).collect();
+                    dep_orders(test, tid, fuel, &vals, &writers, &read_bytes[tid], &pcs)
+                } else {
+                    Some(Vec::new())
+                };
+                red.orders_rr.push(full || rr || deps.is_none());
+                red.dep_rr.push(deps.unwrap_or_default());
                 red.full.push(full);
                 red.acquire.push(acquire);
                 red.dmb_st.push(st);

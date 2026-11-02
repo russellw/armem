@@ -3,8 +3,11 @@
 //!
 //! Each line of `expected.txt` gives a program, an optimization level, the
 //! expected ARM and TSO verdicts for its litmus test (`c/NAME.litmus`), and
-//! any further clang flags (usually a `-D` that weakens one ordering). The
-//! test is skipped (with a message) when clang is not installed.
+//! any further clang flags (usually a `-D` that weakens one ordering). A
+//! `sample=N` among the flags runs the ARM model on N random paths instead
+//! of exhaustively, for variants too big to explore; it may only confirm
+//! that the condition is reachable, as sampling may miss states. The test
+//! is skipped (with a message) when clang is not installed.
 
 use armem::elf::Elf;
 use armem::image::{Image, LoadOptions};
@@ -18,6 +21,7 @@ struct Expectation {
     line: String,
     program: String,
     cflags: Vec<String>,
+    sample: Option<u64>,
     arm: bool,
     tso: bool,
 }
@@ -36,8 +40,16 @@ fn expectations() -> Vec<Expectation> {
                 _ => panic!("expected.txt: bad verdict '{}' in: {}", s, l),
             };
             let mut cflags = vec![f[1].to_string()];
-            cflags.extend(f[4..].iter().map(|s| s.to_string()));
-            Expectation { line: l.to_string(), program: f[0].to_string(), cflags, arm: verdict(f[2]), tso: verdict(f[3]) }
+            let mut sample = None;
+            for s in &f[4..] {
+                match s.strip_prefix("sample=") {
+                    Some(n) => sample = Some(n.parse().unwrap()),
+                    None => cflags.push(s.to_string()),
+                }
+            }
+            let arm = verdict(f[2]);
+            assert!(arm || sample.is_none(), "expected.txt: sampling cannot show that a condition is unreachable: {}", l);
+            Expectation { line: l.to_string(), program: f[0].to_string(), cflags, sample, arm, tso: verdict(f[3]) }
         })
         .collect()
 }
@@ -80,7 +92,8 @@ fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let opts = Options { fuel: FUEL, ..Default::default() };
     let mut errors = Vec::new();
     for (model, want) in [(Model::Arm, e.arm), (Model::Tso, e.tso)] {
-        let o = run(&test, model, &opts);
+        let sampled = Options { sample: e.sample, ..opts };
+        let o = run(&test, model, if model == Model::Arm { &sampled } else { &opts });
         if o.truncated {
             errors.push(format!("{} ran out of fuel", model.name()));
         }

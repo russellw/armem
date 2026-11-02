@@ -362,6 +362,10 @@ is installed:
   runs an acquire fence and destroys the object: it checks that both
   uses happened, then frees it. The condition is a use after the object
   is freed, or the destructor missing a use.
+* `treiber.c`: a Treiber stack, a linked list whose top changes only by
+  compare-and-swap. One thread pushes 1, then 2, and another pops once.
+  The condition is the pop returning a value never pushed, or the stack
+  left with anything but the nodes not popped (a lost node).
 
 Each program is correct as written. Macros name the orderings it relies
 on, and defining one as `__ATOMIC_RELAXED` removes it:
@@ -396,6 +400,8 @@ verdicts at `-O0`, `-O1`, `-Os` and `-O2`, except where noted:
 | refcount | none | no | no |
 | refcount | release of the decrement (`DEC`) | yes, but no at `-O0` | no |
 | refcount | acquire fence before destruction (`ACQ`) | yes, but no at `-O0` | no |
+| treiber | push's release (`PUSH`) | yes, but no at `-O0` | no |
+| treiber | pop's acquire (`POP`) | no | no |
 
 Two results are worth a note. With `SEE` relaxed, clang `-O2` reuses its
 first read of `buf[0]` for the second item, which C allows, so the
@@ -422,7 +428,15 @@ clang `-O0` compiles every atomic read-modify-write (compare-and-swap and
 `__atomic_fetch_sub` included) with `LDAXR`/`STLXR`, whatever the order
 asked for. So at `-O0`, `dcl`'s lock acquires even with `LOCK` relaxed,
 and `refcount`'s decrement acquires and releases, which makes all its
-variants correct.
+variants correct, as does `treiber`'s push.
+
+In `treiber`, `POP` is harmless on ARM for the same reason as `dcl`'s
+`SEE` with a pointer: the pop reads the node through the pointer it read
+from `top`. The node's link is a relaxed atomic, as in most C11
+implementations. As a plain field, clang `-O1` and above moves the
+push's store of it out of the retry loop, after the compare-and-swap
+that publishes the node, and with `PUSH` relaxed that loses nodes on
+every machine.
 
 A condition compares a location with a value, and a symbol on the right
 is an address: `out_a=out_b` means "`out_a` holds the address of
@@ -435,16 +449,26 @@ take longer, mostly because of the number of promise memories when
 with two slots and three items, 583 memories in 17 s (`tail` relaxed: 44
 memories in 0.5 s). `--sample 20` finds the bug in under 5 s.
 
-The `refcount` tests take under 1 s each. The `dcl` tests take 0.1-0.4 s
-when correct, and up to 21 s with the lock's release relaxed. Two
-choices keep them that fast. Each thread records whether it constructed
-the object in its own variable, which is private memory: counting
-constructions in one shared counter instead took the correct program
-from 47 memories to 623, and the `UNLOCK` variant beyond 5 minutes,
-because the two threads' read-modify-writes of the counter multiply the
-memories. And the lock uses compare-and-swap rather than exchange: a
-failed exchange still writes, so each turn of a spinning thread adds a
-write (with exchange, the correct program took over 10 minutes).
+The `dcl` tests take at most 0.2 s when correct, and up to 9 s (at
+`-O0`) with the lock's release relaxed. At `-O2` that variant takes 3.5
+s; before the reduction's pre-pass kept whole values (see [How it
+works](#how-it-works)), it took 21 s. Two choices keep them that fast.
+Each thread records whether it constructed the object in its own
+variable, which is private memory: counting constructions in one shared
+counter instead took the correct program from 47 memories to 623, and
+the `UNLOCK` variant beyond 5 minutes, because the two threads' read-
+modify-writes of the counter multiply the memories. And the lock uses
+compare-and-swap rather than exchange: a failed exchange still writes,
+so each turn of a spinning thread adds a write (with exchange, the
+correct program took over 10 minutes).
+
+The `refcount` tests take under 1 s each. The correct `treiber` takes 8
+s at `-O2` (about 300 memories) and 20 s at `-O0`. With `PUSH` relaxed,
+nothing orders the pusher's writes, and the popper sees them in many
+orders: the exhaustive search does not finish in 10 minutes, so
+`expected.txt` checks it with `sample=20` (20 random paths, which find
+the bug in 4 s). A line may give `sample=N` only when the condition is
+expected to be reachable, since sampling may miss states.
 
 ### Calls
 
@@ -597,7 +621,18 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   exists), so the indices and counters a thread owns stay precise; this
   is what lets the analysis bound `buf[head % N]` in a ring buffer.
   (It keeps such values only for bytes the thread reads; when a run
-  reads one it dropped, the thread's run is repeated.) Besides barriers,
+  reads one it dropped, the thread's run is repeated.) The pre-pass also
+  keeps the whole values written with each footprint. An aligned read
+  of bytes that every write covers with the read's own footprint reads
+  them all from one write (or initial memory), since an aligned access
+  is single-copy atomic, so it returns only those values. Byte by byte,
+  a pointer that may be null or point to one of two nodes would combine
+  into many addresses no write stored. Reading through those found yet
+  more values until the bytes were widened, and the pre-pass gave up on
+  the [Treiber stack](#c-programs). Being more precise, it also cut the
+  correct double-checked initialization at `-O2` from 178 memories to
+  47, all of them now from private memory rather than the reduction.
+  Besides barriers,
   a thread orders reads by dependencies: by an address dependency, by
   reading back a write whose address or data depends on a read, and
   after an acquire so ordered. Where a thread may do so, the pre-pass
@@ -674,7 +709,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   spin loops cost almost nothing. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 83 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 85 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
@@ -718,7 +753,7 @@ Current results (herdtools7 7.58):
 | diy7, basic edges, 3 threads | 5428 | all match |
 | diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
 | diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
-| `litmus/` | 83 | 63 match, 1 known difference; herd7 times out or rejects 19 |
+| `litmus/` | 85 | 65 match, 1 known difference; herd7 times out or rejects 19 |
 
 The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
 a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when
@@ -762,11 +797,10 @@ lets a lone `LDXP` be torn.
    division, conditional compare, byte reversal, add with carry, ...),
    and the SIMD&FP loads, stores and moves that integer code uses (see
    [SIMD&FP registers](#simdfp-registers)). Lock-free C programs (a
-   seqlock, a ring buffer, double-checked initialization and reference
-   counting) run unchanged, and armem finds the
+   seqlock, a ring buffer, double-checked initialization, reference
+   counting and a Treiber stack) run unchanged, and armem finds the
    ARM-only bugs in their weakened versions (see [C programs](#c-programs));
-   next come more such programs (a Treiber stack) and functions
-   extracted from real code.
+   next come functions extracted from real code.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
@@ -776,7 +810,8 @@ lets a lone `LDXP` be torn.
    43 s to 583 in 20 s); next come
    reducing the cost of each memory's solo explorations (mostly
    certification), and guiding the sampling towards reads that disagree
-   with what TSO would return.
+   with what TSO would return. The Treiber stack with its push's release
+   relaxed, which takes over 10 minutes, is a good benchmark.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

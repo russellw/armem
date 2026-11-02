@@ -3,6 +3,7 @@
 # condition is the bug. Columns: program, optimization level, condition
 # reachable on ARM, under TSO, then any further clang flags.
 # W_FENCE etc. name an ordering; -DX=__ATOMIC_RELAXED removes it.
+# sample=N explores the ARM model on N random paths (for a "yes" only).
 
 seqlock -O2 no no
 seqlock -O2 yes no -DW_FENCE=__ATOMIC_RELAXED
@@ -59,3 +60,12 @@ refcount -O0 no no
 # clang -O0 compiles every atomic read-modify-write with LDAXR/STLXR.
 refcount -O0 no no -DDEC=__ATOMIC_RELAXED
 refcount -O0 no no -DACQ=__ATOMIC_RELAXED
+
+treiber -O2 no no
+# Too big to explore exhaustively (over 10 minutes); 20 random paths find it.
+treiber -O2 yes no -DPUSH=__ATOMIC_RELAXED sample=20
+# Ordered on ARM by the address dependency from the load of top.
+treiber -O2 no no -DPOP=__ATOMIC_RELAXED
+treiber -O0 no no
+# clang -O0 compiles every compare-and-swap with LDAXR/STLXR.
+treiber -O0 no no -DPUSH=__ATOMIC_RELAXED

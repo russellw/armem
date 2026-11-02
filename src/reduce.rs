@@ -44,6 +44,9 @@
 //! over-approximated before exploring. [`analyze`] runs each thread alone,
 //! letting every load return any value that some write (or initial memory)
 //! may put in each byte, until the sets of possible values stop growing.
+//! It also keeps the whole values written with each footprint, so that an
+//! aligned read of bytes written only with its own footprint (a pointer,
+//! say) returns those values rather than every combination of their bytes.
 //! Every real execution reads and writes only values found this way, so the
 //! footprints it records (of all reads, of acquire reads, of release
 //! writes and of atomic writes) cover every execution. A byte that may
@@ -295,6 +298,42 @@ fn taint(v: RV) -> View {
 /// The values a byte may hold besides its initial value (None: any).
 type ByteVals = Option<BTreeSet<u8>>;
 
+/// The whole values the writes with one footprint may store (None: any).
+type WordVals = Option<BTreeSet<u128>>;
+
+/// What the analysis has found that memory may hold.
+///
+/// Byte by byte, a pointer that may be null or point to one of a few
+/// objects lets its bytes combine into many addresses no write stored, and
+/// reading through those finds yet more values. So the whole values each
+/// write footprint may store are kept too. An aligned read whose bytes are
+/// all written only with its own footprint reads them from one write (or
+/// initial memory), as an aligned access is single-copy atomic, and so
+/// returns only those whole values.
+#[derive(Clone, Default)]
+struct Known {
+    bytes: HashMap<u64, ByteVals>,
+    words: HashMap<(u64, u64), WordVals>,
+    /// The footprints of the writes to each byte.
+    cover: HashMap<u64, BTreeSet<(u64, u64)>>,
+}
+
+impl Known {
+    /// The values an aligned read of `n` bytes at `a` may return besides
+    /// the initial value, if they can be found from whole writes.
+    fn whole(&self, a: u64, n: u64) -> Option<&BTreeSet<u128>> {
+        if !matches!(n, 1 | 2 | 4 | 8) || a % n != 0 {
+            return None;
+        }
+        let only = |b: u64| self.cover.get(&b).is_some_and(|c| c.len() == 1 && c.contains(&(a, n)));
+        let known = |b: u64| matches!(self.bytes.get(&b), Some(Some(_)));
+        if !(a..a + n).all(|b| only(b) && known(b)) {
+            return None;
+        }
+        self.words.get(&(a, n))?.as_ref()
+    }
+}
+
 /// The address operand of a memory instruction.
 fn mem_addr(i: &Instr) -> Option<&Addr> {
     match i {
@@ -320,7 +359,7 @@ struct Havoc<'a> {
     prog: &'a Code,
     tid: usize,
     fuel: u32,
-    vals: &'a HashMap<u64, ByteVals>,
+    vals: &'a Known,
     /// The threads that may write each byte (none if absent).
     writers: &'a HashMap<u64, BTreeSet<usize>>,
     /// The bytes the thread may read, as found so far: `Own` keeps the
@@ -337,6 +376,7 @@ struct Havoc<'a> {
     release_writes: Footprints,
     atomic_writes: Footprints,
     writes: HashMap<u64, ByteVals>,
+    word_writes: HashMap<(u64, u64), WordVals>,
     /// Footprints of writes whose address or data depends on a read.
     dep_writes: Footprints,
     /// Some read's address depends on an earlier read.
@@ -362,7 +402,7 @@ impl<'a> Havoc<'a> {
         test: &'a Test,
         tid: usize,
         fuel: u32,
-        vals: &'a HashMap<u64, ByteVals>,
+        vals: &'a Known,
         writers: &'a HashMap<u64, BTreeSet<usize>>,
         read_bytes: &'a HashSet<u64>,
         budget: &'a mut usize,
@@ -385,6 +425,7 @@ impl<'a> Havoc<'a> {
             release_writes: Footprints::new(),
             atomic_writes: Footprints::new(),
             writes: HashMap::new(),
+            word_writes: HashMap::new(),
             dep_writes: Footprints::new(),
             addr_dep: false,
             read_pcs: BTreeMap::new(),
@@ -409,6 +450,15 @@ impl<'a> Havoc<'a> {
         if acquire {
             self.acquire_reads.insert((a, n));
         }
+        if !(a..a + n).any(|b| self.own_only(b))
+            && let Some(ws) = self.vals.whole(a, n)
+        {
+            let init = self.stand_in(a, n);
+            if ws.len() < MAX_READ_VALUES {
+                let t = self.dep_taint(own, addr, n);
+                return std::iter::once(init).chain(ws.iter().copied()).collect::<BTreeSet<_>>().into_iter().map(|v| (v, t)).collect();
+            }
+        }
         let mut out = vec![0u128];
         for b in (a..a + n).rev() {
             let init = self.test.init_byte(b);
@@ -426,7 +476,7 @@ impl<'a> Havoc<'a> {
                 }
                 continue;
             }
-            let mut byte = match self.vals.get(&b) {
+            let mut byte = match self.vals.bytes.get(&b) {
                 None => BTreeSet::new(),
                 Some(Some(v)) => v.clone(),
                 Some(None) => {
@@ -500,6 +550,13 @@ impl<'a> Havoc<'a> {
                 let e = if self.read_bytes.contains(&(a + i)) { ((data < UNKNOWN).then_some((v >> (8 * i)) as u8), depends) } else { (None, false) };
                 own.insert(a + i, e);
             }
+        }
+        let w = self.word_writes.entry((a, n)).or_insert_with(|| Some(BTreeSet::new()));
+        match w {
+            Some(set) if data < UNKNOWN => {
+                set.insert(v);
+            }
+            _ => *w = None,
         }
         for i in 0..n {
             let e = self.writes.entry(a + i).or_insert_with(|| Some(BTreeSet::new()));
@@ -738,7 +795,7 @@ fn dep_orders(
     test: &Test,
     tid: usize,
     fuel: u32,
-    vals: &HashMap<u64, ByteVals>,
+    vals: &Known,
     writers: &HashMap<u64, BTreeSet<usize>>,
     read_bytes: &HashSet<u64>,
     pcs: &BTreeSet<usize>,
@@ -770,7 +827,7 @@ fn dep_orders(
 /// gives up (then nothing should be pruned).
 pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
     let n = test.threads.len();
-    let mut vals: HashMap<u64, ByteVals> = HashMap::new();
+    let mut vals = Known::default();
     let mut red = Reduction {
         reads: vec![Footprints::new(); n],
         writes: vec![Footprints::new(); n],
@@ -793,6 +850,7 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
         let mut new_vals = vals.clone();
         let mut new_writers = writers.clone();
         let mut new_writer = false;
+        let mut words_grown = false;
         for tid in 0..n {
             let mut h = loop {
                 let mut h = Havoc::new(test, tid, fuel, &vals, &writers, &read_bytes[tid], &mut budget, None);
@@ -815,9 +873,26 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
             red.acquire_reads[tid].append(&mut h.acquire_reads);
             red.release_writes[tid].append(&mut h.release_writes);
             red.atomic_writes[tid].append(&mut h.atomic_writes);
+            for ((a, len), vs) in h.word_writes {
+                for b in a..a + len {
+                    new_vals.cover.entry(b).or_default().insert((a, len));
+                }
+                let e = new_vals.words.entry((a, len)).or_insert_with(|| Some(BTreeSet::new()));
+                let before = e.as_ref().map(BTreeSet::len);
+                match (e.as_mut(), vs) {
+                    (Some(set), Some(vs)) => {
+                        set.extend(vs);
+                        if set.len() >= MAX_READ_VALUES {
+                            *e = None;
+                        }
+                    }
+                    _ => *e = None,
+                }
+                words_grown |= e.as_ref().map(BTreeSet::len) != before;
+            }
             for (b, vs) in h.writes {
                 new_writer |= new_writers.entry(b).or_default().insert(tid);
-                let e = new_vals.entry(b).or_insert_with(|| Some(BTreeSet::new()));
+                let e = new_vals.bytes.entry(b).or_insert_with(|| Some(BTreeSet::new()));
                 let before = e.as_ref().map(BTreeSet::len);
                 match (e.as_mut(), vs) {
                     (Some(set), Some(vs)) => {
@@ -838,12 +913,19 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
             let n = streaks.entry(b).or_insert(0);
             *n += 1;
             if *n >= WIDEN_AFTER {
-                new_vals.insert(b, None);
+                new_vals.bytes.insert(b, None);
+            }
+        }
+        // A footprint with a byte that may hold any value may too, so a
+        // counter's whole values stop growing once its bytes are widened.
+        for (&(a, len), e) in &mut new_vals.words {
+            if e.is_some() && (a..a + len).any(|b| matches!(new_vals.bytes.get(&b), Some(None))) {
+                *e = None;
             }
         }
         vals = new_vals;
         writers = new_writers;
-        if grown.is_empty() && !new_writer {
+        if grown.is_empty() && !new_writer && !words_grown {
             for (tid, th) in test.threads.iter().enumerate() {
                 let (full, rr, st, acquire) = orderings(&th.code);
                 // Whether the thread may order reads by dependencies at all:

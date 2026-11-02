@@ -1,0 +1,10 @@
+AArch64 MP+ptrs
+"Publish two objects through one pointer without barriers; the reader follows it"
+{ 0:X1=a; 0:X2=p; 0:X3=b; 1:X1=p; }
+ P0          | P1           ;
+ MOV X0,#1   | LDR X0,[X1]  ;
+ STR X0,[X1] | CBZ X0,L0    ;
+ STR X1,[X2] | LDR X2,[X0]  ;
+ STR X0,[X3] | L0:          ;
+ STR X3,[X2] |              ;
+exists (1:X0=a /\ 1:X2=0 \/ 1:X0=b /\ 1:X2=0)

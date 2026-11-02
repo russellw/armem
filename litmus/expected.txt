@@ -7,6 +7,8 @@ MP-calls               yes  no
 MP+dmbs                no   no
 MP+po+addr             yes  no
 MP+dmb.st+addr         no   no
+MP+ptrs                yes  no
+MP+dmb.st+ptrs         no   no
 MP+dmb.sy+ctrl         yes  no
 MP+dmb.sy+ctrlisb      no   no
 MP+popl+poap           no   no

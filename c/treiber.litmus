@@ -1,0 +1,6 @@
+AArch64 treiber
+"The pop must return a pushed value or EMPTY (99), leaving the rest on the stack"
+{ }
+ P0 = pusher | P1 = popper ;
+locations [top; [n2+8]; [n1+8];]
+exists (~(got=99 /\ top=n2 /\ [n2+8]=n1 /\ [n1+8]=0 \/ got=1 /\ top=n2 /\ [n2+8]=0 \/ got=2 /\ top=n1 /\ [n1+8]=0))

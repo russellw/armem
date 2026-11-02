@@ -51,3 +51,11 @@ dcl -O0 yes no -DFLAG -DPUB=__ATOMIC_RELAXED
 dcl -O0 yes no -DFLAG -DSEE=__ATOMIC_RELAXED
 dcl -O0 no no -DFLAG -DLOCK=__ATOMIC_RELAXED
 dcl -O0 yes no -DFLAG -DUNLOCK=__ATOMIC_RELAXED
+
+refcount -O2 no no
+refcount -O2 yes no -DDEC=__ATOMIC_RELAXED
+refcount -O2 yes no -DACQ=__ATOMIC_RELAXED
+refcount -O0 no no
+# clang -O0 compiles every atomic read-modify-write with LDAXR/STLXR.
+refcount -O0 no no -DDEC=__ATOMIC_RELAXED
+refcount -O0 no no -DACQ=__ATOMIC_RELAXED

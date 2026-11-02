@@ -1,0 +1,5 @@
+AArch64 refcount
+"No thread may use the object after it is freed, and the destructor must see both uses"
+{ }
+ P0 = t0 | P1 = t1 ;
+exists (~(out0=42 /\ out1=42) \/ seen0=1 \/ seen1=1)

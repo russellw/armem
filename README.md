@@ -356,6 +356,12 @@ is installed:
   published through a pointer, or with `-DFLAG` through a flag. The
   condition is a thread reading anything but the constructed value, or
   both threads constructing the object.
+* `refcount.c`: reference counting. Two threads share an object, each
+  holding a reference. Each uses the object, then drops its reference
+  with a release decrement, and the one that drops the last reference
+  runs an acquire fence and destroys the object: it checks that both
+  uses happened, then frees it. The condition is a use after the object
+  is freed, or the destructor missing a use.
 
 Each program is correct as written. Macros name the orderings it relies
 on, and defining one as `__ATOMIC_RELAXED` removes it:
@@ -387,6 +393,9 @@ verdicts at `-O0`, `-O1`, `-Os` and `-O2`, except where noted:
 | dcl | fast path's acquire of the flag (`SEE`, `-DFLAG`) | yes | no |
 | dcl | lock's acquire (`LOCK`) | yes, but no at `-O0` | no |
 | dcl | lock's release (`UNLOCK`) | yes | no |
+| refcount | none | no | no |
+| refcount | release of the decrement (`DEC`) | yes, but no at `-O0` | no |
+| refcount | acquire fence before destruction (`ACQ`) | yes, but no at `-O0` | no |
 
 Two results are worth a note. With `SEE` relaxed, clang `-O2` reuses its
 first read of `buf[0]` for the second item, which C allows, so the
@@ -396,13 +405,24 @@ store to the slot is control dependent on its load of `tail`, and ARM never
 makes a store visible before a load it depends on, so the hardware cannot
 show the bug. The program still has a data race in C.
 
-In `dcl`, which dependency the read of the value has decides `SEE`. Published
-through a pointer, the object's value is read through the pointer, and
-that address dependency keeps the read in order on ARM even without the
-acquire. Published through a flag, only a control dependency (the branch
-on the flag) comes before the read, and ARM may perform the read early.
-With `LOCK` relaxed, clang `-O0` still emits an acquire, since it
-compiles every compare-and-swap with `LDAXR`/`STLXR`.
+In `dcl`, which dependency the read of the value has decides `SEE`.
+Published through a pointer, the object's value is read through the
+pointer, and that address dependency keeps the read in order on ARM even
+without the acquire. Published through a flag, only a control dependency
+(the branch on the flag) comes before the read, and ARM may perform the
+read early.
+
+In `refcount` with `ACQ` relaxed, only the branch on the count orders the
+destructor after the other thread's use. ARM may perform the destructor's
+reads early, so it can miss the use, but it never makes the destructor's
+write of the freed value visible early, since a store waits for the
+branches before it.
+
+clang `-O0` compiles every atomic read-modify-write (compare-and-swap and
+`__atomic_fetch_sub` included) with `LDAXR`/`STLXR`, whatever the order
+asked for. So at `-O0`, `dcl`'s lock acquires even with `LOCK` relaxed,
+and `refcount`'s decrement acquires and releases, which makes all its
+variants correct.
 
 A condition compares a location with a value, and a symbol on the right
 is an address: `out_a=out_b` means "`out_a` holds the address of
@@ -415,16 +435,16 @@ take longer, mostly because of the number of promise memories when
 with two slots and three items, 583 memories in 17 s (`tail` relaxed: 44
 memories in 0.5 s). `--sample 20` finds the bug in under 5 s.
 
-The `dcl` tests take 0.1-0.4 s when correct, and up to 21 s with the
-lock's release relaxed. Two choices keep them that fast. Each thread
-records whether it constructed the object in its own variable, which is
-private memory: counting constructions in one shared counter instead
-took the correct program from 47 memories to 623, and the `UNLOCK`
-variant beyond 5 minutes, because the two threads' read-modify-writes
-of the counter multiply the memories. And the lock uses compare-and-swap
-rather than exchange: a failed exchange still writes, so each turn of
-a spinning thread adds a write (with exchange, the correct program took
-over 10 minutes).
+The `refcount` tests take under 1 s each. The `dcl` tests take 0.1-0.4 s
+when correct, and up to 21 s with the lock's release relaxed. Two
+choices keep them that fast. Each thread records whether it constructed
+the object in its own variable, which is private memory: counting
+constructions in one shared counter instead took the correct program
+from 47 memories to 623, and the `UNLOCK` variant beyond 5 minutes,
+because the two threads' read-modify-writes of the counter multiply the
+memories. And the lock uses compare-and-swap rather than exchange: a
+failed exchange still writes, so each turn of a spinning thread adds a
+write (with exchange, the correct program took over 10 minutes).
 
 ### Calls
 
@@ -742,10 +762,11 @@ lets a lone `LDXP` be torn.
    division, conditional compare, byte reversal, add with carry, ...),
    and the SIMD&FP loads, stores and moves that integer code uses (see
    [SIMD&FP registers](#simdfp-registers)). Lock-free C programs (a
-   seqlock, a ring buffer and double-checked initialization) run unchanged, and armem finds the
+   seqlock, a ring buffer, double-checked initialization and reference
+   counting) run unchanged, and armem finds the
    ARM-only bugs in their weakened versions (see [C programs](#c-programs));
-   next come more such programs (a Treiber stack, reference counting)
-   and functions extracted from real code.
+   next come more such programs (a Treiber stack) and functions
+   extracted from real code.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

@@ -1,0 +1,5 @@
+AArch64 seqlock
+"The reader must never copy a torn record"
+{ }
+ P0 = writer | P1 = reader ;
+exists (out_a=0 /\ out_b=1 \/ out_a=1 /\ out_b=0)

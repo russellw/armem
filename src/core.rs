@@ -231,7 +231,9 @@ pub enum MemOp {
     Clrex,
 }
 
-/// Result of attempting to execute the next instruction locally.
+/// Result of attempting to execute the next instruction locally. Only a
+/// `Local` step changes the core: after `Done`, `Fault` or `Mem` it is as
+/// it was.
 pub enum Step {
     /// The thread has finished.
     Done,

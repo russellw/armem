@@ -338,6 +338,60 @@ is installed:
   rejects. A run of 2 million words (750,468 decoded) found no other
   differences.
 
+### C programs
+
+`c/` holds small lock-free C programs, each with a litmus test
+(`c/NAME.litmus`) whose condition is the bug the program must avoid:
+
+* `seqlock.c`: a sequence lock. A writer updates a two-word record and a
+  reader copies it, retrying until it sees the same even sequence number
+  before and after. The condition is a torn copy.
+* `spsc.c`: a single-producer, single-consumer ring buffer. The condition
+  is the consumer receiving anything but 1, then 2.
+
+Each program is correct as written. Macros name the orderings it relies
+on, and defining one as `__ATOMIC_RELAXED` removes it:
+
+```
+clang --target=aarch64-linux-gnu -O2 -fno-pic -c -DW_FENCE=__ATOMIC_RELAXED c/seqlock.c
+armem --elf seqlock.o c/seqlock.litmus
+```
+
+`tests/c_programs.rs` compiles them with clang and checks the verdicts in
+`c/expected.txt`, when clang is installed. All the variants give the same
+verdicts at `-O0`, `-O1`, `-Os` and `-O2`, except where noted:
+
+| Program | Ordering removed | ARM | TSO |
+|---|---|---|---|
+| seqlock | none | no | no |
+| seqlock | writer's fence after the odd sequence number (`W_FENCE`) | yes | no |
+| seqlock | writer's release of the even sequence number (`W_SEQ`) | yes | no |
+| seqlock | reader's acquire of the first sequence number (`R_SEQ`) | yes | no |
+| seqlock | reader's fence before the second sequence number (`R_FENCE`) | yes | no |
+| spsc | none | no | no |
+| spsc | producer's release of `head` (`PUB`) | yes | no |
+| spsc | consumer's release of `tail` (`FREE`) | yes | no |
+| spsc | consumer's acquire of `head` (`SEE`) | yes | yes at `-O2`, else no |
+| spsc | producer's acquire of `tail` (`ROOM`) | no | no |
+
+Two results are worth a note. With `SEE` relaxed, clang `-O2` reuses its
+first read of `buf[0]` for the second item, which C allows, so the
+compiled code is wrong on every machine. armem runs the binary and so
+finds compiler-introduced bugs too. With `ROOM` relaxed, the producer's
+store to the slot is control dependent on its load of `tail`, and ARM never
+makes a store visible before a load it depends on, so the hardware cannot
+show the bug. The program still has a data race in C.
+
+A condition compares a location with a value, and a symbol on the right
+is an address: `out_a=out_b` means "`out_a` holds the address of
+`out_b`". To ask whether two locations differ, list the cases, as
+`seqlock.litmus` does.
+
+The tests take between 0.3 s and 10 s each, except the
+seqlock at `-O0` (20-55 s, nearly all in the ARM model); `c/expected.txt`
+includes only its correct version at `-O0`. A ring of two slots sending
+three items, with `head` relaxed, did not finish in 5 minutes.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -496,7 +550,13 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   `-variant mixed` (see below). herd7 rejects unaligned accesses and has
   no LSE2 option, so those parts are checked only by our own tests.
 * **Reference models** (`src/interleave.rs`): SC and x86-TSO. These
-  enumerate interleavings, with FIFO store buffers for TSO. A full `DMB`
+  enumerate interleavings, with FIFO store buffers for TSO. Only
+  shared-memory operations are interleaving points: a thread's local
+  steps (register operations, branches and private stack accesses)
+  commute with everything the other threads do, so after each step a
+  thread runs on through them at once. Compiled code at `-O0` is mostly
+  local steps, and this takes the reference models from minutes to
+  milliseconds on it. A full `DMB`
   acts like `MFENCE`, and atomics act as locked operations. They run the
   same ARM program under an x86-like ordering, so any outcome they cannot
   produce is an *ARM-only* behavior.
@@ -588,13 +648,19 @@ lets a lone `LDXP` be torn.
    instructions compilers commonly emit (bitfield moves, multiply-add,
    division, conditional compare, byte reversal, add with carry, ...),
    and the SIMD&FP loads, stores and moves that integer code uses (see
-   [SIMD&FP registers](#simdfp-registers)); next come user-mode
-   functions extracted from real programs.
+   [SIMD&FP registers](#simdfp-registers)). Lock-free C programs (a
+   seqlock and a ring buffer) run unchanged, and armem finds the
+   ARM-only bugs in their weakened versions (see [C programs](#c-programs));
+   next come more such programs (double-checked initialization, a
+   Treiber stack, reference counting) and functions extracted from real
+   code.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
-   [How it works](#how-it-works)); next come guiding the sampling
-   towards reads that disagree with what TSO would return, and reducing
-   the cost of each memory's solo explorations.
+   [How it works](#how-it-works)); next come making the ARM model
+   faster on compiled code (the `-O0` seqlock takes 20-55 s, nearly all
+   in the ARM model), for example by reducing the cost of each memory's
+   solo explorations, and guiding the sampling towards reads that
+   disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

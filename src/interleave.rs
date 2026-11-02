@@ -5,6 +5,14 @@
 //! drains the buffer, as MFENCE would; atomics are locked operations).
 //! They answer the question "could this outcome also have happened on an
 //! x86-like machine?", so that ARM-only outcomes can be singled out.
+//!
+//! Only shared-memory operations are interleaving points. A thread's local
+//! steps (register operations, branches and accesses to its private stack)
+//! commute with every step of the other threads and with the draining of
+//! store buffers, so after each step a thread runs on through its local
+//! steps at once. This changes no outcome, and keeps compiled code
+//! (especially at -O0, where most instructions are local) from multiplying
+//! the interleavings.
 
 use crate::core::{Core, MemOp, RV, Step, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::isa::{Barrier, Size};
@@ -85,10 +93,18 @@ impl Global {
     }
 }
 
+/// Run the thread's local steps up to its next memory operation, the end of
+/// its code, a fault or the fuel limit. `Core::step` leaves the core
+/// unchanged unless the step is local, so the next instruction is left for
+/// the explorer.
+fn run_local(core: &mut Core, prog: &crate::isa::Code, fuel: u32) {
+    while core.steps < fuel && matches!(core.step(prog), Step::Local { .. }) {}
+}
+
 pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
     let obs = test.observables();
     let mut results = Outcomes::new(obs.clone());
-    let start = Global {
+    let mut start = Global {
         threads: test
             .threads
             .iter()
@@ -97,6 +113,9 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             .collect(),
         mem: BTreeMap::new(),
     };
+    for (t, p) in start.threads.iter_mut().zip(&test.threads) {
+        run_local(&mut t.core, &p.code, fuel);
+    }
     // Visited states (step counters zeroed) -> per-thread step counts when
     // last explored. A state reached again with no thread having used fewer
     // steps cannot lead anywhere new; this collapses spin loops.
@@ -266,6 +285,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 },
             };
             if ok {
+                run_local(&mut n.threads[tid].core, prog, fuel);
                 stack.push(n);
                 any = true;
             }

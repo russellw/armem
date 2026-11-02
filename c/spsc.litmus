@@ -1,0 +1,5 @@
+AArch64 spsc
+"The consumer must receive 1, then 2"
+{ uint64_t got[2]; }
+ P0 = producer | P1 = consumer ;
+exists (~(got[0]=1 /\ got[1]=2))

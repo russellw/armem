@@ -848,71 +848,177 @@ impl<'a> Solo<'a> {
 }
 
 pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
-    let n = test.threads.len();
-    if n == 1 {
+    if test.threads.len() == 1 {
         // A lone thread sees its own accesses in program order: its behaviors
         // are exactly the sequentially consistent ones.
         return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel);
     }
     let proj = Projection::new(test);
-    let mut results = Outcomes::new(test.observables());
-    let mut seen: HashSet<Vec<Msg>> = HashSet::new();
-    let mut stack: Vec<Vec<Msg>> = vec![Vec::new()];
+    let mut ex = Explorer {
+        test,
+        cfg,
+        proj: &proj,
+        reduction: if cfg.por { crate::reduce::analyze(test, cfg.fuel) } else { None },
+        results: Outcomes::new(test.observables()),
+    };
+    match cfg.sample {
+        None => ex.exhaustive(),
+        Some(walks) => ex.sample(walks, cfg.seed),
+    }
+    ex.results
+}
 
-    let solo = |tid: usize, mem: &[Msg], mode: Mode| Solo::new(test, cfg, &proj, tid, mem.to_vec(), mode);
-    let start = |tid: usize, mem: &[Msg]| {
-        let mut st = TState::new(test.init_regs[tid], tid, n, test.threads[tid].entry);
+/// The promise-first search over memories.
+struct Explorer<'a> {
+    test: &'a Test,
+    cfg: &'a Options,
+    proj: &'a Projection,
+    reduction: Option<crate::reduce::Reduction>,
+    results: Outcomes,
+}
+
+impl<'a> Explorer<'a> {
+    fn solo(&self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
+        Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode)
+    }
+
+    fn start(&self, tid: usize, mem: &[Msg]) -> TState {
+        let test = self.test;
+        let mut st = TState::new(test.init_regs[tid], tid, test.threads.len(), test.threads[tid].entry);
         st.promises = (1..=mem.len() as View).filter(|&t| mem[t as usize - 1].tid == tid).collect();
         st
-    };
+    }
 
-    while let Some(mem) = stack.pop() {
-        if !seen.insert(mem.clone()) {
-            continue;
-        }
-        results.stats.memories += 1;
-
-        // Phase 2: run every thread to completion against this memory.
+    /// Phase 2: run every thread to completion against `mem`, fulfilling
+    /// exactly its promises, and record the final states. Returns whether
+    /// any execution completed (or faulted) with this memory.
+    fn finish(&mut self, mem: &[Msg]) -> bool {
+        let test = self.test;
+        self.results.stats.memories += 1;
         let mut per_thread = Vec::new();
-        for tid in 0..n {
-            let mut s = solo(tid, &mem, Mode::Final);
-            s.run(start(tid, &mem));
-            results.truncated |= s.truncated;
-            results.faults.extend(std::mem::take(&mut s.faults));
+        let mut faulted = false;
+        for tid in 0..test.threads.len() {
+            let mut s = self.solo(tid, mem, Mode::Final);
+            s.run(self.start(tid, mem));
+            self.results.truncated |= s.truncated;
+            faulted |= !s.faults.is_empty();
+            self.results.faults.extend(std::mem::take(&mut s.faults));
             per_thread.push(s.finals);
         }
-        if per_thread.iter().all(|f| !f.is_empty()) {
-            let byte = |b: u64| {
-                mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b))
-            };
-            for state in proj.combine(&per_thread, &|o| match o {
-                Obs::Mem(a) => test.loc_value(a, &byte),
-                Obs::Reg(..) => unreachable!(),
-            }) {
-                results.insert(state);
-            }
+        if per_thread.iter().any(|f| f.is_empty()) {
+            // Some thread cannot complete, so neither can the execution.
+            return faulted;
         }
+        let byte =
+            |b: u64| mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b));
+        for state in self.proj.combine(&per_thread, &|o| match o {
+            Obs::Mem(a) => test.loc_value(a, &byte),
+            Obs::Reg(..) => unreachable!(),
+        }) {
+            self.results.insert(state);
+        }
+        true
+    }
 
-        // Phase 1: try every certifiable promise.
-        for tid in 0..n {
-            let mut c = solo(tid, &mem, Mode::Collect);
-            c.run(start(tid, &mem));
-            results.truncated |= c.truncated;
+    /// Phase 1: every memory that extends `mem` by one certifiable promise,
+    /// except those that `skip` rejects (before certifying them) and those
+    /// the reduction prunes.
+    fn children(&mut self, mem: &[Msg], skip: &dyn Fn(&[Msg]) -> bool) -> Vec<Vec<Msg>> {
+        let mut out = Vec::new();
+        for tid in 0..self.test.threads.len() {
+            let mut c = self.solo(tid, mem, Mode::Collect);
+            c.run(self.start(tid, mem));
+            self.results.truncated |= c.truncated;
             for (addr, size, val) in c.candidates {
-                let mut m2 = mem.clone();
-                m2.push(Msg { addr, size, val, tid });
-                if seen.contains(&m2) {
+                let msg = Msg { addr, size, val, tid };
+                if let (Some(r), Some(last)) = (&self.reduction, mem.last()) {
+                    if r.prunable(last, &msg) {
+                        self.results.stats.pruned += 1;
+                        continue;
+                    }
+                }
+                let mut m2 = mem.to_vec();
+                m2.push(msg);
+                if skip(&m2) {
                     continue;
                 }
-                let mut cert = solo(tid, &m2, Mode::Certify);
-                cert.run(start(tid, &m2));
+                let mut cert = self.solo(tid, &m2, Mode::Certify);
+                cert.run(self.start(tid, &m2));
                 if cert.certified {
-                    stack.push(m2);
+                    out.push(m2);
                 } else {
-                    results.truncated |= cert.truncated;
+                    self.results.truncated |= cert.truncated;
+                }
+            }
+        }
+        out
+    }
+
+    /// Explore every memory.
+    fn exhaustive(&mut self) {
+        let mut seen: HashSet<Vec<Msg>> = HashSet::new();
+        let mut stack: Vec<Vec<Msg>> = vec![Vec::new()];
+        while let Some(mem) = stack.pop() {
+            if !seen.insert(mem.clone()) {
+                continue;
+            }
+            if self.cfg.max_memories.is_some_and(|m| self.results.stats.memories >= m) {
+                self.results.over_budget = true;
+                return;
+            }
+            self.finish(&mem);
+            let children = self.children(&mem, &|m| seen.contains(m));
+            stack.extend(children);
+        }
+    }
+
+    /// Explore `walks` random paths through the memories, each from the
+    /// empty memory until no promise can be added. A path that ends without
+    /// a final state backtracks: such dead ends are common with the
+    /// reduction, whose pruning can leave a memory with no way to complete.
+    fn sample(&mut self, walks: u64, seed: u64) {
+        self.results.sampled = true;
+        let mut rng = seed;
+        // Memories already finished, and whether they had final states.
+        let mut finished: HashMap<Vec<Msg>, bool> = HashMap::new();
+        // The children of each memory that are not known to be dead ends.
+        let mut children: HashMap<Vec<Msg>, Vec<Vec<Msg>>> = HashMap::new();
+        'walks: for _ in 0..walks {
+            let mut path: Vec<Vec<Msg>> = vec![Vec::new()];
+            while let Some(mem) = path.last().cloned() {
+                if !finished.contains_key(&mem) {
+                    let found = self.finish(&mem);
+                    finished.insert(mem.clone(), found);
+                }
+                if !children.contains_key(&mem) {
+                    let c = self.children(&mem, &|_| false);
+                    children.insert(mem.clone(), c);
+                }
+                let c = &children[&mem];
+                if !c.is_empty() {
+                    path.push(c[(splitmix64(&mut rng) % c.len() as u64) as usize].clone());
+                    continue;
+                }
+                if finished[&mem] {
+                    continue 'walks;
+                }
+                // A dead end: never come here again.
+                path.pop();
+                match path.last() {
+                    Some(parent) => children.get_mut(parent).unwrap().retain(|m| *m != mem),
+                    // Every memory has been explored.
+                    None => break 'walks,
                 }
             }
         }
     }
-    results
+}
+
+/// A small, fast pseudo-random generator (SplitMix64).
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }

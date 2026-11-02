@@ -51,7 +51,17 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
             writeln!(s, "Witnesses: Positive {} Negative {}", pos, neg).unwrap();
         }
         if o.stats.memories > 0 {
-            writeln!(s, "Explored {} promise memories", o.stats.memories).unwrap();
+            write!(s, "Explored {} promise memories", o.stats.memories).unwrap();
+            if o.stats.pruned > 0 {
+                write!(s, " ({} pruned by partial-order reduction)", o.stats.pruned).unwrap();
+            }
+            writeln!(s).unwrap();
+        }
+        if o.over_budget {
+            writeln!(s, "WARNING: the search stopped at its memory budget; other final states may be possible").unwrap();
+        }
+        if o.sampled {
+            writeln!(s, "WARNING: only sampled executions were explored; other final states may be possible").unwrap();
         }
         if o.stats.states > 0 {
             writeln!(s, "Explored {} states", o.stats.states).unwrap();
@@ -96,6 +106,9 @@ pub fn summary(test: &Test, results: &[(Model, Outcomes)]) -> String {
         write!(s, " {}:{:<9}", m.name(), observation(o, test)).unwrap();
         if o.truncated {
             s.push_str("(trunc)");
+        }
+        if o.sampled {
+            s.push_str("(sampled)");
         }
         if !o.faults.is_empty() {
             s.push_str("(fault)");

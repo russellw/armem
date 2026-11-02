@@ -16,6 +16,7 @@ pub mod litmus;
 pub mod memory;
 pub mod outcome;
 pub mod promising;
+pub mod reduce;
 pub mod report;
 
 use outcome::Outcomes;
@@ -46,11 +47,24 @@ pub struct Options {
     /// for W registers) are single-copy atomic, and so is any other
     /// non-exclusive access that stays within an aligned 16-byte block.
     pub lse2: bool,
+    /// Prune memories that differ only in the order of writes nothing can
+    /// observe the order of (see `reduce.rs`).
+    pub por: bool,
+    /// Instead of exploring every memory, follow this many random paths
+    /// through them. The final states found are possible, but others may be
+    /// missed.
+    pub sample: Option<u64>,
+    /// Seed for `sample`.
+    pub seed: u64,
+    /// Stop the ARM model's exhaustive search after this many memories,
+    /// setting `Outcomes::over_budget` (for tests that compare against a
+    /// search that may be too big).
+    pub max_memories: Option<u64>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false }
+        Options { fuel: 200, lse2: false, por: true, sample: None, seed: 0, max_memories: None }
     }
 }
 

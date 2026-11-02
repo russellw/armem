@@ -29,6 +29,8 @@ cargo build --release
 ./target/release/armem -m arm,sc,tso -f 500 FILE   # choose models / fuel
 ./target/release/armem --lse2 FILE                 # assume FEAT_LSE2 hardware
 ./target/release/armem --elf data.o FILE           # start from an ELF file's memory
+./target/release/armem --sample 100 FILE           # 100 random paths, for big tests
+./target/release/armem --no-por FILE               # without partial-order reduction
 cargo test --release                               # check the litmus suite
 ```
 
@@ -435,6 +437,41 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   are the product of the per-thread results. Candidate promises come from
   a solo exploration of the thread under the same model. A
   single-threaded test is run as SC, which is exact for a lone thread.
+* **Partial-order reduction** (`src/reduce.rs`, on by default; `--no-por`
+  turns it off). Every write another thread can see is a promise, so
+  `n` writes that nothing orders give `n!` memories, although the order of
+  writes to different locations usually cannot be observed. In Arm's
+  axiomatic model the memory order only has to extend the
+  *ordered-before* relation, so for each execution armem explores only
+  the least such order under a fixed priority on writes: a memory whose
+  last two writes are out of priority order is skipped when nothing can
+  order the first before the second. Whether something can is decided
+  from a sound pre-pass. It runs each thread alone with every load
+  returning any value some write may have stored, and finds what each
+  thread may read and where it uses acquires, releases, atomics,
+  barriers and dependencies. For example, two threads storing to four
+  locations each explore 2,242 memories in 2 s instead of 109,601 in 5
+  minutes. A compiled writer publishing a 32-byte struct to a reader
+  with release/acquire takes 0.6 s instead of 50 s. With relaxed
+  atomics, which previously did not finish in 10 minutes, it takes 11 s.
+  The argument (that any order extending ordered-before will do, also
+  with armem's mixed-size extension) is our own and not machine-checked,
+  so `tests/por.rs` checks that the reduction never changes the final
+  states: on every litmus test, with and without `--lse2`, and on random
+  tests mixing sizes, barriers, dependencies, acquire/release, exclusives
+  and atomics. `cargo test` runs 200 small random tests; larger ones,
+  which can take hours, run with
+  `cargo test --release --test por -- --ignored` and are worth running
+  after changing the model or the reduction. If the
+  pre-pass gets too big, or a thread accesses memory at an address it
+  cannot bound, it gives up and nothing is pruned.
+* **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
+  exhaustively, armem follows `N` random paths through the promise
+  memories instead of all of them. Each path adds random certified
+  promises until none is left, and backtracks from dead ends. Every final
+  state reported is reachable, but others may be missed, so a condition
+  reported `Never` only means the walks did not find it. The report says
+  the results are sampled.
 * **Mixed sizes**: memory is byte-addressed. Each write message has a
   footprint (address and size), and coherence and forwarding are tracked
   per byte. An aligned access is single-copy atomic: an aligned read
@@ -478,7 +515,8 @@ through SIMD&FP registers. Their expected ARMv8/TSO verdicts are in
 `litmus/expected.txt` (one line per test and option set; an optional
 `lse2` column runs the test with `--lse2`), and `cargo test` checks them.
 The tests also check that every SC outcome is reachable under TSO and
-under ARM, and that results are deterministic.
+under ARM, that results are deterministic, and that the partial-order
+reduction and sampling never change or invent final states.
 
 ## Validation against herd7
 
@@ -530,8 +568,12 @@ lets a lone `LDXP` be torn.
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
   atomics.
-* The search is exhaustive, so it suits small snippets. The number of
-  promise orders grows quickly with the number of writes.
+* The exhaustive search suits tests with tens of writes, not thousands.
+  The reduction removes orders nothing can observe, but writes that
+  other threads read in an order they can observe still multiply the
+  memories. Beyond that, `--sample` gives up completeness. Each memory
+  also costs a solo exploration of every thread, which grows with
+  the threads' own branching.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
   `STLR; LDAR` (ordered on ARM) can show as a TSO-only outcome.
 
@@ -548,9 +590,11 @@ lets a lone `LDXP` be torn.
    and the SIMD&FP loads, stores and moves that integer code uses (see
    [SIMD&FP registers](#simdfp-registers)); next come user-mode
    functions extracted from real programs.
-3. Scalable exploration for large programs: deterministic pseudo-random
-   (seeded) sampling of promise/read choices, partial-order reduction,
-   and prioritizing reads that disagree with what TSO would return.
+3. Scalable exploration for large programs: seeded sampling and a
+   partial-order reduction of promise orders are done (see
+   [How it works](#how-it-works)); next come guiding the sampling
+   towards reads that disagree with what TSO would return, and reducing
+   the cost of each memory's solo explorations.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

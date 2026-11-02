@@ -15,6 +15,12 @@ options:
   -s, --summary      print one line per test instead of full reports
       --lse2         model FEAT_LSE2 (16-byte atomic LDP/STP, atomic
                      unaligned accesses within a 16-byte block)
+      --sample N     follow N random paths through the ARM model's
+                     executions instead of exploring them all (for tests
+                     too big to explore exhaustively; may miss outcomes)
+      --seed N       random seed for --sample (default: 0)
+      --no-por       explore every order of writes, without partial-order
+                     reduction (slower; for checking the reduction)
       --elf FILE     start from the memory of an AArch64 ELF file (an
                      object file is relocated first); its global variables
                      can be named in the tests
@@ -39,6 +45,15 @@ fn main() -> ExitCode {
             }
             "-s" | "--summary" => summary = true,
             "--lse2" => opts.lse2 = true,
+            "--no-por" => opts.por = false,
+            "--sample" | "--seed" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(n) if a == "--sample" => opts.sample = Some(n),
+                Some(n) => opts.seed = n,
+                None => {
+                    eprintln!("{} needs a number", a);
+                    return ExitCode::from(2);
+                }
+            },
             "-m" | "--model" => {
                 let Some(v) = args.next() else {
                     eprintln!("--model needs an argument");

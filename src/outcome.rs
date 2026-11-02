@@ -61,6 +61,8 @@ impl Projection {
 pub struct Stats {
     /// Promising: number of distinct promise memories explored.
     pub memories: u64,
+    /// Promising: memories skipped by the partial-order reduction.
+    pub pruned: u64,
     /// Interleaving models: number of distinct global states explored.
     pub states: u64,
 }
@@ -76,12 +78,17 @@ pub struct Outcomes {
     /// thread's stack), each prefixed with the thread. Such an execution
     /// has no final state.
     pub faults: BTreeSet<String>,
+    /// Only some executions were sampled, so the set may be incomplete.
+    pub sampled: bool,
+    /// The search stopped at `Options::max_memories`, so the set may be
+    /// incomplete.
+    pub over_budget: bool,
     pub stats: Stats,
 }
 
 impl Outcomes {
     pub fn new(obs: Vec<Obs>) -> Outcomes {
-        Outcomes { obs, states: BTreeMap::new(), truncated: false, faults: BTreeSet::new(), stats: Stats::default() }
+        Outcomes { obs, states: BTreeMap::new(), truncated: false, faults: BTreeSet::new(), sampled: false, over_budget: false, stats: Stats::default() }
     }
 
     pub fn insert(&mut self, state: Vec<u64>) {

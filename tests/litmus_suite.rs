@@ -27,7 +27,7 @@ fn expectations() -> Vec<Expectation> {
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            let mut opts = armem::Options { fuel: FUEL, lse2: false };
+            let mut opts = armem::Options { fuel: FUEL, ..Default::default() };
             for o in &f[3..] {
                 match *o {
                     "lse2" => opts.lse2 = true,
@@ -95,7 +95,7 @@ fn sc_is_contained_in_weaker_models() {
 fn deterministic() {
     for name in ["IRIW", "spinlock-norelease", "PPOCA"] {
         let t = load(&name);
-        let opts = armem::Options { fuel: FUEL, lse2: false };
+        let opts = armem::Options { fuel: FUEL, ..Default::default() };
         let a = run(&t, Model::Arm, &opts);
         let b = run(&t, Model::Arm, &opts);
         assert_eq!(a.states, b.states);

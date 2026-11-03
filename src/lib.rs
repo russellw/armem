@@ -6,6 +6,7 @@
 //! memory model (bounded by a per-thread instruction budget, the "fuel").
 
 pub mod asm;
+pub mod bytemap;
 pub mod core;
 pub mod decode;
 pub mod elf;

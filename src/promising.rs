@@ -31,6 +31,7 @@
 //! includes dependencies through conditional selects and CAS comparisons.
 //! Pick dependencies order later writes, but not later reads.
 
+use crate::bytemap::ByteMap;
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::{FxHashMap, FxHashSet};
 use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
@@ -38,7 +39,7 @@ use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -109,9 +110,9 @@ struct TState {
     /// Latest release write (orders later LDAR, which is RCsc).
     v_rel: View,
     /// Per-byte coherence view.
-    coh: BTreeMap<u64, View>,
+    coh: ByteMap<View>,
     /// Forwarding bank: latest own write per byte.
-    fwd: BTreeMap<u64, Fwd>,
+    fwd: ByteMap<Fwd>,
     xcl: Option<Monitor>,
     /// Outstanding (unfulfilled) promises.
     promises: BTreeSet<View>,
@@ -130,15 +131,20 @@ impl TState {
             v_wnew: 0,
             v_cap: 0,
             v_rel: 0,
-            coh: BTreeMap::new(),
-            fwd: BTreeMap::new(),
+            coh: ByteMap::new(),
+            fwd: ByteMap::new(),
             xcl: None,
             promises: BTreeSet::new(),
         }
     }
 
     fn coh(&self, b: u64) -> View {
-        self.coh.get(&b).copied().unwrap_or(0)
+        self.coh.get(b).unwrap_or(0)
+    }
+
+    /// The greatest coherence view of the bytes `a..a + n`.
+    fn coh_max(&self, a: u64, n: u64) -> View {
+        self.coh.values(a, a + n).max().unwrap_or(0)
     }
 }
 
@@ -407,7 +413,7 @@ impl<'a> Solo<'a> {
             for (i, &t) in srcs.iter().enumerate().rev() {
                 let b = a + i as u64;
                 val = (val << 8) | self.byte_value(ext, b, t) as u128;
-                match st.fwd.get(&b) {
+                match st.fwd.get(b) {
                     Some(f) if f.ts == t => {
                         rview = rview.max(f.view);
                         if acquire {
@@ -421,10 +427,7 @@ impl<'a> Solo<'a> {
             let vpost = vpre.max(rview);
             let ppost = vpost.max(rpick).max(addr.pick);
             let mut s = st.clone();
-            for i in 0..n {
-                let b = a + i;
-                s.coh.insert(b, st.coh(b).max(vpost));
-            }
+            s.coh.update(a, a + n, |v| Some(v.unwrap_or(0).max(vpost)));
             if kind.noret {
                 s.v_rnoret = s.v_rnoret.max(vpost);
                 s.v_rnoret_p = s.v_rnoret_p.max(ppost);
@@ -485,10 +488,8 @@ impl<'a> Solo<'a> {
                 pick: addr.pick.max(data.pick),
                 xview: kind.xview,
             };
-            for b in a..a + n {
-                s.coh.insert(b, t);
-                s.fwd.insert(b, fwd);
-            }
+            s.coh.set(a, a + n, t);
+            s.fwd.set(a, a + n, fwd);
             s.v_wold = s.v_wold.max(t);
             s.v_cap = s.v_cap.max(addr.pick);
             if kind.release {
@@ -505,7 +506,7 @@ impl<'a> Solo<'a> {
             Some((srcs, others_only)) => self.atomic(ext, a, srcs, t, others_only),
             None => true,
         };
-        let coh_ok = |t: View| (a..a + n).all(|b| st.coh(b) < t);
+        let coh_ok = |t: View| st.coh_max(a, n) < t;
         let mut out = Vec::new();
         // Fulfill an outstanding promise.
         for &t in &st.promises {
@@ -866,7 +867,7 @@ impl<'a> Solo<'a> {
     fn doomed(&self, st: &TState, ext: &[Msg]) -> bool {
         st.promises.iter().any(|&t| {
             let m = self.msg(ext, t);
-            st.v_wnew >= t || st.v_cap >= t || (m.addr..m.addr + m.size.bytes()).any(|b| st.coh(b) >= t)
+            st.v_wnew >= t || st.v_cap >= t || st.coh_max(m.addr, m.size.bytes()) >= t
         })
     }
 

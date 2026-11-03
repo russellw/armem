@@ -445,12 +445,12 @@ is an address: `out_a=out_b` means "`out_a` holds the address of
 
 The seqlock and ring buffer tests take at most 0.3 s each. Larger rings
 take longer, mostly because of the number of promise memories when
-`head` is relaxed: with one slot and three items, 70 memories in 1 s;
-with two slots and three items, 583 memories in 17 s (`tail` relaxed: 44
-memories in 0.5 s). `--sample 20` finds the bug in under 5 s.
+`head` is relaxed: with one slot and three items, 70 memories in 0.2 s;
+with two slots and three items, 583 memories in 1.7 s (`tail` relaxed:
+44 memories in 0.2 s).
 
-The `dcl` tests take at most 0.2 s when correct, and up to 9 s (at
-`-O0`) with the lock's release relaxed. At `-O2` that variant takes 3.5
+The `dcl` tests take at most 0.2 s when correct, and up to 2.5 s (at
+`-O0`) with the lock's release relaxed. At `-O2` that variant takes 1
 s; before the reduction's pre-pass kept whole values (see [How it
 works](#how-it-works)), it took 21 s. Two choices keep them that fast.
 Each thread records whether it constructed the object in its own
@@ -462,13 +462,13 @@ compare-and-swap rather than exchange: a failed exchange still writes,
 so each turn of a spinning thread adds a write (with exchange, the
 correct program took over 10 minutes).
 
-The `refcount` tests take under 1 s each. The correct `treiber` takes 8
-s at `-O2` (about 300 memories) and 20 s at `-O0`. With `PUSH` relaxed,
+The `refcount` tests take under 1 s each. The correct `treiber` takes
+0.6 s at `-O2` (315 memories) and 1.1 s at `-O0`. With `PUSH` relaxed,
 nothing orders the pusher's writes, and the popper sees them in many
-orders: the exhaustive search does not finish in 10 minutes, so
-`expected.txt` checks it with `sample=20` (20 random paths, which find
-the bug in 4 s). A line may give `sample=N` only when the condition is
-expected to be reachable, since sampling may miss states.
+orders: the exhaustive search explores 7,824 memories in 15 s. For
+tests too big for that, a line of `expected.txt` may give `sample=N`
+(`N` random paths), but only when the condition is expected to be
+reachable, since sampling may miss states.
 
 ### Calls
 
@@ -588,6 +588,17 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   widening in the reduction's pre-pass (below), this cut the `-O0`
   seqlock of [C programs](#c-programs) from 20-63 s to 1-10 s, and
   private memory (below) to 0.1-0.3 s.
+
+  A solo exploration drops any state with a promise it can no longer
+  fulfill. Fulfilling promise `t` needs the thread's write views and the
+  coherence view of each of its bytes to be below `t`, and these never
+  decrease, so once one reaches `t` no run from that state certifies or
+  completes. Without this, a failed certification explored every
+  reachable state before giving up, and most certifications fail: on
+  the Treiber stack with its push's release relaxed, about 5 in 6. That
+  test now takes 15 s instead of 6 minutes 43 s (the same 7,824
+  memories), and the ring buffer with `head` relaxed, 2 slots and 3
+  items, 1.7 s instead of 17 s.
 * **Partial-order reduction** (`src/reduce.rs`, on by default; `--no-por`
   turns it off). Every write another thread can see is a promise, so
   `n` writes that nothing orders give `n!` memories, although the order of
@@ -807,11 +818,12 @@ lets a lone `LDXP` be torn.
    once and in order of steps used, private memory, and finding which
    reads each dependency orders (the last took the ring buffer with
    `head` relaxed, 2 slots and 3 items, from 2,745 memories in 3 minutes
-   43 s to 583 in 20 s); next come
-   reducing the cost of each memory's solo explorations (mostly
-   certification), and guiding the sampling towards reads that disagree
-   with what TSO would return. The Treiber stack with its push's release
-   relaxed, which takes over 10 minutes, is a good benchmark.
+   43 s to 583 in 20 s), and dropping states with a promise that can no
+   longer be fulfilled (the Treiber stack with its push's release
+   relaxed, from 6 minutes 43 s to 15 s); next come reducing the cost of
+   each solo exploration's states, mostly hashing and copying them for
+   the visited set, and guiding the sampling towards reads that disagree
+   with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

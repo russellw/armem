@@ -858,6 +858,16 @@ impl<'a> Solo<'a> {
         out
     }
 
+    /// Can some outstanding promise no longer be fulfilled? Fulfilling
+    /// promise `t` needs `v_wnew`, `v_cap` and the coherence view of each of
+    /// its bytes to be below `t`, and none of them ever decreases.
+    fn doomed(&self, st: &TState, ext: &[Msg]) -> bool {
+        st.promises.iter().any(|&t| {
+            let m = self.msg(ext, t);
+            st.v_wnew >= t || st.v_cap >= t || (m.addr..m.addr + m.size.bytes()).any(|b| st.coh(b) >= t)
+        })
+    }
+
     fn run(&mut self, start: TState) {
         let mut queue = StepQueue::new();
         queue.push(start.core.steps, (start, Vec::new()));
@@ -865,6 +875,11 @@ impl<'a> Solo<'a> {
             if self.mode == Mode::Certify && st.promises.is_empty() {
                 self.certified = true;
                 return;
+            }
+            // A run with a promise it can no longer fulfill can neither
+            // certify nor complete, nor lead to a certifiable candidate.
+            if self.doomed(&st, &ext) {
+                continue;
             }
             // A state already reached with no more steps used has nothing new
             // to offer; this collapses spin loops.

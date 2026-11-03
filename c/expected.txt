@@ -62,8 +62,7 @@ refcount -O0 no no -DDEC=__ATOMIC_RELAXED
 refcount -O0 no no -DACQ=__ATOMIC_RELAXED
 
 treiber -O2 no no
-# Too big to explore exhaustively (over 10 minutes); 20 random paths find it.
-treiber -O2 yes no -DPUSH=__ATOMIC_RELAXED sample=20
+treiber -O2 yes no -DPUSH=__ATOMIC_RELAXED
 # Ordered on ARM by the address dependency from the load of top.
 treiber -O2 no no -DPOP=__ATOMIC_RELAXED
 treiber -O0 no no

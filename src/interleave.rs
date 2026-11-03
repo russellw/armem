@@ -15,10 +15,12 @@
 //! the interleavings.
 
 use crate::core::{Core, MemOp, RV, Step, VR, low_bytes, pair_value, rmw_result, split_pair};
+use crate::hash::FxHashMap;
 use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::Outcomes;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -119,7 +121,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
     // Visited states (step counters zeroed) -> per-thread step counts when
     // last explored. A state reached again with no thread having used fewer
     // steps cannot lead anywhere new; this collapses spin loops.
-    let mut seen: HashMap<Global, Vec<u32>> = HashMap::new();
+    let mut seen: FxHashMap<Global, Vec<u32>> = FxHashMap::default();
     let mut stack = vec![start];
     while let Some(g) = stack.pop() {
         let mut key = g.clone();
@@ -127,10 +129,11 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
         for t in key.threads.iter_mut() {
             t.core.steps = 0;
         }
-        match seen.get(&key) {
-            Some(prev) if prev.iter().zip(&steps).all(|(p, s)| p <= s) => continue,
-            _ => {
-                seen.insert(key, steps);
+        match seen.entry(key) {
+            Entry::Occupied(e) if e.get().iter().zip(&steps).all(|(p, s)| p <= s) => continue,
+            Entry::Occupied(mut e) => *e.get_mut() = steps,
+            Entry::Vacant(e) => {
+                e.insert(steps);
             }
         }
         results.stats.states += 1;

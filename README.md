@@ -445,12 +445,12 @@ is an address: `out_a=out_b` means "`out_a` holds the address of
 
 The seqlock and ring buffer tests take at most 0.3 s each. Larger rings
 take longer, mostly because of the number of promise memories when
-`head` is relaxed: with one slot and three items, 70 memories in 0.2 s;
-with two slots and three items, 583 memories in 1.7 s (`tail` relaxed:
-44 memories in 0.2 s).
+`head` is relaxed: with one slot and three items, 70 memories in 0.1 s;
+with two slots and three items, 583 memories in 0.9 s (`tail` relaxed:
+44 memories in 0.1 s).
 
-The `dcl` tests take at most 0.2 s when correct, and up to 2.5 s (at
-`-O0`) with the lock's release relaxed. At `-O2` that variant takes 1
+The `dcl` tests take at most 0.2 s when correct, and up to 1.4 s (at
+`-O0`) with the lock's release relaxed. At `-O2` that variant takes 0.6
 s; before the reduction's pre-pass kept whole values (see [How it
 works](#how-it-works)), it took 21 s. Two choices keep them that fast.
 Each thread records whether it constructed the object in its own
@@ -463,9 +463,9 @@ so each turn of a spinning thread adds a write (with exchange, the
 correct program took over 10 minutes).
 
 The `refcount` tests take under 1 s each. The correct `treiber` takes
-0.6 s at `-O2` (315 memories) and 1.1 s at `-O0`. With `PUSH` relaxed,
+0.3 s at `-O2` (315 memories) and 0.6 s at `-O0`. With `PUSH` relaxed,
 nothing orders the pusher's writes, and the popper sees them in many
-orders: the exhaustive search explores 7,824 memories in 15 s. For
+orders: the exhaustive search explores 7,824 memories in 9 s. For
 tests too big for that, a line of `expected.txt` may give `sample=N`
 (`N` random paths), but only when the condition is expected to be
 reachable, since sampling may miss states.
@@ -599,6 +599,12 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   test now takes 15 s instead of 6 minutes 43 s (the same 7,824
   memories), and the ring buffer with `head` relaxed, 2 slots and 3
   items, 1.7 s instead of 17 s.
+
+  The visited sets of the solo explorations, the reduction's pre-pass
+  and the reference models use a fast hasher of their own (`src/hash.rs`,
+  after `rustc-hash`) rather than the standard library's SipHash, and
+  look each state up once. Hashing whole thread states had taken half
+  the time; the relaxed Treiber stack went from 15 s to 9 s.
 * **Partial-order reduction** (`src/reduce.rs`, on by default; `--no-por`
   turns it off). Every write another thread can see is a promise, so
   `n` writes that nothing orders give `n!` memories, although the order of
@@ -820,9 +826,10 @@ lets a lone `LDXP` be torn.
    `head` relaxed, 2 slots and 3 items, from 2,745 memories in 3 minutes
    43 s to 583 in 20 s), and dropping states with a promise that can no
    longer be fulfilled (the Treiber stack with its push's release
-   relaxed, from 6 minutes 43 s to 15 s); next come reducing the cost of
-   each solo exploration's states, mostly hashing and copying them for
-   the visited set, and guiding the sampling towards reads that disagree
+   relaxed, from 6 minutes 43 s to 15 s, and with a faster hasher to
+   9 s); next come reducing the cost of each solo exploration's states,
+   now mostly copying the per-byte coherence and forwarding maps (which
+   could be kept as ranges), and guiding the sampling towards reads that disagree
    with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory

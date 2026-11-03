@@ -9,6 +9,7 @@ pub mod asm;
 pub mod core;
 pub mod decode;
 pub mod elf;
+pub mod hash;
 pub mod image;
 pub mod interleave;
 pub mod isa;

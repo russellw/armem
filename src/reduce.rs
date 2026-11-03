@@ -60,9 +60,11 @@
 //! analysis gives up (or gets too big), nothing is pruned.
 
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
+use crate::hash::FxHashMap;
 use crate::isa::{Addr, Barrier, Code, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::Test;
 use crate::promising::Msg;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Most values the analysis lets one read return before it treats the
@@ -571,16 +573,17 @@ impl<'a> Havoc<'a> {
 
     /// Explore every run of the thread. None if the analysis gives up.
     fn run(&mut self, start: Core) -> Option<()> {
-        let mut visited: HashMap<HState, u32> = HashMap::new();
+        let mut visited: FxHashMap<HState, u32> = FxHashMap::default();
         let mut queue = StepQueue::new();
         queue.push(start.steps, (start, None, Own::new(), false));
         while let Some(st) = queue.pop() {
             let mut key = st.clone();
             key.0.steps = 0;
-            match visited.get(&key) {
-                Some(&n) if n <= st.0.steps => continue,
-                _ => {
-                    visited.insert(key, st.0.steps);
+            match visited.entry(key) {
+                Entry::Occupied(e) if *e.get() <= st.0.steps => continue,
+                Entry::Occupied(mut e) => *e.get_mut() = st.0.steps,
+                Entry::Vacant(e) => {
+                    e.insert(st.0.steps);
                 }
             }
             *self.budget = self.budget.checked_sub(1)?;

@@ -32,11 +32,13 @@
 //! Pick dependencies order later writes, but not later reads.
 
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
+use crate::hash::{FxHashMap, FxHashSet};
 use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -204,7 +206,7 @@ struct Solo<'a> {
     lse2: bool,
     mode: Mode,
     /// Visited states (with the step counter zeroed) -> fewest steps seen.
-    visited: HashMap<(TState, Vec<Msg>), u32>,
+    visited: FxHashMap<(TState, Vec<Msg>), u32>,
     candidates: BTreeSet<Candidate>,
     finals: BTreeSet<Vec<u64>>,
     final_regs: &'a [u8],
@@ -255,7 +257,7 @@ impl<'a> Solo<'a> {
             fuel: cfg.fuel,
             lse2: cfg.lse2,
             mode,
-            visited: HashMap::new(),
+            visited: FxHashMap::default(),
             candidates: BTreeSet::new(),
             finals: BTreeSet::new(),
             final_regs: &proj.thread_regs[tid],
@@ -885,11 +887,11 @@ impl<'a> Solo<'a> {
             // to offer; this collapses spin loops.
             let mut key = st.clone();
             key.core.steps = 0;
-            let key = (key, ext.clone());
-            match self.visited.get(&key) {
-                Some(&n) if n <= st.core.steps => continue,
-                _ => {
-                    self.visited.insert(key, st.core.steps);
+            match self.visited.entry((key, ext.clone())) {
+                Entry::Occupied(e) if *e.get() <= st.core.steps => continue,
+                Entry::Occupied(mut e) => *e.get_mut() = st.core.steps,
+                Entry::Vacant(e) => {
+                    e.insert(st.core.steps);
                 }
             }
             if st.core.steps >= self.fuel && st.core.pc < self.prog.instrs.len() {
@@ -1042,7 +1044,7 @@ impl<'a> Explorer<'a> {
 
     /// Explore every memory.
     fn exhaustive(&mut self) {
-        let mut seen: HashSet<Vec<Msg>> = HashSet::new();
+        let mut seen: FxHashSet<Vec<Msg>> = FxHashSet::default();
         let mut stack: Vec<Vec<Msg>> = vec![Vec::new()];
         while let Some(mem) = stack.pop() {
             if !seen.insert(mem.clone()) {
@@ -1065,9 +1067,9 @@ impl<'a> Explorer<'a> {
         self.results.sampled = true;
         let mut rng = seed;
         // Memories already finished, and whether they had final states.
-        let mut finished: HashMap<Vec<Msg>, bool> = HashMap::new();
+        let mut finished: FxHashMap<Vec<Msg>, bool> = FxHashMap::default();
         // The children of each memory that are not known to be dead ends.
-        let mut children: HashMap<Vec<Msg>, Vec<Vec<Msg>>> = HashMap::new();
+        let mut children: FxHashMap<Vec<Msg>, Vec<Vec<Msg>>> = FxHashMap::default();
         'walks: for _ in 0..walks {
             let mut path: Vec<Vec<Msg>> = vec![Vec::new()];
             while let Some(mem) = path.last().cloned() {

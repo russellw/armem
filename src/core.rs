@@ -107,6 +107,11 @@ pub fn stack_range(tid: usize) -> (u64, u64) {
 /// stack (another thread's stack, a guard slot, or across the edge of its
 /// own), or to access its stack with an exclusive, atomic, acquire or
 /// release instruction.
+///
+/// Private memory outside the stack may also be accessed with exclusive and
+/// atomic instructions that neither acquire nor release. The memory model
+/// performs those (a store-exclusive may fail, and so has two outcomes), but
+/// with `private_load` and `private_store` rather than with write messages.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stack {
     pub lo: u64,
@@ -144,6 +149,17 @@ enum Place {
     Fault(String),
 }
 
+/// The kind of an access, for deciding where it goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// A load or store with no exclusive, atomic or ordering semantics.
+    Plain,
+    /// An exclusive or atomic access that neither acquires nor releases.
+    Atomic,
+    /// An acquire or release access.
+    Ordered,
+}
+
 impl Stack {
     pub fn new(tid: usize, threads: usize) -> Stack {
         let (lo, hi) = stack_range(tid);
@@ -152,9 +168,11 @@ impl Stack {
 
     /// Treat `ranges` (sorted and disjoint) as private to the thread: memory
     /// that no other thread reads or writes, and that this thread accesses
-    /// only with plain loads and stores, each one wholly inside the ranges
-    /// or wholly outside them. Such accesses are performed like those to
-    /// the stack. `init` gives the initial value of each byte.
+    /// with no acquire or release instruction, each access wholly inside the
+    /// ranges or wholly outside them. Plain loads and stores to it are
+    /// performed like those to the stack; exclusive and atomic accesses are
+    /// left to the memory model (see `is_private`). `init` gives the initial
+    /// value of each byte.
     pub fn set_private(&mut self, ranges: Arc<Vec<(u64, u64)>>, init: &dyn Fn(u64) -> u8) {
         for &(a, b) in ranges.iter() {
             for x in a..b {
@@ -170,14 +188,22 @@ impl Stack {
         self.bytes.get(&b).map(|e| e.0)
     }
 
-    /// Classify an access of `len` bytes at `a`. `plain`: a load or store
-    /// with no exclusive, atomic or ordering semantics.
-    fn place(&self, a: u64, len: u64, plain: bool) -> Place {
+    /// Whether `len` bytes at `a` are in the private memory set by
+    /// `set_private` (not the stack). An exclusive or atomic access there is
+    /// performed with `Core::private_load` and `Core::private_store`.
+    pub fn is_private(&self, a: u64, len: u64) -> bool {
+        let ranges = &self.private.0;
+        let end = a.saturating_add(len);
+        ranges.get(ranges.partition_point(|&(_, q)| q <= a)).is_some_and(|&(p, q)| a >= p && end <= q)
+    }
+
+    /// Classify an access of `len` bytes at `a`.
+    fn place(&self, a: u64, len: u64, access: Access) -> Place {
         let Some(end) = a.checked_add(len) else {
             return Place::Memory;
         };
         if a >= self.lo && end <= self.hi {
-            if plain {
+            if access == Access::Plain {
                 return Place::Stack;
             }
             return Place::Fault(format!(
@@ -188,8 +214,11 @@ impl Stack {
         let ranges = &self.private.0;
         if let Some(&(p, q)) = ranges.get(ranges.partition_point(|&(_, q)| q <= a)) {
             if end > p {
-                return if a >= p && end <= q && plain {
+                return if a >= p && end <= q && access == Access::Plain {
                     Place::Stack
+                } else if a >= p && end <= q && access == Access::Atomic {
+                    // Performed by the memory model (see `is_private`).
+                    Place::Memory
                 } else {
                     Place::Fault(format!(
                         "internal error: {}-byte access at {:#x} to memory found private to the thread ({:#x}..{:#x})",
@@ -488,6 +517,26 @@ impl Core {
         self.stack.write(a.val + off, size.bytes(), data.val as u128, a.view.max(data.view), a.pick.max(data.pick));
     }
 
+    /// For an exclusive or atomic access to private memory (see
+    /// `Stack::is_private`): read `size` bytes at `a` as a stack load does.
+    /// Returns the value and its dependencies (those of the stores it comes
+    /// from and of `a`), as an `RV` whose value is unused.
+    pub fn private_load(&self, a: RV, size: Size) -> (u128, RV) {
+        let (v, view, pick) = self.stack.read(a.val, size.bytes());
+        let view = view.max(a.view);
+        (v, RV { val: 0, view, pick: pick.max(a.pick).max(view) })
+    }
+
+    /// For an exclusive or atomic access to private memory: write `val`
+    /// (`size` bytes) at `a`, whose data has dependencies `data`, as a stack
+    /// store does. Returns the (pick) view of its address and data, which,
+    /// as for `Step::Local`'s `write`, the memory model must place the write
+    /// after.
+    pub fn private_store(&mut self, a: RV, size: Size, val: u128, data: RV) -> View {
+        self.stack.write(a.val, size.bytes(), val, a.view.max(data.view), a.pick.max(data.pick));
+        data.pick.max(data.view).max(a.pick)
+    }
+
     /// Load SIMD&FP register `v` from `size` bytes at `a + off` on the stack.
     fn stack_vload(&mut self, a: RV, off: u64, size: Size, v: VReg) {
         let (val, view, pick) = self.stack.read(a.val + off, size.bytes());
@@ -499,23 +548,41 @@ impl Core {
     /// return what to do instead: `Some(step)` for an access to memory (or
     /// a fault).
     fn stack_access(&mut self, ins: Instr) -> Option<Step> {
-        let (addr, len, plain) = match ins {
-            Instr::Load { addr, size, kind, excl, .. } => (addr, size.bytes(), kind == LoadKind::Plain && !excl),
-            Instr::Store { addr, size, release, .. } => (addr, size.bytes(), !release),
-            Instr::LoadPair { addr, size, .. } | Instr::StorePair { addr, size, .. } => (addr, 2 * size.bytes(), true),
-            Instr::StoreExcl { addr, size, .. } | Instr::Rmw { addr, size, .. } | Instr::Cas { addr, size, .. } => {
-                (addr, size.bytes(), false)
+        let atomic = |ordered: bool| if ordered { Access::Ordered } else { Access::Atomic };
+        let (addr, len, access) = match ins {
+            Instr::Load { addr, size, kind, excl, .. } => (
+                addr,
+                size.bytes(),
+                match (kind, excl) {
+                    (LoadKind::Plain, false) => Access::Plain,
+                    (LoadKind::Plain, true) => Access::Atomic,
+                    _ => Access::Ordered,
+                },
+            ),
+            Instr::Store { addr, size, release, .. } => {
+                (addr, size.bytes(), if release { Access::Ordered } else { Access::Plain })
             }
-            Instr::LoadExclPair { addr, rt, .. } | Instr::StoreExclPair { addr, rt, .. } => {
-                (addr, 2 * Size::of(rt).bytes(), false)
+            Instr::LoadPair { addr, size, .. } | Instr::StorePair { addr, size, .. } => {
+                (addr, 2 * size.bytes(), Access::Plain)
             }
+            Instr::StoreExcl { addr, size, release, .. } => (addr, size.bytes(), atomic(release)),
+            // An atomic whose loaded value is discarded does not acquire
+            // (as in `step`).
+            Instr::Rmw { addr, size, rt, acquire, release, .. } => {
+                (addr, size.bytes(), atomic(acquire && rt.idx != ZR || release))
+            }
+            Instr::Cas { addr, size, rs, acquire, release, .. } => {
+                (addr, size.bytes(), atomic(acquire && rs.idx != ZR || release))
+            }
+            Instr::LoadExclPair { addr, rt, acquire, .. } => (addr, 2 * Size::of(rt).bytes(), atomic(acquire)),
+            Instr::StoreExclPair { addr, rt, release, .. } => (addr, 2 * Size::of(rt).bytes(), atomic(release)),
             Instr::VLoad { addr, vt2, size, .. } | Instr::VStore { addr, vt2, size, .. } => {
-                (addr, size.bytes() * if vt2.is_some() { 2 } else { 1 }, true)
+                (addr, size.bytes() * if vt2.is_some() { 2 } else { 1 }, Access::Plain)
             }
             _ => return None,
         };
         let a = self.addr(&addr);
-        match self.stack.place(a.val, len, plain) {
+        match self.stack.place(a.val, len, access) {
             Place::Memory => return None,
             Place::Fault(e) => return Some(Step::Fault(e)),
             Place::Stack => {}

@@ -100,8 +100,6 @@ pub struct Reduction {
     reads: Vec<Footprints>,
     /// All writes.
     writes: Vec<Footprints>,
-    /// Exclusive reads.
-    exclusive_reads: Vec<Footprints>,
     /// Acquire reads (including those of atomics).
     acquire_reads: Vec<Footprints>,
     /// Release writes (including those of atomics).
@@ -165,17 +163,20 @@ impl Reduction {
 impl Reduction {
     /// The memory private to each thread, as sorted, disjoint byte ranges:
     /// bytes that no other thread may read or write, and that the thread
-    /// accesses only with plain loads and stores. Every access of the
-    /// thread, and every location in `observed`, lies either wholly in a
-    /// thread's private memory or wholly outside it.
+    /// accesses with no acquire or release instruction (exclusive and
+    /// atomic ones included). Every access of the thread, and every
+    /// location in `observed`, lies either wholly in a thread's private
+    /// memory or wholly outside it.
     pub fn private(&self, observed: &[(u64, u64)]) -> Vec<Vec<(u64, u64)>> {
         let n = self.reads.len();
         let bytes = |f: &Footprints| -> BTreeSet<u64> { f.iter().flat_map(|&(a, len)| a..a + len).collect() };
-        let accessed: Vec<BTreeSet<u64>> = (0..n).map(|t| &bytes(&self.reads[t]) | &bytes(&self.writes[t])).collect();
+        // A store-exclusive's footprint counts even if it never succeeds.
+        let accessed: Vec<BTreeSet<u64>> =
+            (0..n).map(|t| &(&bytes(&self.reads[t]) | &bytes(&self.writes[t])) | &bytes(&self.atomic_writes[t])).collect();
         let mut private: Vec<BTreeSet<u64>> = (0..n)
             .map(|t| {
                 let mut p = accessed[t].clone();
-                for f in [&self.acquire_reads[t], &self.release_writes[t], &self.atomic_writes[t], &self.exclusive_reads[t]] {
+                for f in [&self.acquire_reads[t], &self.release_writes[t]] {
                     p.retain(|b| !bytes(f).contains(b));
                 }
                 for (u, other) in accessed.iter().enumerate() {
@@ -189,7 +190,7 @@ impl Reduction {
         // An access or location partly private is made wholly shared, until
         // none is left.
         let fps: Vec<(u64, u64)> = (0..n)
-            .flat_map(|t| self.reads[t].iter().chain(&self.writes[t]).copied())
+            .flat_map(|t| self.reads[t].iter().chain(&self.writes[t]).chain(&self.atomic_writes[t]).copied())
             .chain(observed.iter().copied())
             .collect();
         loop {
@@ -385,7 +386,6 @@ struct Havoc<'a> {
     addr_dep: bool,
     /// Footprints of all writes, and of exclusive reads.
     write_fps: Footprints,
-    exclusive_reads: Footprints,
     /// Instructions that read memory, with the footprints of their reads.
     read_pcs: BTreeMap<usize, Footprints>,
     /// Set when finding dependencies.
@@ -422,7 +422,6 @@ impl<'a> Havoc<'a> {
             budget,
             reads: Footprints::new(),
             write_fps: Footprints::new(),
-            exclusive_reads: Footprints::new(),
             acquire_reads: Footprints::new(),
             release_writes: Footprints::new(),
             atomic_writes: Footprints::new(),
@@ -645,9 +644,6 @@ impl<'a> Havoc<'a> {
         };
         match op {
             MemOp::Load { addr, rt, size, signed, excl, kind } => {
-                if excl {
-                    self.exclusive_reads.insert((addr.val, size.bytes()));
-                }
                 for (v, t) in self.read(&own, addr, size.bytes(), kind != LoadKind::Plain) {
                     let mut c = core.clone();
                     c.set(rt, reg(size.extend(v as u64, signed), t));
@@ -656,7 +652,6 @@ impl<'a> Havoc<'a> {
             }
             MemOp::LoadExclPair { addr, rt, rt2, size, acquire } => {
                 let total = size.double();
-                self.exclusive_reads.insert((addr.val, total.bytes()));
                 for (v, t) in self.read(&own, addr, total.bytes(), acquire) {
                     let (lo, hi) = split_pair(v, size);
                     let mut c = core.clone();
@@ -834,7 +829,6 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
     let mut red = Reduction {
         reads: vec![Footprints::new(); n],
         writes: vec![Footprints::new(); n],
-        exclusive_reads: vec![Footprints::new(); n],
         acquire_reads: vec![Footprints::new(); n],
         release_writes: vec![Footprints::new(); n],
         atomic_writes: vec![Footprints::new(); n],
@@ -872,7 +866,6 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
             addr_dep[tid] |= h.addr_dep;
             red.reads[tid].append(&mut h.reads);
             red.writes[tid].append(&mut h.write_fps);
-            red.exclusive_reads[tid].append(&mut h.exclusive_reads);
             red.acquire_reads[tid].append(&mut h.acquire_reads);
             red.release_writes[tid].append(&mut h.release_writes);
             red.atomic_writes[tid].append(&mut h.atomic_writes);

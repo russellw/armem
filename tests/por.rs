@@ -81,7 +81,9 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
         let mut label = 0;
         let accesses = 2 + rng.below(if large { 3 } else { 4 - threads });
         for k in 0..accesses {
-            let loc = format!("X{}", 1 + rng.below(3));
+            // Sometimes the thread's own location (X4), which only it
+            // accesses: private memory, even for its atomics.
+            let loc = format!("X{}", if rng.below(5) == 0 { 4 } else { 1 + rng.below(3) });
             let val = 1 + tid * 4 + k;
             let mut fresh = || {
                 let r = format!("W{}", next_reg);
@@ -114,6 +116,14 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
                 None => format!("[{}]", loc),
             };
             match rng.below(13) {
+                // An exclusive pair, on the thread's own location.
+                12 if loc == "X4" && rng.below(2) == 0 => {
+                    let (r, r2, s) = (fresh(), fresh(), fresh());
+                    code.push(format!("{} {},{},[X4]", ["LDXP", "LDAXP"][rng.below(2)], r, r2));
+                    code.push(format!("ADD W9,{},#{}", r, val));
+                    code.push(format!("{} {},W9,{},[X4]", ["STXP", "STLXP"][rng.below(2)], s, r2));
+                    loaded.push(r);
+                }
                 0..=3 => {
                     // Store, sometimes data-dependent on an earlier load.
                     if !loaded.is_empty() && rng.below(3) == 0 {
@@ -163,7 +173,7 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
     let rows = cols.iter().map(Vec::len).max().unwrap();
     let mut src = format!("AArch64 random-{}\n{{ uint32_t x; uint32_t y; uint32_t z;", n);
     for tid in 0..threads {
-        src.push_str(&format!(" {0}:X1=x; {0}:X2=y; {0}:X3=z;", tid));
+        src.push_str(&format!(" uint64_t p{0}; {0}:X1=x; {0}:X2=y; {0}:X3=z; {0}:X4=p{0};", tid));
     }
     src.push_str(" }\n");
     src.push_str(&(0..threads).map(|t| format!("P{}", t)).collect::<Vec<_>>().join(" | "));
@@ -173,7 +183,8 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
         src.push_str(&row.join(" | "));
         src.push_str(" ;\n");
     }
-    src.push_str(&format!("locations [x; y; z; {}]\n", observed.join("; ")));
+    let own: Vec<String> = (0..threads).map(|t| format!("p{}", t)).collect();
+    src.push_str(&format!("locations [x; y; z; {}; {}]\n", own.join("; "), observed.join("; ")));
     src
 }
 

@@ -468,7 +468,9 @@ nothing orders the pusher's writes, and the popper sees them in many
 orders: the exhaustive search explores 7,824 memories in 5 s. For
 tests too big for that, a line of `expected.txt` may give `sample=N`
 (`N` random paths), but only when the condition is expected to be
-reachable, since sampling may miss states.
+reachable, since sampling may miss states. A line may also give
+`fuel=N`, for a program whose threads need more than the default 1,000
+instructions each.
 
 ### Concurrency Kit
 
@@ -575,6 +577,25 @@ stopped waiting, and freed the object that the reader still reads. With
 one section, the bug does not appear: the record's starting epoch, 0,
 is never current, so the writer waits for the section to end. The tests
 take up to 4 s (at `-O0`).
+
+`ck_epoch_poll.c` reclaims through `ck_epoch_poll` instead, which never
+waits. The writer replaces the pointer, defers freeing the old object
+with `ck_epoch_call`, and polls twice; the reader again reads the object
+in two sections. It is correct, and the tests take 3.4 s at `-O2` and
+7.3 s at `-O0` (which needs `fuel=2000`). The writer's deferred lists
+are private memory even though ck pops them with an atomic exchange (see
+[How it works](#how-it-works)); before atomics could be private, the
+tests took over 2 minutes.
+
+ck commit `d1b348c` (June 2026) changed which deferred objects a poll
+may free ("This held in production only due to x86 store / atomic
+ordering guarantees but falls apart on RMO"). With the poll from before
+that commit, this test is also correct, as are versions with three
+sections and three polls (about 100 s each). That fits ck's own
+comments: the old poll fails only when `ck_epoch_call` files an object
+under an epoch that another thread has already advanced, so it needs a
+second thread that polls. With that third thread, neither exhaustive
+search nor 3,000 sampled paths finish within 200 s.
 
 ### Calls
 
@@ -775,7 +796,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   only one thread uses, are often in memory that no other thread
   accesses. The reduction's pre-pass finds each thread's private memory:
   bytes that no other thread may read or write, and that the thread
-  accesses only with plain loads and stores. A byte is private only if
+  accesses with no acquire or release instruction. A byte is private only if
   every access to it, and every location the test observes, lies wholly
   in private memory or wholly outside it. The core performs accesses to
   it like those to the stack (see [Stacks](#stacks)), so they make no
@@ -790,6 +811,20 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   litmus test and random test, the final states with private memory
   alone, and with private memory and the reduction, must equal those
   with neither.
+  Exclusive and atomic instructions that neither acquire nor release may
+  access private memory too. The model performs them (a store-exclusive
+  may always fail, and a successful `CAS` may leave `Rs` with the value
+  from either memory or the register), but on the thread's private bytes,
+  as a load and then a store, rather than with write messages. No other
+  thread writes those bytes, so the access is trivially atomic, and the
+  ordering that sets atomics apart only matters to acquire reads, which
+  are never private. This is what makes `ck_epoch_poll` tractable (see
+  [Concurrency Kit](#concurrency-kit)): ck pops a thread's lists of
+  deferred objects with an atomic exchange. While those were shared
+  writes, one poll against one reader's section took over 60 s; it now
+  takes 0.1 s. The random tests give each thread a location of its own,
+  which it sometimes accesses with atomics and exclusive pairs, to check
+  this.
 * **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
   exhaustively, armem follows `N` random paths through the promise
   memories instead of all of them. Each path adds random certified
@@ -903,7 +938,8 @@ lets a lone `LDXP` be torn.
   Arm's model).
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
-  atomics.
+  atomics (other private memory can, if they neither acquire nor
+  release).
 * The exhaustive search suits tests with tens of shared writes, not
   thousands. The reduction removes orders nothing can observe, and
   private memory removes writes no other thread can see, but writes that
@@ -935,8 +971,8 @@ lets a lone `LDXP` be torn.
    So does Concurrency Kit's ring buffer, and armem finds the ARM-only
    bugs that ck fixed in June 2026 in it and in `ck_epoch`, and ck's
    seven spinlocks and its sequence lock run too (see [Concurrency
-   Kit](#concurrency-kit)); next come more of ck (`ck_epoch_poll`, its
-   queues) and other libraries.
+   Kit](#concurrency-kit)); next come more of ck (`ck_epoch_poll` with a
+   second poller, its queues) and other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
@@ -946,7 +982,9 @@ lets a lone `LDXP` be torn.
    43 s to 583 in 20 s), and dropping states with a promise that can no
    longer be fulfilled (the Treiber stack with its push's release
    relaxed, from 6 minutes 43 s to 15 s, then with a faster hasher and
-   coherence kept as ranges to 5 s); next comes guiding the sampling
+   coherence kept as ranges to 5 s), and private memory for atomics
+   that neither acquire nor release (`ck_epoch_poll` from over 2
+   minutes to 3.4 s); next comes guiding the sampling
    towards reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory

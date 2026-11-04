@@ -3,7 +3,8 @@
 # condition is the bug. Columns: program, optimization level, condition
 # reachable on ARM, under TSO, then any further clang flags.
 # W_FENCE etc. name an ordering; -DX=__ATOMIC_RELAXED removes it.
-# sample=N explores the ARM model on N random paths (for a "yes" only).
+# sample=N explores the ARM model on N random paths (for a "yes" only),
+# and fuel=N gives each thread N instructions (default 1000).
 
 seqlock -O2 no no
 seqlock -O2 yes no -DW_FENCE=__ATOMIC_RELAXED
@@ -144,3 +145,7 @@ ck_epoch -O2 no no
 ck_epoch -O2 yes no -DOLD_BEGIN
 ck_epoch -O0 no no
 ck_epoch -O0 yes no -DOLD_BEGIN
+# ck_epoch_poll: the writer's deferred lists are private memory, atomics
+# included.
+ck_epoch_poll -O2 no no
+ck_epoch_poll -O0 no no fuel=2000

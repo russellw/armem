@@ -622,8 +622,116 @@ impl<'a> Solo<'a> {
         }
     }
 
+    /// An exclusive or atomic access to memory private to the thread (see
+    /// `Stack::is_private`), or None for any other operation. The core
+    /// performs it on its private bytes, like a stack access: no message is
+    /// written and nothing is read from memory. No other thread accesses
+    /// these bytes, so the access is trivially atomic, and its outcomes are
+    /// those of the shared case with every other thread's writes left out.
+    /// The access neither acquires nor releases (the core faults on such
+    /// accesses to private memory), and so needs none of the views that
+    /// those use. A write is placed as early as it may be, as for a stack
+    /// store (see `successors`).
+    fn private_successors(&self, st: &TState, op: MemOp) -> Option<Vec<TState>> {
+        let prog = self.prog;
+        let status = |ok: bool| RV::imm(if ok { 0 } else { 1 });
+        let (addr, len) = match op {
+            MemOp::Load { addr, size, excl: true, .. }
+            | MemOp::StoreExcl { addr, size, .. }
+            | MemOp::Rmw { addr, size, .. } => (addr, size.bytes()),
+            MemOp::LoadExclPair { addr, size, .. } | MemOp::StoreExclPair { addr, size, .. } => {
+                (addr, 2 * size.bytes())
+            }
+            _ => return None,
+        };
+        if !st.core.stack.is_private(addr.val, len) {
+            return None;
+        }
+        let mut base = st.clone();
+        base.v_cap = base.v_cap.max(addr.pick);
+        // Place a private write: after everything it must follow.
+        let placed = |s: &mut TState, w: View| s.v_wold = s.v_wold.max(w).max(st.v_wnew).max(st.v_cap);
+        let mut out = Vec::new();
+        match op {
+            MemOp::Load { rt, size, signed, .. } => {
+                let (v, dep) = base.core.private_load(addr, size);
+                base.core.set(rt, RV { val: size.extend(v as u64, signed), ..dep });
+                base.xcl = Some(Monitor { addr: addr.val, size, srcs: Vec::new(), view: dep.view });
+                out.push(base);
+            }
+            MemOp::LoadExclPair { rt, rt2, size, .. } => {
+                let total = size.double();
+                let (v, dep) = base.core.private_load(addr, total);
+                let (lo, hi) = split_pair(v, size);
+                base.core.set(rt, RV { val: lo, ..dep });
+                base.core.set(rt2, RV { val: hi, ..dep });
+                base.xcl = Some(Monitor { addr: addr.val, size: total, srcs: Vec::new(), view: dep.view });
+                out.push(base);
+            }
+            MemOp::StoreExcl { data, rs, size, .. } | MemOp::StoreExclPair { data, rs, size, .. } => {
+                // As for shared memory, failure is always possible.
+                let (total, val, data) = match op {
+                    MemOp::StoreExclPair { data2, .. } => {
+                        (size.double(), pair_value(data.val, data2.val, size), RV::joined(0, data, data2))
+                    }
+                    _ => (size, size.mask(data.val) as u128, data),
+                };
+                let mut f = base.clone();
+                f.xcl = None;
+                f.core.set(rs, status(false));
+                out.push(f);
+                if st.xcl.as_ref().is_some_and(|m| m.addr == addr.val && m.size == total) {
+                    let mut s = base;
+                    let w = s.core.private_store(addr, total, val, data);
+                    placed(&mut s, w);
+                    s.xcl = None;
+                    s.core.set(rs, status(true));
+                    out.push(s);
+                }
+            }
+            MemOp::Rmw { op, operand, cmp, rt, size, .. } => {
+                let (v, dep) = base.core.private_load(addr, size);
+                let old = v as u64;
+                let reg = RV { val: old, ..dep };
+                match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
+                    None => {
+                        base.core.set(rt, reg);
+                        out.push(base);
+                    }
+                    Some(new) => {
+                        // As in `mem_successors`.
+                        let data = match (cmp, op) {
+                            (Some(c), _) => RV { pick: operand.pick.max(c.pick).max(dep.pick), ..operand },
+                            (None, RmwOp::Swp) => operand,
+                            (None, _) => RV::joined(0, operand, dep),
+                        };
+                        let mut outs = vec![reg];
+                        if let Some(c) = cmp {
+                            outs.push(RV { val: old, view: c.view, pick: c.pick.max(dep.pick) });
+                        }
+                        let w = base.core.private_store(addr, size, new as u128, data);
+                        placed(&mut base, w);
+                        for o in outs {
+                            let mut s = base.clone();
+                            s.core.set(rt, o);
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        for s in &mut out {
+            s.core.retire(prog);
+        }
+        Some(out)
+    }
+
     fn mem_successors(&mut self, st: TState, ext: &[Msg], op: MemOp) -> Vec<Succ> {
         let prog = self.prog;
+        if let Some(states) = self.private_successors(&st, op) {
+            return states.into_iter().map(|s| (s, ext.to_vec())).collect();
+        }
         let mut out = Vec::new();
         let status = |ok: bool| RV::imm(if ok { 0 } else { 1 });
         match op {

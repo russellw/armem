@@ -52,9 +52,9 @@ pub struct Options {
     /// Prune memories that differ only in the order of writes nothing can
     /// observe the order of (see `reduce.rs`).
     pub por: bool,
-    /// In the ARM model, perform plain accesses to memory that only one
-    /// thread accesses like those to its stack, without write messages (see
-    /// `reduce::Reduction::private`).
+    /// Perform accesses to memory that only one thread accesses like those
+    /// to its stack: in the ARM model without write messages, and in the
+    /// reference models as local steps (see `reduce::Reduction::private`).
     pub private: bool,
     /// Instead of exploring every memory, follow this many random paths
     /// through them. The final states found are possible, but others may be
@@ -77,7 +77,7 @@ impl Default for Options {
 pub fn run(test: &litmus::Test, model: Model, opts: &Options) -> Outcomes {
     match model {
         Model::Arm => promising::explore(test, opts),
-        Model::Tso => interleave::explore(test, interleave::Kind::Tso, opts.fuel),
-        Model::Sc => interleave::explore(test, interleave::Kind::Sc, opts.fuel),
+        Model::Tso => interleave::explore(test, interleave::Kind::Tso, opts.fuel, opts.private),
+        Model::Sc => interleave::explore(test, interleave::Kind::Sc, opts.fuel, opts.private),
     }
 }

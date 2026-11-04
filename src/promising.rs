@@ -1018,7 +1018,7 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
     if test.threads.len() == 1 {
         // A lone thread sees its own accesses in program order: its behaviors
         // are exactly the sequentially consistent ones.
-        return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel);
+        return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel, cfg.private);
     }
     let mut proj = Projection::new(test);
     let analysis = if cfg.por || cfg.private { crate::reduce::analyze(test, cfg.fuel) } else { None };

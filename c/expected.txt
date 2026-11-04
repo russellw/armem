@@ -149,3 +149,7 @@ ck_epoch -O0 yes no -DOLD_BEGIN
 # included.
 ck_epoch_poll -O2 no no
 ck_epoch_poll -O0 no no fuel=2000
+# With a third thread that polls. OLD_POLL polls as before ck commit
+# d1b348c. (-O0 gives the same verdicts, in up to 26 s per run.)
+ck_epoch_poll3 -O2 no no
+ck_epoch_poll3 -O2 yes no -DOLD_POLL

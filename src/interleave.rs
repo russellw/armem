@@ -13,6 +13,14 @@
 //! steps at once. This changes no outcome, and keeps compiled code
 //! (especially at -O0, where most instructions are local) from multiplying
 //! the interleavings.
+//!
+//! With `private`, memory that only one thread accesses (as found by the
+//! reduction's pre-pass, `reduce::Reduction::private`) is treated like its
+//! stack: the core performs plain accesses to it as local steps, and a
+//! store to it bypasses the store buffer, which no other thread could
+//! observe. An exclusive or atomic access to it is performed on the core's
+//! private bytes, but keeps its effect on the thread's own ordering: it
+//! waits for the store buffer to drain, as a locked operation does.
 
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::FxHashMap;
@@ -20,6 +28,7 @@ use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
 use crate::outcome::Outcomes;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::collections::hash_map::Entry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,9 +49,13 @@ struct Thread {
     mon: Option<(u64, Size)>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 struct Global {
-    threads: Vec<Thread>,
+    /// Shared with the states it was reached from until changed.
+    threads: Vec<Arc<Thread>>,
+    /// The id under which each thread is interned in `explore`, if known
+    /// (reset whenever the thread changes).
+    ids: Vec<Option<u32>>,
     /// Bytes written so far (others hold their initial value).
     mem: BTreeMap<u64, u8>,
 }
@@ -52,6 +65,12 @@ fn overlaps(a: u64, sa: Size, b: u64, sb: Size) -> bool {
 }
 
 impl Global {
+    /// Thread `tid`, to be changed.
+    fn thread(&mut self, tid: usize) -> &mut Thread {
+        self.ids[tid] = None;
+        Arc::make_mut(&mut self.threads[tid])
+    }
+
     fn mem_byte(&self, b: u64, test: &Test) -> u8 {
         self.mem.get(&b).copied().unwrap_or_else(|| test.init_byte(b))
     }
@@ -76,7 +95,7 @@ impl Global {
 
     fn store(&mut self, tid: usize, kind: Kind, w: Write) {
         match kind {
-            Kind::Tso => self.threads[tid].buf.push(w),
+            Kind::Tso => self.thread(tid).buf.push(w),
             Kind::Sc => self.commit(tid, w),
         }
     }
@@ -85,10 +104,10 @@ impl Global {
         for i in 0..size.bytes() {
             self.mem.insert(a + i, (v >> (8 * i)) as u8);
         }
-        for (i, t) in self.threads.iter_mut().enumerate() {
-            if let Some((ma, ms)) = t.mon {
+        for i in 0..self.threads.len() {
+            if let Some((ma, ms)) = self.threads[i].mon {
                 if i != tid && overlaps(a, size, ma, ms) {
-                    t.mon = None;
+                    self.thread(i).mon = None;
                 }
             }
         }
@@ -103,21 +122,101 @@ fn run_local(core: &mut Core, prog: &crate::isa::Code, fuel: u32) {
     while core.steps < fuel && matches!(core.step(prog), Step::Local { .. }) {}
 }
 
-pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
+/// An exclusive or atomic access by thread `t` to its private memory, if
+/// `op` is one: Some(whether it can be performed now), having performed it.
+fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<bool> {
+    let (addr, len) = match op {
+        MemOp::Load { addr, size, excl: true, .. } | MemOp::StoreExcl { addr, size, .. } | MemOp::Rmw { addr, size, .. } => {
+            (addr, size.bytes())
+        }
+        MemOp::LoadExclPair { addr, size, .. } | MemOp::StoreExclPair { addr, size, .. } => (addr, 2 * size.bytes()),
+        _ => return None,
+    };
+    if !t.core.stack.is_private(addr.val, len) {
+        return None;
+    }
+    let reg = |val: u64| RV { val, pick: 0, view: 0 };
+    let drained = t.buf.is_empty();
+    match op {
+        MemOp::Load { rt, size, signed, .. } => {
+            let v = t.core.private_load(addr, size).0;
+            t.core.set(rt, reg(size.extend(v as u64, signed)));
+            t.mon = Some((addr.val, size));
+        }
+        MemOp::LoadExclPair { rt, rt2, size, .. } => {
+            let total = size.double();
+            let (lo, hi) = split_pair(t.core.private_load(addr, total).0, size);
+            t.core.set(rt, reg(lo));
+            t.core.set(rt2, reg(hi));
+            t.mon = Some((addr.val, total));
+        }
+        MemOp::StoreExcl { .. } | MemOp::StoreExclPair { .. } | MemOp::Rmw { .. } if !drained => return Some(false),
+        MemOp::StoreExcl { data, rs, size, .. } => {
+            let success = t.mon == Some((addr.val, size));
+            if success {
+                t.core.private_store(addr, size, size.mask(data.val) as u128, RV::default());
+            }
+            t.mon = None;
+            t.core.set(rs, reg(if success { 0 } else { 1 }));
+        }
+        MemOp::StoreExclPair { data, data2, rs, size, .. } => {
+            let total = size.double();
+            let success = t.mon == Some((addr.val, total));
+            if success {
+                t.core.private_store(addr, total, pair_value(data.val, data2.val, size), RV::default());
+            }
+            t.mon = None;
+            t.core.set(rs, reg(if success { 0 } else { 1 }));
+        }
+        MemOp::Rmw { op, operand, cmp, rt, size, .. } => {
+            let old = t.core.private_load(addr, size).0 as u64;
+            if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
+                t.core.private_store(addr, size, new as u128, RV::default());
+            }
+            t.core.set(rt, reg(old));
+        }
+        _ => unreachable!(),
+    }
+    t.core.retire(prog);
+    Some(true)
+}
+
+/// Explore every interleaving of `test` under `kind`. With `private`,
+/// memory that only one thread accesses is treated like its stack (see
+/// the module comment).
+pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
     let obs = test.observables();
     let mut results = Outcomes::new(obs.clone());
-    let mut start = Global {
+    let n = test.threads.len();
+    let ranges: Vec<Arc<Vec<(u64, u64)>>> = match private.then(|| crate::reduce::analyze(test, fuel)).flatten() {
+        Some(r) => {
+            let observed: Vec<(u64, u64)> = obs
+                .iter()
+                .filter_map(|o| match *o {
+                    Obs::Mem(a) => Some((a, test.loc_type(a).size.bytes())),
+                    Obs::Reg(..) => None,
+                })
+                .collect();
+            r.private(&observed).into_iter().map(Arc::new).collect()
+        }
+        None => vec![Arc::new(Vec::new()); n],
+    };
+    let start = Global {
         threads: test
             .threads
             .iter()
+            .zip(ranges)
             .enumerate()
-            .map(|(i, p)| Thread { core: Core::new(test.init_regs[i], i, test.threads.len(), p.entry), buf: Vec::new(), mon: None })
+            .map(|(i, (p, r))| {
+                let mut core = Core::new(test.init_regs[i], i, n, p.entry);
+                core.stack.set_private(r, &|b| test.init_byte(b));
+                run_local(&mut core, &p.code, fuel);
+                Arc::new(Thread { core, buf: Vec::new(), mon: None })
+            })
             .collect(),
+        ids: vec![None; n],
         mem: BTreeMap::new(),
     };
-    for (t, p) in start.threads.iter_mut().zip(&test.threads) {
-        run_local(&mut t.core, &p.code, fuel);
-    }
     // Visited states (step counters zeroed) -> the per-thread step counts
     // they have been explored with, none using at least as many steps as
     // another on every thread. A state reached again with no thread having
@@ -125,16 +224,33 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
     // collapses spin loops. States are explored in order of total steps
     // used, so each is usually first reached by a path that spins least,
     // and later paths that spin more are cut off.
-    let mut seen: FxHashMap<Global, Vec<Vec<u32>>> = FxHashMap::default();
+    // A state is keyed by the ids of its threads (with their steps taken
+    // out), interned so that each thread state is stored once however many
+    // states of the others it is combined with, and by memory.
+    let mut seen: FxHashMap<(Vec<u32>, BTreeMap<u64, u8>), Vec<Vec<u32>>> = FxHashMap::default();
+    let mut interned: FxHashMap<Thread, u32> = FxHashMap::default();
     let total = |g: &Global| g.threads.iter().map(|t| t.core.steps).sum::<u32>();
     let mut queue = StepQueue::new();
     queue.push(total(&start), start);
-    while let Some(g) = queue.pop() {
-        let mut key = g.clone();
-        let steps: Vec<u32> = key.threads.iter().map(|t| t.core.steps).collect();
-        for t in key.threads.iter_mut() {
-            t.core.steps = 0;
+    while let Some(mut g) = queue.pop() {
+        let steps: Vec<u32> = g.threads.iter().map(|t| t.core.steps).collect();
+        for i in 0..n {
+            if g.ids[i].is_none() {
+                let t = Arc::make_mut(&mut g.threads[i]);
+                t.core.steps = 0;
+                let id = match interned.get(t) {
+                    Some(&id) => id,
+                    None => {
+                        let id = interned.len() as u32;
+                        interned.insert(t.clone(), id);
+                        id
+                    }
+                };
+                t.core.steps = steps[i];
+                g.ids[i] = Some(id);
+            }
         }
+        let key = (g.ids.iter().map(|id| id.unwrap()).collect(), g.mem.clone());
         let covers = |p: &Vec<u32>, s: &Vec<u32>| p.iter().zip(s).all(|(p, s)| p <= s);
         match seen.entry(key) {
             Entry::Occupied(e) if e.get().iter().any(|p| covers(p, &steps)) => continue,
@@ -154,7 +270,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             // Drain the oldest buffered store.
             if !th.buf.is_empty() {
                 let mut n = g.clone();
-                let w = n.threads[tid].buf.remove(0);
+                let w = n.thread(tid).buf.remove(0);
                 n.commit(tid, w);
                 queue.push(total(&n), n);
                 any = true;
@@ -165,9 +281,9 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 continue;
             }
             let mut n = g.clone();
-            let buf_empty = n.threads[tid].buf.is_empty();
+            let buf_empty = n.thread(tid).buf.is_empty();
             let prog = &*test.threads[tid].code;
-            let step = n.threads[tid].core.step(prog);
+            let step = n.thread(tid).core.step(prog);
             let ok = match step {
                 Step::Done => false,
                 Step::Local { .. } => true,
@@ -177,128 +293,131 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                     stuck = true;
                     false
                 }
-                Step::Mem(op) => match op {
-                    MemOp::Load { addr, rt, size, signed, excl, .. } => {
-                        let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
-                        let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: v, pick: 0, view: 0 });
-                        if excl {
-                            t.mon = Some((addr.val, size));
+                Step::Mem(op) => match private_atomic(n.thread(tid), op, prog) {
+                    Some(ok) => ok,
+                    None => match op {
+                        MemOp::Load { addr, rt, size, signed, excl, .. } => {
+                            let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
+                            let t = n.thread(tid);
+                            t.core.set(rt, RV { val: v, pick: 0, view: 0 });
+                            if excl {
+                                t.mon = Some((addr.val, size));
+                            }
+                            t.core.retire(prog);
+                            true
                         }
-                        t.core.retire(prog);
-                        true
-                    }
-                    MemOp::LoadExclPair { addr, rt, rt2, size, .. } => {
-                        let total = size.double();
-                        let (lo, hi) = split_pair(n.read(tid, addr.val, total, test), size);
-                        let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: lo, pick: 0, view: 0 });
-                        t.core.set(rt2, RV { val: hi, pick: 0, view: 0 });
-                        t.mon = Some((addr.val, total));
-                        t.core.retire(prog);
-                        true
-                    }
-                    MemOp::StoreExclPair { addr, data, data2, rs, size, .. } => {
-                        if !buf_empty {
-                            false
-                        } else {
+                        MemOp::LoadExclPair { addr, rt, rt2, size, .. } => {
                             let total = size.double();
-                            let success = n.threads[tid].mon == Some((addr.val, total));
-                            if success {
-                                n.commit(tid, (addr.val, total, pair_value(data.val, data2.val, size)));
+                            let (lo, hi) = split_pair(n.read(tid, addr.val, total, test), size);
+                            let t = n.thread(tid);
+                            t.core.set(rt, RV { val: lo, pick: 0, view: 0 });
+                            t.core.set(rt2, RV { val: hi, pick: 0, view: 0 });
+                            t.mon = Some((addr.val, total));
+                            t.core.retire(prog);
+                            true
+                        }
+                        MemOp::StoreExclPair { addr, data, data2, rs, size, .. } => {
+                            if !buf_empty {
+                                false
+                            } else {
+                                let total = size.double();
+                                let success = n.thread(tid).mon == Some((addr.val, total));
+                                if success {
+                                    n.commit(tid, (addr.val, total, pair_value(data.val, data2.val, size)));
+                                }
+                                let t = n.thread(tid);
+                                t.mon = None;
+                                t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
+                                t.core.retire(prog);
+                                true
                             }
-                            let t = &mut n.threads[tid];
+                        }
+                        MemOp::LoadPair { addr, rt, rt2, size, signed } => {
+                            // Both halves are read in one step.
+                            let v1 = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
+                            let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test) as u64, signed);
+                            let t = n.thread(tid);
+                            t.core.set(rt, RV { val: v1, pick: 0, view: 0 });
+                            t.core.set(rt2, RV { val: v2, pick: 0, view: 0 });
+                            t.core.retire(prog);
+                            true
+                        }
+                        MemOp::VLoad { addr, vt, vt2, size } => {
+                            // All registers are read in one step.
+                            for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
+                                let val = n.read(tid, addr.val + i as u64 * size.bytes(), size, test);
+                                n.thread(tid).core.vset(v, VR { val, view: 0, pick: 0 });
+                            }
+                            n.thread(tid).core.retire(prog);
+                            true
+                        }
+                        MemOp::VStore { addr, data, data2, size } => {
+                            let len = size.bytes();
+                            for (i, d) in std::iter::once(data).chain(data2).enumerate() {
+                                n.store(tid, kind, (addr.val + i as u64 * len, size, low_bytes(d.val, len)));
+                            }
+                            n.thread(tid).core.retire(prog);
+                            true
+                        }
+                        MemOp::Store { addr, data, size, .. } => {
+                            n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
+                            n.thread(tid).core.retire(prog);
+                            true
+                        }
+                        MemOp::StorePair { addr, data, data2, size } => {
+                            n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
+                            n.store(tid, kind, (addr.val + size.bytes(), size, size.mask(data2.val) as u128));
+                            n.thread(tid).core.retire(prog);
+                            true
+                        }
+                        MemOp::StoreExcl { addr, data, rs, size, .. } => {
+                            if !buf_empty {
+                                false
+                            } else {
+                                let success = n.thread(tid).mon == Some((addr.val, size));
+                                if success {
+                                    n.commit(tid, (addr.val, size, size.mask(data.val) as u128));
+                                }
+                                let t = n.thread(tid);
+                                t.mon = None;
+                                t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
+                                t.core.retire(prog);
+                                true
+                            }
+                        }
+                        MemOp::Rmw { addr, op, operand, cmp, rt, size, .. } => {
+                            if !buf_empty {
+                                false
+                            } else {
+                                let old = n.read(tid, addr.val, size, test) as u64;
+                                if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
+                                    n.commit(tid, (addr.val, size, new as u128));
+                                }
+                                let t = n.thread(tid);
+                                t.core.set(rt, RV { val: old, pick: 0, view: 0 });
+                                t.core.retire(prog);
+                                true
+                            }
+                        }
+                        MemOp::Clrex => {
+                            let t = n.thread(tid);
                             t.mon = None;
-                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
                             t.core.retire(prog);
                             true
                         }
-                    }
-                    MemOp::LoadPair { addr, rt, rt2, size, signed } => {
-                        // Both halves are read in one step.
-                        let v1 = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
-                        let v2 = size.extend(n.read(tid, addr.val + size.bytes(), size, test) as u64, signed);
-                        let t = &mut n.threads[tid];
-                        t.core.set(rt, RV { val: v1, pick: 0, view: 0 });
-                        t.core.set(rt2, RV { val: v2, pick: 0, view: 0 });
-                        t.core.retire(prog);
-                        true
-                    }
-                    MemOp::VLoad { addr, vt, vt2, size } => {
-                        // All registers are read in one step.
-                        for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
-                            let val = n.read(tid, addr.val + i as u64 * size.bytes(), size, test);
-                            n.threads[tid].core.vset(v, VR { val, view: 0, pick: 0 });
-                        }
-                        n.threads[tid].core.retire(prog);
-                        true
-                    }
-                    MemOp::VStore { addr, data, data2, size } => {
-                        let len = size.bytes();
-                        for (i, d) in std::iter::once(data).chain(data2).enumerate() {
-                            n.store(tid, kind, (addr.val + i as u64 * len, size, low_bytes(d.val, len)));
-                        }
-                        n.threads[tid].core.retire(prog);
-                        true
-                    }
-                    MemOp::Store { addr, data, size, .. } => {
-                        n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
-                        n.threads[tid].core.retire(prog);
-                        true
-                    }
-                    MemOp::StorePair { addr, data, data2, size } => {
-                        n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
-                        n.store(tid, kind, (addr.val + size.bytes(), size, size.mask(data2.val) as u128));
-                        n.threads[tid].core.retire(prog);
-                        true
-                    }
-                    MemOp::StoreExcl { addr, data, rs, size, .. } => {
-                        if !buf_empty {
-                            false
-                        } else {
-                            let success = n.threads[tid].mon == Some((addr.val, size));
-                            if success {
-                                n.commit(tid, (addr.val, size, size.mask(data.val) as u128));
+                        MemOp::Barrier(b) => {
+                            if b == Barrier::Full && !buf_empty {
+                                false
+                            } else {
+                                n.thread(tid).core.retire(prog);
+                                true
                             }
-                            let t = &mut n.threads[tid];
-                            t.mon = None;
-                            t.core.set(rs, RV { val: if success { 0 } else { 1 }, pick: 0, view: 0 });
-                            t.core.retire(prog);
-                            true
                         }
-                    }
-                    MemOp::Rmw { addr, op, operand, cmp, rt, size, .. } => {
-                        if !buf_empty {
-                            false
-                        } else {
-                            let old = n.read(tid, addr.val, size, test) as u64;
-                            if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
-                                n.commit(tid, (addr.val, size, new as u128));
-                            }
-                            let t = &mut n.threads[tid];
-                            t.core.set(rt, RV { val: old, pick: 0, view: 0 });
-                            t.core.retire(prog);
-                            true
-                        }
-                    }
-                    MemOp::Clrex => {
-                        let t = &mut n.threads[tid];
-                        t.mon = None;
-                        t.core.retire(prog);
-                        true
-                    }
-                    MemOp::Barrier(b) => {
-                        if b == Barrier::Full && !buf_empty {
-                            false
-                        } else {
-                            n.threads[tid].core.retire(prog);
-                            true
-                        }
-                    }
+                    },
                 },
             };
             if ok {
-                run_local(&mut n.threads[tid].core, prog, fuel);
+                run_local(&mut n.thread(tid).core, prog, fuel);
                 queue.push(total(&n), n);
                 any = true;
             }
@@ -309,7 +428,14 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 .iter()
                 .map(|o| match *o {
                     Obs::Reg(t, r) => g.threads[t].core.regs[r as usize].val,
-                    Obs::Mem(a) => test.loc_value(a, &|b| g.mem_byte(b, test)),
+                    Obs::Mem(a) => test.loc_value(a, &|b| {
+                        // A private byte's value is in its thread's core.
+                        g.threads
+                            .iter()
+                            .find(|t| t.core.stack.is_private(b, 1))
+                            .and_then(|t| t.core.stack.byte(b))
+                            .unwrap_or_else(|| g.mem_byte(b, test))
+                    }),
                 })
                 .collect();
             results.insert(state);

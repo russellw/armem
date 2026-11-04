@@ -591,11 +591,25 @@ ck commit `d1b348c` (June 2026) changed which deferred objects a poll
 may free ("This held in production only due to x86 store / atomic
 ordering guarantees but falls apart on RMO"). With the poll from before
 that commit, this test is also correct, as are versions with three
-sections and three polls (about 100 s each). That fits ck's own
-comments: the old poll fails only when `ck_epoch_call` files an object
-under an epoch that another thread has already advanced, so it needs a
-second thread that polls. With that third thread, neither exhaustive
-search nor 3,000 sampled paths finish within 200 s.
+sections and three polls. That fits ck's own comments: the old poll
+fails only when `ck_epoch_call` files an object under an epoch that
+another thread has already advanced, so it needs a second thread that
+polls.
+
+`ck_epoch_poll3.c` adds that thread: a helper with its own record and
+nothing deferred, which polls once, while the writer polls once. The
+writer removes the object with an atomic exchange, since with a plain
+store the removal can be reordered after the reader's check, which is
+a bug under TSO as well. As written the test is correct, and with
+`-DOLD_POLL`, which polls with a copy of the poll from before `d1b348c`
+(`c/ck_epoch_poll_old.c`), the reader sees the freed object on ARM
+only, at `-O2` and `-O0`. This is the bug that commit fixed. The tests
+take 5 to 7 s on ARM and 3 to 4 s under TSO at `-O2`, and up to 17 s
+at `-O0`, which is left out of the test suite. With two writer polls
+the verdicts are the same, in 24 to 30 s. Before the pre-pass could
+handle three threads (see [How it works](#how-it-works)), and before
+the reference models had private memory, neither exhaustive search nor
+3,000 sampled paths finished within 200 s.
 
 ### Calls
 
@@ -867,7 +881,15 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   commute with everything the other threads do, so after each step a
   thread runs on through them at once. Compiled code at `-O0` is mostly
   local steps, and this takes the reference models from minutes to
-  milliseconds on it. A full `DMB`
+  milliseconds on it. Memory private to one thread (see Private memory
+  above) is treated like its stack, so its accesses are local steps too.
+  Its exclusive and atomic accesses wait for the thread's store buffer
+  to drain, as locked operations do, but are performed on the thread's
+  own bytes. Each state is stored as the ids of its threads' states,
+  interned so that a thread state shared by many global states is stored
+  once, plus memory. Successors share the threads they leave unchanged.
+  On `ck_epoch_poll3` with two writer polls, these took TSO from 100 s
+  and 20 GB to 14 s and 0.5 GB. A full `DMB`
   acts like `MFENCE`, and atomics act as locked operations. They run the
   same ARM program under an x86-like ordering, so any outcome they cannot
   produce is an *ARM-only* behavior.
@@ -976,8 +998,9 @@ lets a lone `LDXP` be torn.
    So does Concurrency Kit's ring buffer, and armem finds the ARM-only
    bugs that ck fixed in June 2026 in it and in `ck_epoch`, and ck's
    seven spinlocks and its sequence lock run too (see [Concurrency
-   Kit](#concurrency-kit)); next come more of ck (`ck_epoch_poll` with a
-   second poller, its queues) and other libraries.
+   Kit](#concurrency-kit)), and with a second poller armem finds the
+   ARM-only bug ck fixed in `ck_epoch_poll`; next come more of ck (its
+   queues) and other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
@@ -989,7 +1012,8 @@ lets a lone `LDXP` be torn.
    relaxed, from 6 minutes 43 s to 15 s, then with a faster hasher and
    coherence kept as ranges to 5 s), and private memory for atomics
    that neither acquire nor release (`ck_epoch_poll` from over 2
-   minutes to 3.4 s); next comes guiding the sampling
+   minutes to 3.4 s), and private memory and interned thread states in
+   the reference models; next comes guiding the sampling
    towards reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory

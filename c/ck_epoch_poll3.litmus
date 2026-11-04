@@ -1,0 +1,5 @@
+AArch64 ck_epoch_poll3
+"The reader must not see the object freed"
+{ uint32_t got[2]; }
+ P0 = writer | P1 = reader | P2 = helper ;
+exists (got[0]=0xdead \/ got[1]=0xdead)

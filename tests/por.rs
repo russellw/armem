@@ -1,7 +1,8 @@
 //! Checks the partial-order reduction (`src/reduce.rs`), and the handling
 //! of memory private to one thread that relies on its analysis: on every
 //! litmus test, and on randomly generated tests, the ARM model must reach
-//! exactly the same final states with and without each of them.
+//! exactly the same final states with and without each of them, and the
+//! TSO and SC models with and without private memory.
 
 use armem::{Model, litmus, run};
 use std::path::Path;
@@ -29,6 +30,13 @@ fn check_within(t: &litmus::Test, src: &str, lse2: bool, budget: Option<u64>) ->
         if por {
             reduced_memories = reduced.stats.memories;
         }
+    }
+    for model in [Model::Tso, Model::Sc] {
+        let [plain, private] = [false, true].map(|private| run(t, model, &options(false, private, lse2)));
+        let what = format!("{:?} private lse2={}", model, lse2);
+        assert_eq!(plain.states.keys().collect::<Vec<_>>(), private.states.keys().collect::<Vec<_>>(), "{}\n{}", what, src);
+        assert_eq!(plain.faults, private.faults, "{}\n{}", what, src);
+        assert_eq!(plain.truncated, private.truncated, "{}\n{}", what, src);
     }
     Some((full.stats.memories, reduced_memories))
 }

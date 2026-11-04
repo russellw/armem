@@ -660,7 +660,9 @@ compare-and-swap, and then 20 sampled paths no longer reach the
 condition; exhaustive search did not finish in 20 minutes, so that is
 evidence for the fix, not proof. `ck_fifo_mpmc_trydequeue` reads the
 value the same way. The bug needs a node to be re-used while another
-thread may still read it, which ck's own test does on purpose.
+thread may still read it, which ck's own test does on purpose. It is
+reported as
+[concurrencykit/ck#297](https://github.com/concurrencykit/ck/issues/297).
 
 ck changed this FIFO twice in 2026, and `ck_fifo_mpmc_variants.c` has
 the code from before each change. `-DOLD_DEQ` uses the dequeue from

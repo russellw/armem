@@ -153,3 +153,12 @@ ck_epoch_poll -O0 no no fuel=2000
 # d1b348c. (-O0 gives the same verdicts, in up to 26 s per run.)
 ck_epoch_poll3 -O2 no no
 ck_epoch_poll3 -O2 yes no -DOLD_POLL
+
+# ck's single-producer, single-consumer FIFO, recycling its two nodes.
+# WEAK_ENQ/WEAK_DEQ drop the store fence in enqueue/dequeue.
+ck_fifo_spsc -O2 no no
+ck_fifo_spsc -O2 yes no -DWEAK_ENQ sample=10
+ck_fifo_spsc -O2 yes no -DWEAK_DEQ
+ck_fifo_spsc -O0 no no fuel=2000
+ck_fifo_spsc -O0 yes no -DWEAK_ENQ sample=10 fuel=2000
+ck_fifo_spsc -O0 yes no -DWEAK_DEQ fuel=2000

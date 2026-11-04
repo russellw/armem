@@ -1,0 +1,5 @@
+AArch64 ck_fifo_spsc
+"The consumer must receive 1, 2, then 3"
+{ uint64_t got[3]; }
+ P0 = producer | P1 = consumer ;
+exists (~(got[0]=1 /\ got[1]=2 /\ got[2]=3))

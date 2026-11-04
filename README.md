@@ -477,7 +477,8 @@ instructions each.
 `c/ck/include` holds the headers of [Concurrency
 Kit](https://github.com/concurrencykit/ck) that its ring buffer
 (`ck_ring.h`), spinlocks (`ck_spinlock.h`), sequence lock
-(`ck_sequence.h`) and epoch-based reclamation (`ck_epoch.h`) need, and
+(`ck_sequence.h`), epoch-based reclamation (`ck_epoch.h`) and FIFOs
+(`ck_fifo.h`) need, and
 `c/ck/src/ck_epoch.c`, unchanged from ck commit `8f0847c` (BSD license,
 in `c/ck/LICENSE`). Its aarch64 port implements barriers and atomics in
 inline assembly. `c/ck/stub` holds the `ck_md.h` that ck's configure
@@ -610,6 +611,25 @@ the verdicts are the same, in 24 to 30 s. Before the pre-pass could
 handle three threads (see [How it works](#how-it-works)), and before
 the reference models had private memory, neither exhaustive search nor
 3,000 sampled paths finished within 200 s.
+
+`ck_fifo_spsc.c` runs ck's single-producer, single-consumer FIFO
+(`ck_fifo.h`), a linked list whose head is always a stub node. The
+producer sends 1, 2, 3 with only two nodes, so it must recycle each node
+(`ck_fifo_spsc_recycle`) once the consumer has moved past it. The
+condition is the consumer receiving anything but 1, 2, 3. Enqueue fills
+a node, runs a store fence and links the node; dequeue reads a node's
+value, runs a store fence and moves the head past it. The FIFO is correct
+as written. `-DWEAK_ENQ` or `-DWEAK_DEQ` drops one of the fences, and
+either makes it lose or corrupt a value on ARM only, at `-O0` to `-O2`:
+without the dequeue's fence, the consumer can move the head before its
+read of the value, and the producer then refills the node first. The
+values are sent as the pointers themselves. Had the consumer read an
+item through each pointer, the read's address dependency would order the
+read of the node before the next update of the head, and `-DWEAK_DEQ`
+would be harmless. The tests take under 0.3 s, except the exhaustive
+search with `-DWEAK_ENQ`: the producer's writes are then unordered, and
+the consumer sees them in many orders, so it takes 2 minutes, and
+`expected.txt` samples 10 paths instead (0.1 to 0.4 s).
 
 ### Calls
 
@@ -974,7 +994,12 @@ lets a lone `LDXP` be torn.
   memories, and so does each prefix of every memory. So do a shared
   counter that several threads increment, and a spinlock that spins on
   an exchange, which writes on every turn (see [C programs](#c-programs)).
-  Beyond that, `--sample` gives up completeness. Each memory
+  Beyond that, `--sample` gives up completeness. ck's multi-producer
+  FIFO (`ck_fifo_mpmc`) is out of reach for now: two threads that each
+  enqueue once explore thousands of memories, as the pre-pass cannot
+  tell that the other thread reads a new node only after the link that
+  publishes it, so the order of the node's initializing writes looks
+  observable. Each memory
   also costs a solo exploration of every thread, which grows with
   the threads' own branching.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
@@ -999,8 +1024,9 @@ lets a lone `LDXP` be torn.
    bugs that ck fixed in June 2026 in it and in `ck_epoch`, and ck's
    seven spinlocks and its sequence lock run too (see [Concurrency
    Kit](#concurrency-kit)), and with a second poller armem finds the
-   ARM-only bug ck fixed in `ck_epoch_poll`; next come more of ck (its
-   queues) and other libraries.
+   ARM-only bug ck fixed in `ck_epoch_poll`, and its single-producer
+   FIFO runs too; next come ck's multi-producer FIFO (see
+   [Limitations](#limitations-current)) and other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

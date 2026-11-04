@@ -55,6 +55,9 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
             if o.stats.pruned > 0 {
                 write!(s, " ({} pruned by partial-order reduction)", o.stats.pruned).unwrap();
             }
+            if o.stats.filtered > 0 {
+                write!(s, " ({} candidate promises left uncertified: they cannot certify)", o.stats.filtered).unwrap();
+            }
             writeln!(s).unwrap();
         }
         if o.over_budget {

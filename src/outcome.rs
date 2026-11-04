@@ -72,6 +72,9 @@ pub struct Stats {
     pub memories: u64,
     /// Promising: memories skipped by the partial-order reduction.
     pub pruned: u64,
+    /// Promising: candidate promises not certified, since the thread's
+    /// exploration shows they cannot certify.
+    pub filtered: u64,
     /// Interleaving models: number of distinct global states explored.
     pub states: u64,
 }

@@ -27,7 +27,7 @@ fn expectations() -> Vec<Expectation> {
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            let mut opts = armem::Options { fuel: FUEL, ..Default::default() };
+            let mut opts = armem::Options { fuel: FUEL, check_filter: true, ..Default::default() };
             for o in &f[3..] {
                 match *o {
                     "lse2" => opts.lse2 = true,

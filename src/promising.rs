@@ -156,7 +156,8 @@ enum Mode {
     ///   least as permissive as any run certifying that promise, so no
     ///   candidate is missed;
     /// - its final states (and faults) with the memory as it is: those of
-    ///   the runs that fulfill all its promises and append no new write.
+    ///   the runs that fulfill all its promises and append no new write;
+    /// - which candidates could certify (see `Solo::promising`).
     Collect,
     /// Search for a run that fulfills all outstanding promises; new writes
     /// may be appended to (a local copy of) memory.
@@ -219,6 +220,11 @@ struct Solo<'a> {
     /// void, and the run must be repeated without it.
     live_failed: bool,
     candidates: BTreeSet<Candidate>,
+    /// Candidates written, in some run, where a promise right after `base`
+    /// could be fulfilled: see `promising`.
+    placeable: FxHashSet<Candidate>,
+    /// Writes appended by some run that then has no outstanding promise.
+    fulfilling: FxHashSet<Candidate>,
     finals: BTreeSet<Vec<u64>>,
     final_regs: &'a [u8],
     /// Observed locations private to the thread (see `Projection`).
@@ -280,6 +286,8 @@ impl<'a> Solo<'a> {
             mode,
             visited: FxHashMap::default(),
             candidates: BTreeSet::new(),
+            placeable: FxHashSet::default(),
+            fulfilling: FxHashSet::default(),
             finals: BTreeSet::new(),
             final_regs: &proj.thread_regs[tid],
             final_mems: &proj.thread_mems[tid],
@@ -534,6 +542,14 @@ impl<'a> Solo<'a> {
         if ok_atomic(t) {
             if self.mode == Mode::Collect {
                 self.candidates.insert((a, size, val));
+                let l = self.base.len() as View;
+                let at_l = match atomic {
+                    Some((srcs, others_only)) => srcs.iter().all(|&f| f <= l) && self.atomic(ext, a, srcs, l + 1, others_only),
+                    None => true,
+                };
+                if vpre <= l && st.coh_max(a, n) <= l && at_l {
+                    self.placeable.insert((a, size, val));
+                }
             }
             let mut e = ext.to_vec();
             e.push(new_msg);
@@ -998,6 +1014,28 @@ impl<'a> Solo<'a> {
         })
     }
 
+    /// Whether a promise of candidate `c` (collected against `base`) can
+    /// certify: a necessary condition, so a candidate for which it fails
+    /// need not be certified.
+    ///
+    /// A run certifying the promise, placed at `t = base.len() + 1`, writes
+    /// it with every view it must exceed (the write's `vpre`, the
+    /// coherence of its bytes, and an exclusive's atomicity) within
+    /// `base`, then goes on until no promise is outstanding. Running the
+    /// same steps in `Collect` mode, appending the write instead of
+    /// fulfilling the promise, gives a run of this exploration: before the
+    /// write, as `Mode::Collect` notes; after it, because the two runs
+    /// differ only in where that one write sits among the thread's own new
+    /// writes, and its bytes are disjoint from those of the writes before
+    /// it (it could not be placed before them otherwise), so on each byte
+    /// the order of the writes is the same, and every check against the
+    /// older promises compares with a timestamp within `base`. That run
+    /// writes `c` with those views within `base` (`placeable`), and ends up
+    /// with no promise outstanding and `c` appended (`fulfilling`).
+    fn promising(&self, c: &Candidate) -> bool {
+        self.placeable.contains(c) && self.fulfilling.contains(c)
+    }
+
     fn run(&mut self, start: TState) {
         let mut queue = StepQueue::new();
         queue.push(start.core.steps, (start, Vec::new()));
@@ -1024,6 +1062,9 @@ impl<'a> Solo<'a> {
                 Entry::Vacant(e) => {
                     e.insert(st.core.steps);
                 }
+            }
+            if self.mode == Mode::Collect && st.promises.is_empty() {
+                self.fulfilling.extend(ext.iter().map(|m| (m.addr, m.size, m.val)));
             }
             if st.core.steps >= self.fuel && st.core.pc < self.prog.instrs.len() {
                 self.truncated = true;
@@ -1143,13 +1184,16 @@ impl<'a> Explorer<'a> {
         let mut per_thread = Vec::new();
         let mut faulted = false;
         let mut candidates = Vec::new();
+        let mut promising = Vec::new();
         for tid in 0..test.threads.len() {
             let mut c = self.solo(tid, mem, Mode::Collect);
+            let cands = std::mem::take(&mut c.candidates);
+            promising.push(cands.iter().map(|x| !self.cfg.filter || c.promising(x)).collect::<Vec<_>>());
             self.results.truncated |= c.truncated;
             faulted |= !c.faults.is_empty();
             self.results.faults.extend(std::mem::take(&mut c.faults));
             per_thread.push(std::mem::take(&mut c.finals));
-            candidates.push(std::mem::take(&mut c.candidates));
+            candidates.push(cands);
         }
         // Phase 2. If some thread cannot complete, neither can the execution.
         let mut found = faulted;
@@ -1167,7 +1211,7 @@ impl<'a> Explorer<'a> {
         // Phase 1.
         let mut out = Vec::new();
         for (tid, cands) in candidates.into_iter().enumerate() {
-            for (addr, size, val) in cands {
+            for ((addr, size, val), promising) in cands.into_iter().zip(&promising[tid]) {
                 let msg = Msg { addr, size, val, tid };
                 if let (Some(r), Some(last)) = (&self.reduction, mem.last()) {
                     if r.prunable(last, &msg) {
@@ -1180,7 +1224,16 @@ impl<'a> Explorer<'a> {
                 if skip(&m2) {
                     continue;
                 }
+                if !promising && !self.cfg.check_filter {
+                    self.results.stats.filtered += 1;
+                    continue;
+                }
                 let cert = self.solo(tid, &m2, Mode::Certify);
+                assert!(
+                    *promising || !cert.certified,
+                    "a candidate the filter rejects certifies: P{} writes {:#x} = {:#x} after {:?}",
+                    tid, addr, val, mem
+                );
                 if cert.certified {
                     out.push(m2);
                 } else {

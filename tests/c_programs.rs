@@ -116,7 +116,7 @@ fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let preload = Image::load(&Elf::parse(&data).unwrap(), &LoadOptions::default()).and_then(|i| i.preload()).unwrap();
     let src = std::fs::read_to_string(dir.join(format!("{}.litmus", e.program))).unwrap();
     let test = litmus::parse_with(&src, &preload).unwrap();
-    let opts = Options { fuel: e.fuel, ..Default::default() };
+    let opts = Options { fuel: e.fuel, check_filter: true, ..Default::default() };
     let mut errors = Vec::new();
     for (model, want) in [(Model::Arm, e.arm), (Model::Tso, e.tso)] {
         let sampled = Options { sample: e.sample, ..opts };

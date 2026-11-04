@@ -33,6 +33,8 @@ cargo build --release
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
 ./target/release/armem --no-live FILE              # without register liveness
+./target/release/armem --no-filter FILE            # certify every candidate promise
+./target/release/armem --check-filter FILE         # ... and check the filter's verdicts
 cargo test --release                               # check the litmus suite
 ```
 
@@ -806,6 +808,30 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   memories), and the ring buffer with `head` relaxed, 2 slots and 3
   items, 1.7 s instead of 17 s.
 
+  Most certifications still failed, though, and they took most of the
+  time: 80% on `ck_fifo_mpmc`, where 12 of every 13 failed. Each of these
+  candidates is a write that the thread could make, and could even
+  place right after the memory, but not on any run that also fulfills
+  the thread's older promises. The solo exploration that collects the
+  candidates already shows this, so armem certifies only a candidate
+  that some run of it writes with every view the write must exceed
+  (its write views, the coherence of its bytes, and an exclusive's
+  atomicity) within the memory, and that some run appends and then goes
+  on to fulfill every outstanding promise. A run certifying the promise
+  gives such a run when the same steps append the write instead: it
+  differs only in where that one write sits among the thread's own new
+  writes, and no earlier one of them shares its bytes (the promise could
+  not be placed before it otherwise), so the order on each byte is the
+  same, and every check against an older promise compares with a
+  timestamp within the memory. `--no-filter` certifies every candidate,
+  and `--check-filter` certifies them all and stops with an error if
+  one the filter rejects certifies; the test suites run with that
+  check. On `ck_fifo_mpmc` the filter rejected every candidate that
+  failed and none that certified. It takes the relaxed Treiber stack
+  from 4.1 s to 1.5 s, the exhaustive `ck_fifo_spsc` with `-DWEAK_ENQ`
+  from 120 s to 36 s, and `ck_epoch_poll3` with `-DOLD_POLL` from 6.4 s to
+  3.0 s, on the same memories.
+
   The visited sets of the solo explorations, the reduction's pre-pass
   and the reference models use a fast hasher of their own (`src/hash.rs`,
   after `rustc-hash`) rather than the standard library's SipHash, and
@@ -1074,11 +1100,10 @@ lets a lone `LDXP` be torn.
   an exchange, which writes on every turn (see [C programs](#c-programs)).
   Beyond that, `--sample` gives up completeness. ck's multi-producer
   FIFO (`ck_fifo_mpmc`), with two threads that each dequeue and enqueue
-  once, does not finish in 20 minutes: each memory costs about 10,000
-  solo states, most of them in certifications that fail, at about 30
-  memories a second. Each memory
-  also costs a solo exploration of every thread, which grows with
-  the threads' own branching.
+  once, does not finish in 20 minutes: it explores about 300 memories a
+  second, and is still finding new ones after 361,000. Each memory costs
+  a solo exploration of every thread, which grows with the threads' own
+  branching, and a certification of each promise it adds.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
   `STLR; LDAR` (ordered on ARM) can show as a TSO-only outcome.
 
@@ -1117,10 +1142,11 @@ lets a lone `LDXP` be torn.
    that neither acquire nor release (`ck_epoch_poll` from over 2
    minutes to 3.4 s), and private memory and interned thread states in
    the reference models, and register liveness (two enqueuers on ck's
-   multi-producer FIFO from 39,421 memories in 232 s to 1,221 in 4.4 s); next come cheaper
-   failed certifications, which dominate that FIFO's full test, and
-   guiding the sampling towards reads that disagree with what TSO would
-   return.
+   multi-producer FIFO from 39,421 memories in 232 s to 1,221 in 4.4 s),
+   and certifying only the promises the thread's own exploration shows
+   can certify (that FIFO's full test from 30 memories a second to 300);
+   next come fewer memories for that test, and guiding the sampling
+   towards reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

@@ -61,6 +61,13 @@ pub struct Options {
     /// again (see `live`): in the ARM model's solo explorations, the
     /// reduction's pre-pass and the reference models.
     pub live: bool,
+    /// In the ARM model, certify only the candidate promises that the
+    /// thread's exploration shows can certify (see `Solo::promising` in
+    /// `promising.rs`).
+    pub filter: bool,
+    /// Certify the candidates that `filter` rejects too, and panic if one
+    /// certifies (a check of the filter).
+    pub check_filter: bool,
     /// Instead of exploring every memory, follow this many random paths
     /// through them. The final states found are possible, but others may be
     /// missed.
@@ -75,7 +82,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, private: true, live: true, sample: None, seed: 0, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, max_memories: None }
     }
 }
 

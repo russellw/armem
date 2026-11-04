@@ -1144,7 +1144,10 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   once, plus memory. Successors share the threads they leave unchanged.
   On `ck_epoch_poll3` with two writer polls, these took TSO from 100 s
   and 20 GB to 14 s and 0.5 GB. A full `DMB`
-  acts like `MFENCE`, and atomics act as locked operations. They run the
+  acts like `MFENCE`, and atomics act as locked operations. An `LDAR`
+  (or `LDAXR`, `LDAXP`) waits until every earlier `STLR` of its thread
+  has left the store buffer, as ARM orders them (`LDAPR` does not), so
+  TSO keeps every ordering ARM guarantees within a thread. They run the
   same ARM program under an x86-like ordering, so any outcome they cannot
   produce is an *ARM-only* behavior.
 * **Fuel** bounds the instructions per thread per execution, so loops
@@ -1157,7 +1160,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   run from over 100 s to 0.2 s. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 85 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 86 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
@@ -1250,8 +1253,12 @@ lets a lone `LDXP` be torn.
   from 7,824 memories to 1,745 and `ck_fifo_spsc -DWEAK_ENQ` from 63,314
   to 5,624, but gives up on this test, whose generation counter the
   pre-pass cannot bound.
-* The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
-  `STLR; LDAR` (ordered on ARM) can show as a TSO-only outcome.
+* The TSO reference cannot tell a seq_cst store from a release store,
+  since both compile to `STLR` on ARM, so it runs every `STLR` as an
+  ordinary x86 store. x86 compilers make a seq_cst store an `XCHG`, a
+  full barrier. A seq_cst store followed by a plain load (`STLR; LDR`)
+  can therefore show store buffering under TSO that real x86 code does
+  not (see [liburcu](#liburcu)).
 
 ## Roadmap
 

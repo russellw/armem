@@ -15,8 +15,9 @@ MP+popl+poap           no   no
 MP+popl+po             yes  no
 SB                     yes  yes
 SB+dmbs                no   no
-SB+rel+acq             no   yes
+SB+rel+acq             no   no
 SB+rel+acqpc           yes  yes
+SB+rel+po              yes  yes
 LB                     yes  no
 LB+datas               no   no
 LB+ctrls               no   no

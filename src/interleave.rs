@@ -3,6 +3,9 @@
 //! These explore every interleaving of the threads. Under TSO each thread
 //! has a FIFO store buffer (loads may bypass buffered stores; a full DMB
 //! drains the buffer, as MFENCE would; atomics are locked operations).
+//! An `LDAR` (or `LDAXR`/`LDAXP`) waits until every `STLR` before it in
+//! the thread has left the buffer, as ARM orders them, so that TSO keeps
+//! every ordering ARM guarantees within a thread. (`LDAPR` does not wait.)
 //! They answer the question "could this outcome also have happened on an
 //! x86-like machine?", so that ARM-only outcomes can be singled out.
 //!
@@ -24,7 +27,7 @@
 
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::FxHashMap;
-use crate::isa::{Barrier, Size};
+use crate::isa::{Barrier, LoadKind, Size};
 use crate::litmus::{Obs, Test};
 use crate::live::Liveness;
 use crate::outcome::Outcomes;
@@ -45,6 +48,9 @@ type Write = (u64, Size, u128);
 struct Thread {
     core: Core,
     buf: Vec<Write>,
+    /// How many of the oldest buffered stores an RCsc acquire load must
+    /// wait for: up to and including the youngest buffered release store.
+    rel: usize,
     /// Exclusive monitor: the footprint of the last load-exclusive, if no
     /// other thread has written to it since.
     mon: Option<(u64, Size)>,
@@ -99,6 +105,13 @@ impl Global {
             Kind::Tso => self.thread(tid).buf.push(w),
             Kind::Sc => self.commit(tid, w),
         }
+    }
+
+    /// A release store: as `store`, and RCsc acquire loads wait for it.
+    fn store_release(&mut self, tid: usize, kind: Kind, w: Write) {
+        self.store(tid, kind, w);
+        let t = self.thread(tid);
+        t.rel = t.buf.len();
     }
 
     fn commit(&mut self, tid: usize, (a, size, v): Write) {
@@ -242,7 +255,7 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
                 let mut core = Core::new(test.init_regs[i], i, n, p.entry);
                 core.stack.set_private(r, &|b| test.init_byte(b));
                 ok &= run_local(&mut core, &p.code, fuel, lives[i].as_ref());
-                Arc::new(Thread { core, buf: Vec::new(), mon: None })
+                Arc::new(Thread { core, buf: Vec::new(), rel: 0, mon: None })
             })
             .collect(),
         ids: vec![None; n],
@@ -310,7 +323,9 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
             // Drain the oldest buffered store.
             if !th.buf.is_empty() {
                 let mut n = g.clone();
-                let w = n.thread(tid).buf.remove(0);
+                let t = n.thread(tid);
+                let w = t.buf.remove(0);
+                t.rel = t.rel.saturating_sub(1);
                 n.commit(tid, w);
                 queue.push(total(&n), n);
                 any = true;
@@ -322,6 +337,8 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
             }
             let mut n = g.clone();
             let buf_empty = n.thread(tid).buf.is_empty();
+            // An RCsc acquire load may not pass a buffered release store.
+            let rel_drained = n.thread(tid).rel == 0;
             let prog = &*test.threads[tid].code;
             if lives[tid].as_ref().is_some_and(|l| !l.ret_ok(prog, &n.thread(tid).core)) {
                 return None;
@@ -339,6 +356,8 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
                 Step::Mem(op) => match private_atomic(n.thread(tid), op, prog) {
                     Some(ok) => ok,
                     None => match op {
+                        MemOp::Load { kind: LoadKind::Acquire, .. } if !rel_drained => false,
+                        MemOp::LoadExclPair { acquire: true, .. } if !rel_drained => false,
                         MemOp::Load { addr, rt, size, signed, excl, .. } => {
                             let v = size.extend(n.read(tid, addr.val, size, test) as u64, signed);
                             let t = n.thread(tid);
@@ -402,8 +421,13 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
                             n.thread(tid).core.retire(prog);
                             true
                         }
-                        MemOp::Store { addr, data, size, .. } => {
-                            n.store(tid, kind, (addr.val, size, size.mask(data.val) as u128));
+                        MemOp::Store { addr, data, size, release } => {
+                            let w = (addr.val, size, size.mask(data.val) as u128);
+                            if release {
+                                n.store_release(tid, kind, w);
+                            } else {
+                                n.store(tid, kind, w);
+                            }
                             n.thread(tid).core.retire(prog);
                             true
                         }

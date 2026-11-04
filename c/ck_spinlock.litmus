@@ -1,0 +1,5 @@
+AArch64 ck_spinlock
+"Both increments inside the lock must count"
+{ uint64_t count; }
+ P0 = thread_a | P1 = thread_b ;
+exists (~count=2)

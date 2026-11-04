@@ -1,0 +1,5 @@
+AArch64 ck_sequence
+"The reader's copy must not be torn"
+{ uint64_t copy[2]; }
+ P0 = writer | P1 = reader ;
+exists ((copy[0]=0 /\ copy[1]=1) \/ (copy[0]=1 /\ copy[1]=0))

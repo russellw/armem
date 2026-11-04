@@ -86,3 +86,54 @@ ck_spmc -O0 no no -DOLD_FENCE
 # With ck's LSE atomics (CAS instead of LDXR/STXR).
 ck_spmc -O2 no no -march=armv8.1-a -DCK_MD_LSE_ENABLE
 ck_spmc -O2 yes no -DOLD_FENCE -march=armv8.1-a -DCK_MD_LSE_ENABLE
+
+# ck's spinlocks: LOCK=1 CAS, 2 FAS, 3 ticket, 4 MCS, 5 CLH, 6 Anderson,
+# 7 decrement. WEAK_LOCK/WEAK_UNLOCK drop the acquire/release fence.
+ck_spinlock -O2 no no -DLOCK=1
+ck_spinlock -O2 yes no -DLOCK=1 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=1 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=1
+ck_spinlock -O0 yes no -DLOCK=1 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=1 -DWEAK_UNLOCK
+ck_spinlock -O2 no no -DLOCK=2
+ck_spinlock -O2 yes no -DLOCK=2 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=2 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=2
+ck_spinlock -O0 yes no -DLOCK=2 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=2 -DWEAK_UNLOCK
+ck_spinlock -O2 no no -DLOCK=3
+ck_spinlock -O2 yes no -DLOCK=3 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=3 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=3
+ck_spinlock -O0 yes no -DLOCK=3 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=3 -DWEAK_UNLOCK
+ck_spinlock -O2 no no -DLOCK=4
+ck_spinlock -O2 yes no -DLOCK=4 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=4 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=4
+ck_spinlock -O2 no no -DLOCK=5
+ck_spinlock -O2 yes no -DLOCK=5 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=5 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=5
+ck_spinlock -O0 yes no -DLOCK=5 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=5 -DWEAK_UNLOCK
+ck_spinlock -O2 no no -DLOCK=6
+ck_spinlock -O2 yes no -DLOCK=6 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=6 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=6
+ck_spinlock -O0 yes no -DLOCK=6 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=6 -DWEAK_UNLOCK
+ck_spinlock -O2 no no -DLOCK=7
+ck_spinlock -O2 yes no -DLOCK=7 -DWEAK_LOCK
+ck_spinlock -O2 yes no -DLOCK=7 -DWEAK_UNLOCK
+ck_spinlock -O0 no no -DLOCK=7
+ck_spinlock -O0 yes no -DLOCK=7 -DWEAK_LOCK
+ck_spinlock -O0 yes no -DLOCK=7 -DWEAK_UNLOCK
+
+# ck's sequence lock. WEAK_WRITER/WEAK_READER drop that side's fences.
+ck_sequence -O2 no no
+ck_sequence -O2 yes no -DWEAK_WRITER
+ck_sequence -O2 yes no -DWEAK_READER
+ck_sequence -O0 no no
+ck_sequence -O0 yes no -DWEAK_WRITER
+ck_sequence -O0 yes no -DWEAK_READER

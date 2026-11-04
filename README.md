@@ -473,13 +473,14 @@ reachable, since sampling may miss states.
 ### Concurrency Kit
 
 `c/ck/include` holds the headers of [Concurrency
-Kit](https://github.com/concurrencykit/ck) that its ring buffer,
-`ck_ring.h`, needs, unchanged from ck commit `8f0847c` (BSD license, in
-`c/ck/LICENSE`). Its aarch64 port implements barriers and atomics in
+Kit](https://github.com/concurrencykit/ck) that its ring buffer
+(`ck_ring.h`), spinlocks (`ck_spinlock.h`) and sequence lock
+(`ck_sequence.h`) need, unchanged from ck commit `8f0847c` (BSD license,
+in `c/ck/LICENSE`). Its aarch64 port implements barriers and atomics in
 inline assembly. `c/ck/stub` holds the `ck_md.h` that ck's configure
-script generates for aarch64 Linux, and the one declaration from
-`<string.h>` that ck needs (there is no AArch64 libc here, so each
-program defines `memcpy`). A program's first line can give clang flags
+script generates for aarch64 Linux, and the declarations from
+`<string.h>` that ck uses (there is no AArch64 libc here, so a program
+that calls `memcpy` defines it). A program's first line can give clang flags
 (`/* cflags: ... */`), and the ck programs use it to compile with
 `-ffreestanding` and these include paths:
 
@@ -531,6 +532,26 @@ verdicts. Each test takes at most 6 s (`ck_spmc` at `-O0`), and under
 with one load, as a libc's does. Copying byte by byte made each read of a
 slot eight reads that could each see a different write, and the `-O0`
 tests took minutes.
+
+`ck_spinlock.c` runs each of ck's spinlocks, chosen with `-DLOCK=N`: 1
+compare-and-swap, 2 exchange, 3 ticket, 4 MCS, 5 CLH, 6 Anderson (array)
+and 7 decrement. Two threads each take the lock once and increment a
+plain counter, and the condition is the counter ending at anything but
+2. Each lock acquires with `ck_pr_fence_lock()` and releases with
+`ck_pr_fence_unlock()` (both `DMB SY` on aarch64). `-DWEAK_LOCK` or
+`-DWEAK_UNLOCK` turns one of them into a compiler barrier only. Every
+lock is correct as written, and either change makes it lose an increment
+on ARM only, at `-O0` and `-O2`. The MCS lock's queue nodes are static
+rather than on the stack, as in ck's own tests, since a thread here
+cannot access another's stack. MCS is the slowest: up to 8 s at `-O2`,
+and 5 s at `-O0` as written (its weakened variants take over 20 s there
+and are left out of `expected.txt`). The others take under 3 s.
+
+`ck_sequence.c` runs ck's sequence lock: a writer updates a two-word
+record once, and a reader copies it with `CK_SEQUENCE_READ`. The
+condition is a torn copy. It is correct as written. `-DWEAK_WRITER`
+(no store fences in the writer) and `-DWEAK_READER` (no load fences in
+the reader) both tear the copy on ARM only. Each test takes 0.1 s.
 
 ### Calls
 
@@ -889,9 +910,9 @@ lets a lone `LDXP` be torn.
    counting and a Treiber stack) run unchanged, and armem finds the
    ARM-only bugs in their weakened versions (see [C programs](#c-programs)).
    So does Concurrency Kit's ring buffer, and armem finds the ARM-only
-   bug that ck fixed in June 2026 (see [Concurrency Kit](#concurrency-kit));
-   next come more of ck (its spinlocks, `ck_sequence`, `ck_epoch`) and
-   other libraries.
+   bug that ck fixed in June 2026, and so do ck's seven spinlocks and its
+   sequence lock (see [Concurrency Kit](#concurrency-kit)); next come
+   more of ck (`ck_epoch`, its queues) and other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

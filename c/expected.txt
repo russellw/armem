@@ -216,3 +216,30 @@ dpdk_ring3 -O1 yes no -DRTS -DOLD_RTS
 dpdk_ring3 -Os yes no -DRTS -DOLD_RTS
 dpdk_ring3 -O2 no no -DRTS -DHTD_MAX=3
 dpdk_ring3 -O2 yes no -DRTS -DHTD_MAX=3 -DOLD_RTS
+
+# liburcu's QSBR and mb flavors: a reader reports a quiescent state (or
+# goes offline, or leaves its critical section) while the grace period
+# arms its futex. Before liburcu commits 9e6448d and 96ef712, the
+# reader's store of its counter was CMM_SEQ_CST, which with C11 atomics
+# is an STLR with no barrier after it, so the reader's load of the
+# waiting flag or futex may pass it: store buffering, and the grace period
+# sleeps with no wakeup to come. That is a bug under TSO too, as armem's
+# TSO reference runs the STLR as an ordinary store; an x86 compiler makes
+# a seq_cst store an XCHG, which is a full barrier. Without C11 atomics
+# (-std=gnu99), liburcu puts a full barrier on each side of the store.
+urcu_qsbr -O2 no no
+urcu_qsbr -O2 no no -march=armv8.3-a
+urcu_qsbr -O2 yes yes -DOLD_QSBR
+urcu_qsbr -O2 yes yes -DOLD_QSBR -march=armv8.3-a
+urcu_qsbr -O2 no no -DOLD_QSBR -std=gnu99
+urcu_qsbr -O2 no no -DOFFLINE
+urcu_qsbr -O2 yes yes -DOFFLINE -DOLD_QSBR
+urcu_qsbr -O0 no no
+urcu_qsbr -O0 yes yes -DOLD_QSBR
+urcu_mb -O2 no no
+urcu_mb -O2 no no -march=armv8.3-a
+urcu_mb -O2 yes yes -DOLD_MB
+urcu_mb -O2 yes yes -DOLD_MB -march=armv8.3-a
+urcu_mb -O2 no no -DOLD_MB -std=gnu99
+urcu_mb -O0 no no
+urcu_mb -O0 yes yes -DOLD_MB

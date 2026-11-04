@@ -1,0 +1,5 @@
+AArch64 urcu_qsbr
+"synchronize_rcu must not sleep with no wakeup to come"
+{ uint64_t blocked; uint64_t urcu_test_woken; }
+ P0 = t0 | P1 = t1 ;
+exists (blocked=1 /\ urcu_test_woken=0)

@@ -756,6 +756,58 @@ code loads the tail with acquire. In `dpdk_ring3.c` the old C11 head move
 and the current rings are right, and the generic ring without the fence
 of `9bc2cbb007` is wrong. The tests take under 4 s.
 
+### liburcu
+
+`c/urcu/include` holds the headers of
+[liburcu](https://liburcu.org) (`include/urcu`, unchanged from liburcu
+commit `645fdc9`, July 2026; mostly LGPL-2.1-or-later, see
+`c/urcu/LICENSE.md`). `c/urcu/stub` holds the generated `urcu/config.h` as
+configure sets it for aarch64 Linux, a `urcu/futex.h` that records each
+`FUTEX_WAKE`, a `urcu/tls-compat.h` that makes thread-local variables
+ordinary globals (each test has one reader), and small stand-ins for the
+C library headers.
+
+`urcu_qsbr.c` and `urcu_mb.c` test the QSBR and mb flavors' wakeup of
+a waiting grace period. The reader, `t0`, calls the real header code: it
+reports a quiescent state (`-DOFFLINE`: goes offline) or leaves its
+read-side critical section. The writer, `t1`, runs one pass of
+`wait_for_readers` (copied from `src/urcu-qsbr.c` and `src/urcu.c`), the
+pass that arms the futex after the busy-wait attempts run out. It then
+checks the reader's counter, and would sleep in `wait_gp` if the reader
+has not reported and the futex is still -1. The condition is that it
+would sleep and the reader never wakes it, which hangs
+`synchronize_rcu`.
+
+liburcu commits `9e6448d` (QSBR) and `96ef712` (mb) (January 2026)
+changed the reader's store of its counter from `CMM_SEQ_CST` to
+`CMM_SEQ_CST_FENCE`, because "Storing to rcu_reader.ctr with a
+CMM_SEQ_CST store does not ensure that the following relaxed load of
+the futex waiting state is ordered after that store". `-DOLD_QSBR` and
+`-DOLD_MB` undo just those commits (`c/urcu/old`, through
+`c/urcu_variants.h`):
+
+| Flavor | Variant | `LDAR` (armv8-a) | `LDAPR` (armv8.3-a) | TSO |
+|---|---|---|---|---|
+| QSBR (quiescent state, offline) | current | no | no | no |
+| QSBR (quiescent state, offline) | before `9e6448d` | **yes** | **yes** | yes |
+| mb | current | no | no | no |
+| mb | before `96ef712` | **yes** | **yes** | yes |
+
+That holds at `-O0` to `-O2` and `-Os`, and each test takes about 0.1 s.
+With C11 atomics, which liburcu uses whenever the compiler supports C11
+(since commit `89280d0`, in 0.15.0), the old store compiles to an `STLR`
+with nothing after it. The reader's next load, of its waiting flag or
+the futex, is a plain `LDR`, which may be satisfied before the `STLR`
+becomes visible. The writer makes the mirror-image store and load, with a
+full barrier between them. That is store buffering: each side misses the
+other's store. The fix adds a `DMB ISH` after the `STLR`. TSO allows
+store buffering too, and armem's TSO reference runs the `STLR` as an
+ordinary store, so it reports the bug under TSO as well. On real x86 the
+bug cannot happen, because compilers make a seq_cst store an `XCHG`,
+which is a full barrier. So it hits ARM and other weak architectures
+only. Compiled without C11 atomics (`-std=gnu99`), liburcu puts a full
+barrier on each side of the store, and the old code is right.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1225,7 +1277,9 @@ lets a lone `LDXP` be torn.
    fixed. On DPDK's ring, armem finds both of the ARM-only bugs DPDK fixed
    in it, including one that needs RCpc acquire loads, and ARM-only bugs
    in the old HTS and RTS modes that DPDK's commits changed without
-   describing them as bugs (see [DPDK](#dpdk)). Next come other libraries.
+   describing them as bugs (see [DPDK](#dpdk)). In liburcu's QSBR and mb
+   flavors, armem finds the lost grace-period wakeups liburcu fixed in
+   January 2026 (see [liburcu](#liburcu)). Next come other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

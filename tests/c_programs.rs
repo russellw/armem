@@ -8,6 +8,9 @@
 //! of exhaustively, for variants too big to explore; it may only confirm
 //! that the condition is reachable, as sampling may miss states. The test
 //! is skipped (with a message) when clang is not installed.
+//!
+//! A program whose first line is `/* cflags: ... */` is compiled with those
+//! flags too, with `-I` paths relative to `c/`.
 
 use armem::elf::Elf;
 use armem::image::{Image, LoadOptions};
@@ -71,15 +74,33 @@ fn scratch(name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// The flags in a program's `/* cflags: ... */` first line, if any.
+fn program_cflags(source: &Path, dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(source).unwrap();
+    let first = text.lines().next().unwrap_or("");
+    let Some(flags) = first.strip_prefix("/* cflags:").and_then(|f| f.strip_suffix("*/")) else {
+        return Vec::new();
+    };
+    flags
+        .split_whitespace()
+        .map(|f| match f.strip_prefix("-I") {
+            Some(p) => format!("-I{}", dir.join(p).display()),
+            None => f.to_string(),
+        })
+        .collect()
+}
+
 /// Compile, load and run one line; returns a failure message.
 fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("c");
     let obj = scratch(&format!("{}-{}.o", e.program, i));
+    let source = dir.join(format!("{}.c", e.program));
     let out = Command::new(clang)
         .args(["--target=aarch64-linux-gnu", "-fno-pic", "-c", "-o"])
         .arg(&obj)
+        .args(program_cflags(&source, &dir))
         .args(&e.cflags)
-        .arg(dir.join(format!("{}.c", e.program)))
+        .arg(&source)
         .output()
         .unwrap();
     if !out.status.success() {

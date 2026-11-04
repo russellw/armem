@@ -68,3 +68,21 @@ treiber -O2 no no -DPOP=__ATOMIC_RELAXED
 treiber -O0 no no
 # clang -O0 compiles every compare-and-swap with LDAXR/STLXR.
 treiber -O0 no no -DPUSH=__ATOMIC_RELAXED
+
+# Concurrency Kit's ck_ring (c/ck/include, unchanged). OLD_FENCE restores
+# the consumer's store fence from before ck commit c7945fe.
+ck_spsc -O2 no no
+ck_spsc -O2 no no -DOLD_FENCE
+ck_spsc -O0 no no
+ck_spsc -O0 no no -DOLD_FENCE
+ck_spmc -O2 no no
+ck_spmc -O2 yes no -DOLD_FENCE
+ck_spmc -O1 yes no -DOLD_FENCE
+ck_spmc -Os yes no -DOLD_FENCE
+ck_spmc -O0 no no
+# The copy's store to the stack, data dependent on the slot's read, is
+# ordered before the compare-and-swap by the store fence.
+ck_spmc -O0 no no -DOLD_FENCE
+# With ck's LSE atomics (CAS instead of LDXR/STXR).
+ck_spmc -O2 no no -march=armv8.1-a -DCK_MD_LSE_ENABLE
+ck_spmc -O2 yes no -DOLD_FENCE -march=armv8.1-a -DCK_MD_LSE_ENABLE

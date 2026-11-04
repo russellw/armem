@@ -1,0 +1,5 @@
+AArch64 ck_spmc
+"The consumers must receive 1 and 2, one each"
+{ uint64_t got_a; uint64_t got_b; }
+ P0 = producer | P1 = consumer_a | P2 = consumer_b ;
+exists (~((got_a=1 /\ got_b=2) \/ (got_a=2 /\ got_b=1)))

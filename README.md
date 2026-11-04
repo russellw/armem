@@ -470,6 +470,68 @@ tests too big for that, a line of `expected.txt` may give `sample=N`
 (`N` random paths), but only when the condition is expected to be
 reachable, since sampling may miss states.
 
+### Concurrency Kit
+
+`c/ck/include` holds the headers of [Concurrency
+Kit](https://github.com/concurrencykit/ck) that its ring buffer,
+`ck_ring.h`, needs, unchanged from ck commit `8f0847c` (BSD license, in
+`c/ck/LICENSE`). Its aarch64 port implements barriers and atomics in
+inline assembly. `c/ck/stub` holds the `ck_md.h` that ck's configure
+script generates for aarch64 Linux, and the one declaration from
+`<string.h>` that ck needs (there is no AArch64 libc here, so each
+program defines `memcpy`). A program's first line can give clang flags
+(`/* cflags: ... */`), and the ck programs use it to compile with
+`-ffreestanding` and these include paths:
+
+```
+clang --target=aarch64-linux-gnu -O2 -fno-pic -ffreestanding -Ic/ck/include -Ic/ck/stub -c c/ck_spmc.c
+armem -f 1000 --elf ck_spmc.o c/ck_spmc.litmus
+```
+
+* `ck_spsc.c`: one producer sends 1, 2, 3 through a ring of 2 slots
+  (ck_ring keeps one free, so it holds one entry) to one consumer. The
+  condition is the consumer receiving anything else.
+* `ck_spmc.c`: the same ring, with two consumers taking one entry each
+  with `ck_ring_dequeue_spmc`, which reads the slot and then claims it by
+  a compare-and-swap of the consumer counter. The condition is the
+  consumers receiving anything but 1 and 2.
+
+In June 2026, ck commit `c7945fe` changed the fence between a consumer's
+read of a slot and its update of the consumer counter from a store fence
+(`DMB ISHST`) to a load-store fence (`DMB SY`). The commit message calls
+the old fence "overly weak in theory ... No impact on a real modern CPU".
+`-DOLD_FENCE` restores it (it turns `ck_pr_fence_load_store` back into
+`ck_pr_fence_store`; the code is the same as before the commit, up to
+register allocation):
+
+| Program | Variant | ARM | TSO |
+|---|---|---|---|
+| ck_spsc | current | no | no |
+| ck_spsc | old fence | no | no |
+| ck_spmc | current | no | no |
+| ck_spmc | old fence | yes, but no at `-O0` | no |
+
+The architecture allows the bug. A store fence does not order a read
+before a later write, so with `ck_spmc` at `-O1` and above, a consumer can
+claim slot 0 and read it only after the other consumer has claimed slot 1
+and the producer has put item 3 in slot 0. The first consumer then
+receives item 3, which also stays in the ring. With one consumer
+(`ck_spsc`), the old fence is enough: the producer reuses a slot only
+after the dequeue that follows it, which runs `DMB ISHLD` before its own
+update and so orders the earlier read first. At `-O0`, the copy of the
+entry is a call to `memcpy`, which stores it to the consumer's stack. That
+store is data dependent on the read, and the store fence orders it before
+the update. This is the case the commit's comment warns about: the
+compiler may keep the copy in a register instead, and does at `-O1`.
+
+ck can also use the LSE atomics (`-march=armv8.1-a
+-DCK_MD_LSE_ENABLE`, `CAS` instead of `LDXR`/`STXR`), with the same
+verdicts. Each test takes at most 6 s (`ck_spmc` at `-O0`), and under
+1 s at `-O1` and above. The harness's `memcpy` copies an aligned word
+with one load, as a libc's does. Copying byte by byte made each read of a
+slot eight reads that could each see a different write, and the `-O0`
+tests took minutes.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -825,8 +887,11 @@ lets a lone `LDXP` be torn.
    [SIMD&FP registers](#simdfp-registers)). Lock-free C programs (a
    seqlock, a ring buffer, double-checked initialization, reference
    counting and a Treiber stack) run unchanged, and armem finds the
-   ARM-only bugs in their weakened versions (see [C programs](#c-programs));
-   next come functions extracted from real code.
+   ARM-only bugs in their weakened versions (see [C programs](#c-programs)).
+   So does Concurrency Kit's ring buffer, and armem finds the ARM-only
+   bug that ck fixed in June 2026 (see [Concurrency Kit](#concurrency-kit));
+   next come more of ck (its spinlocks, `ck_sequence`, `ck_epoch`) and
+   other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

@@ -14,7 +14,7 @@
 //! (especially at -O0, where most instructions are local) from multiplying
 //! the interleavings.
 
-use crate::core::{Core, MemOp, RV, Step, VR, low_bytes, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::FxHashMap;
 use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
@@ -118,22 +118,32 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
     for (t, p) in start.threads.iter_mut().zip(&test.threads) {
         run_local(&mut t.core, &p.code, fuel);
     }
-    // Visited states (step counters zeroed) -> per-thread step counts when
-    // last explored. A state reached again with no thread having used fewer
-    // steps cannot lead anywhere new; this collapses spin loops.
-    let mut seen: FxHashMap<Global, Vec<u32>> = FxHashMap::default();
-    let mut stack = vec![start];
-    while let Some(g) = stack.pop() {
+    // Visited states (step counters zeroed) -> the per-thread step counts
+    // they have been explored with, none using at least as many steps as
+    // another on every thread. A state reached again with no thread having
+    // used fewer steps than in one of them cannot lead anywhere new; this
+    // collapses spin loops. States are explored in order of total steps
+    // used, so each is usually first reached by a path that spins least,
+    // and later paths that spin more are cut off.
+    let mut seen: FxHashMap<Global, Vec<Vec<u32>>> = FxHashMap::default();
+    let total = |g: &Global| g.threads.iter().map(|t| t.core.steps).sum::<u32>();
+    let mut queue = StepQueue::new();
+    queue.push(total(&start), start);
+    while let Some(g) = queue.pop() {
         let mut key = g.clone();
         let steps: Vec<u32> = key.threads.iter().map(|t| t.core.steps).collect();
         for t in key.threads.iter_mut() {
             t.core.steps = 0;
         }
+        let covers = |p: &Vec<u32>, s: &Vec<u32>| p.iter().zip(s).all(|(p, s)| p <= s);
         match seen.entry(key) {
-            Entry::Occupied(e) if e.get().iter().zip(&steps).all(|(p, s)| p <= s) => continue,
-            Entry::Occupied(mut e) => *e.get_mut() = steps,
+            Entry::Occupied(e) if e.get().iter().any(|p| covers(p, &steps)) => continue,
+            Entry::Occupied(mut e) => {
+                e.get_mut().retain(|p| !covers(&steps, p));
+                e.get_mut().push(steps);
+            }
             Entry::Vacant(e) => {
-                e.insert(steps);
+                e.insert(vec![steps]);
             }
         }
         results.stats.states += 1;
@@ -146,7 +156,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
                 let mut n = g.clone();
                 let w = n.threads[tid].buf.remove(0);
                 n.commit(tid, w);
-                stack.push(n);
+                queue.push(total(&n), n);
                 any = true;
             }
             if th.core.pc < test.threads[tid].code.instrs.len() && th.core.steps >= fuel {
@@ -289,7 +299,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32) -> Outcomes {
             };
             if ok {
                 run_local(&mut n.threads[tid].core, prog, fuel);
-                stack.push(n);
+                queue.push(total(&n), n);
                 any = true;
             }
         }

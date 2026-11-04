@@ -727,7 +727,12 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   produce is an *ARM-only* behavior.
 * **Fuel** bounds the instructions per thread per execution, so loops
   terminate. A state that recurs with no more fuel used is pruned, so
-  spin loops cost almost nothing. If any execution runs out of fuel, the
+  spin loops cost almost nothing. The reference models count fuel per
+  thread, so they prune a state only if some earlier visit used no more
+  fuel on every thread. They explore states in order of total fuel used,
+  so a state is usually first reached by the path that spins least. With
+  three threads spinning on each other, this took a ring buffer's TSO
+  run from over 100 s to 0.2 s. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
 Validation: `litmus/` holds 85 tests. They include the classic shapes (MP,

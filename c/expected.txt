@@ -187,3 +187,32 @@ dpdk_ring -O0 no no
 dpdk_ring -O0 no no -march=armv8.3-a
 dpdk_ring -O0 no no -DOLD_HEAD
 dpdk_ring -O0 yes no -DRTE_GENERIC_RING -DOLD_GENERIC
+
+# DPDK's ring with the item 2 enqueued by a third thread, so t0 can take
+# it without having written it. The HTS and RTS modes from before DPDK
+# commits 66d5f96278 and 36b69b5f95 are wrong on any ARM: a consumer
+# reads the producer's tail with a plain load before its acquire
+# compare-and-swap of the head, so its loads of the slots may be satisfied
+# before that load, and t0 receives the stale 99. (The commits describe
+# the change as establishing a safe partial order, not as fixing a bug.)
+# RTS lets a thread move the head while others have yet to move the tail
+# only when htd_max is above its default, 0 here; that does not matter to
+# this bug. The old C11 head move is right in this shape: it needs t0 to
+# be the producer. -O0 runs out of memory.
+dpdk_ring3 -O2 no no
+dpdk_ring3 -O2 no no -march=armv8.3-a
+dpdk_ring3 -O2 yes no -DRTE_GENERIC_RING -DOLD_GENERIC
+dpdk_ring3 -O2 no no -DHTS
+dpdk_ring3 -O2 no no -DHTS -march=armv8.3-a
+dpdk_ring3 -O2 yes no -DHTS -DOLD_HTS
+dpdk_ring3 -O2 yes no -DHTS -DOLD_HTS -march=armv8.3-a
+dpdk_ring3 -O1 yes no -DHTS -DOLD_HTS
+dpdk_ring3 -Os yes no -DHTS -DOLD_HTS
+dpdk_ring3 -O2 no no -DRTS
+dpdk_ring3 -O2 no no -DRTS -march=armv8.3-a
+dpdk_ring3 -O2 yes no -DRTS -DOLD_RTS
+dpdk_ring3 -O2 yes no -DRTS -DOLD_RTS -march=armv8.3-a
+dpdk_ring3 -O1 yes no -DRTS -DOLD_RTS
+dpdk_ring3 -Os yes no -DRTS -DOLD_RTS
+dpdk_ring3 -O2 no no -DRTS -DHTD_MAX=3
+dpdk_ring3 -O2 yes no -DRTS -DHTD_MAX=3 -DOLD_RTS

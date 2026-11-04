@@ -724,6 +724,38 @@ tests take under 0.5 s, except the old C11 head move with `LDAPR`
 (4.4 s at `-O1` to `-O2`, 55 s at `-O0`, which is left out of the test
 suite).
 
+The ring's other two multi-thread modes, head/tail sync (HTS, `-DHTS`)
+and relaxed tail sync (RTS, `-DRTS`), had the same kind of change in DPDK
+commits `66d5f96278` and `36b69b5f95`, in the same series as
+`a4ad0eba9d`. Those commits describe it as establishing "a safe partial
+order", not as fixing a failure. `-DOLD_HTS` and `-DOLD_RTS` restore the
+old code (`c/dpdk/old`, unchanged from the commits' parents). In
+`dpdk_ring.c` neither old mode goes wrong. `dpdk_ring3.c` moves the
+enqueue of 2 to a third thread, `t2`, so that `t0` can take an item it
+did not write:
+
+| Ring | Variant | `LDAR` (armv8-a) | `LDAPR` (armv8.3-a) |
+|---|---|---|---|
+| HTS | current | no | no |
+| HTS | before `66d5f96278` | **ARM only** | **ARM only** |
+| RTS | current | no | no |
+| RTS | before `36b69b5f95` | **ARM only** | **ARM only** |
+
+That holds at `-O1`, `-O2` and `-Os`, and for RTS also with a maximum
+distance between head and tail (`-DHTD_MAX=3`) above its default, which
+is 0 here. At `-O0` the search runs out of memory. With either old mode,
+`t0` dequeues both items but receives 99 for the second. The old code
+reads the producer tail with a plain load and only then does the
+acquire compare-and-swap of the consumer head. An acquire orders the
+loads after it, not the ones before, so `t0`'s loads of the slots may be
+satisfied before its load of the tail: it reads the tail that `t2`'s
+release store set and slots older than that store. The old code's own
+comment says the acquire compare-and-swap "serves as a hoist barrier to
+prevent ... OOO reads of cons tail value", which it does not. The new
+code loads the tail with acquire. In `dpdk_ring3.c` the old C11 head move
+and the current rings are right, and the generic ring without the fence
+of `9bc2cbb007` is wrong. The tests take under 4 s.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1191,8 +1223,9 @@ lets a lone `LDXP` be torn.
    ARM-only bug ck fixed in `ck_epoch_poll`, and its FIFOs run too: in
    the multi-producer one, armem finds an ARM-only bug that ck has not
    fixed. On DPDK's ring, armem finds both of the ARM-only bugs DPDK fixed
-   in it, including one that needs RCpc acquire loads (see
-   [DPDK](#dpdk)). Next come other libraries.
+   in it, including one that needs RCpc acquire loads, and ARM-only bugs
+   in the old HTS and RTS modes that DPDK's commits changed without
+   describing them as bugs (see [DPDK](#dpdk)). Next come other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

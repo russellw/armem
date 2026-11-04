@@ -12,7 +12,26 @@
    OLD_GENERIC: the generic ring (RTE_GENERIC_RING, rte_ring_gcc_pvt.h)
    without the acquire fence between the reads of the head and of the
    other side's tail, as before DPDK commit 9bc2cbb007 ("ring: guarantee
-   load/load order in enqueue and dequeue", November 2017). */
+   load/load order in enqueue and dequeue", November 2017).
+
+   OLD_HTS and OLD_RTS: the head/tail sync and relaxed tail sync modes
+   from before DPDK commits 66d5f96278 and 36b69b5f95 (November 2025, the
+   same series as a4ad0eba9d): dpdk/old holds their rte_ring_hts_elem_pvt.h
+   and rte_ring_rts_elem_pvt.h, unchanged from the commits' parents.
+   Included first, they define the include guards of the current files,
+   which rte_ring.h then skips. */
+
+#if defined(OLD_HTS) || defined(OLD_RTS)
+#include <rte_common.h>
+#include <rte_ring_core.h>
+#include <rte_ring_elem_pvt.h>
+#endif
+#ifdef OLD_HTS
+#include "dpdk/old/rte_ring_hts_elem_pvt.h"
+#endif
+#ifdef OLD_RTS
+#include "dpdk/old/rte_ring_rts_elem_pvt.h"
+#endif
 
 #ifdef OLD_GENERIC
 #define __atomic_thread_fence(m) ((void)0)

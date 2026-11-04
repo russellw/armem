@@ -1101,9 +1101,21 @@ lets a lone `LDXP` be torn.
   Beyond that, `--sample` gives up completeness. ck's multi-producer
   FIFO (`ck_fifo_mpmc`), with two threads that each dequeue and enqueue
   once, does not finish in 20 minutes: it explores about 300 memories a
-  second, and is still finding new ones after 361,000. Each memory costs
-  a solo exploration of every thread, which grows with the threads' own
-  branching, and a certification of each promise it adds.
+  second, and is still finding new ones after 361,000. Nearly all of them
+  differ only in the order of writes to different locations: the first
+  60,001 hold just 182 sets of writes, each with one order of the writes
+  to each location, and one set comes in 4,974 orders. The reduction
+  prunes none of them. Nodes are re-used, so both threads read and write
+  every field of every node, and ck's load fences order any read before
+  any later one, so for any two writes the other thread may read both in
+  order, as far as the thread-wide footprints of the pre-pass can tell.
+  The orders are real ARM behaviors (an enqueue's stores to the fields
+  of the node it re-uses come in every order, some before the dequeue's
+  compare-and-swap that claimed the node), and observable in principle,
+  since the bug is the other thread still reading that node. Telling
+  which orders some execution observes needs a reduction that knows
+  which writes the threads read, not only where they may read; see
+  [docs/dynamic-reduction.md](docs/dynamic-reduction.md).
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
   `STLR; LDAR` (ordered on ARM) can show as a TSO-only outcome.
 
@@ -1145,7 +1157,9 @@ lets a lone `LDXP` be torn.
    multi-producer FIFO from 39,421 memories in 232 s to 1,221 in 4.4 s),
    and certifying only the promises the thread's own exploration shows
    can certify (that FIFO's full test from 30 memories a second to 300);
-   next come fewer memories for that test, and guiding the sampling
+   next come a reduction that uses what each execution reads, which that
+   test needs (see [docs/dynamic-reduction.md](docs/dynamic-reduction.md)),
+   and guiding the sampling
    towards reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory

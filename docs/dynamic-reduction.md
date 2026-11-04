@@ -209,6 +209,39 @@ Ways forward:
   generation again fall away. This also sharpens the reduction
   everywhere else.
 
+### Rounds, and what they showed
+
+The first way forward is implemented (`Explorer::observe`). It doesn't
+need the bound on later writes: once a round adds no value, the values
+are complete. A read of an exclusive pair is atomic only per 8-byte
+half, so it takes each half from the memory or from a later write.
+
+On `ck_fifo_mpmc`, the rounds converge in two on full-length memories:
+the generations get one or two values each. But on shallower memories,
+where the threads have made few promises, a thread's observing
+exploration exceeds its 200,000 states even in the first round, so the
+search still falls back to the static reduction there.
+
+Condition 3 also limits what this test can gain. Pruning by the
+observing explorations without future reads (unsound, so a ceiling)
+explores 70,264 memories in 355 s (51,298 in 250 s with `-DFENCE_DEQ`),
+against 3,811 without condition 3: both threads read every location,
+so each may read `x`. Ways to get closer to 3,811:
+
+- **Check reachability directly.** Instead of condition 3, certify `y`
+  after `Q` without `x`. This is not enough alone: the rest of the
+  swapped memory (`x` after `Q·y`, and every later message) must stay
+  reachable too, and that argument is not worked out.
+- **Read `x` only before `y`.** `B` needs `x` to certify `y` only if it
+  may read `x` before it writes `y`, or before it fulfills a promise
+  that the certification of `y` needs. That needs the same kind of
+  argument.
+
+And to make the observing explorations affordable on shallow memories:
+merge views below `ts(x)` that no comparison can tell apart, or explore
+only the runs that can still fulfill their promises (the third way
+forward above).
+
 ## Plan
 
 0. **Measure the ceiling first.** As a throwaway experiment, use the

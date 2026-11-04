@@ -190,6 +190,16 @@ const FUTURE: View = View::MAX / 2;
 /// Most states `Mode::Observe` may visit before it gives up.
 const MAX_OBSERVE_STATES: u64 = 200_000;
 
+/// Most values a read of later writes may return in `Mode::Observe`, where
+/// the analysis does not know them, before it gives up.
+const MAX_UNKNOWN_VALUES: usize = 4096;
+
+/// Most rounds of `Explorer::observe` before it gives up.
+const MAX_OBSERVE_ROUNDS: usize = 8;
+
+/// Values written, by footprint (address, length).
+type Written = FxHashMap<(u64, u64), BTreeSet<u128>>;
+
 /// How a read orders later accesses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ReadKind {
@@ -252,6 +262,13 @@ struct Solo<'a> {
     observed_reads: std::cell::RefCell<crate::reduce::Footprints>,
     observed_writes: crate::reduce::Footprints,
     reads_x: std::cell::Cell<bool>,
+    /// For `Mode::Observe`: the values other threads' later writes may
+    /// store, for bytes whose values the analysis does not know (see
+    /// `Explorer::observe`); whether a read used them; and the values of
+    /// this thread's new writes.
+    unknown: Arc<Written>,
+    used_unknown: std::cell::Cell<bool>,
+    written: Written,
     gave_up: std::cell::Cell<bool>,
     states: u64,
     /// Candidates written, in some run, where a promise right after `base`
@@ -324,6 +341,9 @@ impl<'a> Solo<'a> {
             observed_reads: Default::default(),
             observed_writes: Default::default(),
             reads_x: Default::default(),
+            unknown: Default::default(),
+            used_unknown: Default::default(),
+            written: Default::default(),
             gave_up: Default::default(),
             states: 0,
             placeable: FxHashSet::default(),
@@ -516,19 +536,20 @@ impl<'a> Solo<'a> {
             out.push(ReadResult { state: s, val, srcs, dep: dep(vpost, ppost) });
         }
         if self.mode == Mode::Observe {
-            let single = pieces(a, n, granule, self.lse2).len() == 1;
-            self.observe_read(st, addr, kind, n, single, vpre, &mut out);
+            let ps = pieces(a, n, granule, self.lse2);
+            self.observe_read(st, addr, kind, n, &ps, vpre, &mut out);
         }
         out
     }
 
     /// For `Mode::Observe`: record the reads ordered after `x` (the last
     /// message of `base`) among `out`, the results of a read of `n` bytes
-    /// (single-copy atomic if `single`) with pre-view `vpre`, and whether
+    /// (in single-copy-atomic pieces `ps`) with pre-view `vpre`, and whether
     /// one reads `x`; and add those that read a later write by another
     /// thread.
     #[allow(clippy::too_many_arguments)]
-    fn observe_read(&self, st: &TState, addr: RV, kind: ReadKind, n: u64, single: bool, vpre: View, out: &mut Vec<ReadResult>) {
+    fn observe_read(&self, st: &TState, addr: RV, kind: ReadKind, n: u64, ps: &[(u64, u64)], vpre: View, out: &mut Vec<ReadResult>) {
+        let single = ps.len() == 1;
         let a = addr.val;
         let l = self.base.len() as View;
         let x = &self.base[l as usize - 1];
@@ -543,8 +564,14 @@ impl<'a> Solo<'a> {
         let vals = match red.future_values(self.tid, a, n, &|b| self.test.init_byte(b)) {
             crate::reduce::Future::None => Vec::new(),
             crate::reduce::Future::Unknown => {
-                self.gave_up.set(true);
-                return;
+                self.used_unknown.set(true);
+                match self.unknown_read_values(a, ps, out, red) {
+                    Some(v) => v,
+                    None => {
+                        self.gave_up.set(true);
+                        return;
+                    }
+                }
             }
             crate::reduce::Future::Values(v) => v,
         };
@@ -581,6 +608,50 @@ impl<'a> Solo<'a> {
             s.v_cap = s.v_cap.max(addr.pick);
             out.push(ReadResult { state: s, val, srcs: vec![FUTURE; n as usize], dep: dep(vpost, ppost) });
         }
+    }
+
+    /// The values a read at `a` in single-copy-atomic pieces `ps` may
+    /// return when some piece reads a later write by another thread, where
+    /// the analysis does not know what those may store, or None if that is
+    /// not known either. Each piece is read on its own, from the memory
+    /// (one of `concrete`'s values) or from a later write.
+    fn unknown_read_values(&self, a: u64, ps: &[(u64, u64)], concrete: &[ReadResult], red: &crate::reduce::Reduction) -> Option<Vec<u128>> {
+        if let [(p, len)] = *ps {
+            return self.unknown_values(p, len, red);
+        }
+        let mut combos = vec![0u128];
+        for &(p, len) in ps {
+            let mask = if len >= 16 { u128::MAX } else { (1u128 << (8 * len)) - 1 };
+            let mut vals: BTreeSet<u128> = concrete.iter().map(|r| (r.val >> (8 * (p - a))) & mask).collect();
+            match red.future_values(self.tid, p, len, &|b| self.test.init_byte(b)) {
+                crate::reduce::Future::None => {}
+                crate::reduce::Future::Values(v) => vals.extend(v),
+                crate::reduce::Future::Unknown => vals.extend(self.unknown_values(p, len, red)?),
+            }
+            if combos.len() * vals.len() > MAX_UNKNOWN_VALUES {
+                return None;
+            }
+            combos = combos.iter().flat_map(|&c| vals.iter().map(move |&v| c | v << (8 * (p - a)))).collect();
+        }
+        Some(combos)
+    }
+
+    /// The values that the later writes in `unknown` give a
+    /// single-copy-atomic read of `n` bytes at `a`, or None if it might
+    /// combine bytes of several writes.
+    fn unknown_values(&self, a: u64, n: u64, red: &crate::reduce::Reduction) -> Option<Vec<u128>> {
+        if red.may_mix(self.tid, a, n) {
+            return None;
+        }
+        let mask = if n >= 16 { u128::MAX } else { (1u128 << (8 * n)) - 1 };
+        let mut out = BTreeSet::new();
+        for (&(wa, wn), vals) in self.unknown.iter() {
+            if wa < a + n && a < wa + wn {
+                // `may_mix` says the write contains the read.
+                out.extend(vals.iter().map(|v| (v >> (8 * (a - wa))) & mask));
+            }
+        }
+        Some(out.into_iter().collect())
     }
 
     /// No write to the footprint between each byte's source and `t`
@@ -620,6 +691,9 @@ impl<'a> Solo<'a> {
         }
         if self.mode == Mode::Observe && vpre == self.base.len() as View {
             self.observed_writes.insert((a, n));
+        }
+        if self.mode == Mode::Observe {
+            self.written.entry((a, n)).or_default().insert(val);
         }
         let apply = |t: View| {
             let mut s = st.clone();
@@ -1287,10 +1361,16 @@ struct Explorer<'a> {
 impl<'a> Explorer<'a> {
     /// Run thread `tid` alone against `mem`.
     fn solo(&mut self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
+        self.solo_with(tid, mem, mode, Arc::default())
+    }
+
+    /// The same, with `Solo::unknown` for `Mode::Observe`.
+    fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>) -> Solo<'a> {
         loop {
             let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
             if mode == Mode::Observe {
                 s.reduction = self.reduction.clone();
+                s.unknown = unknown.clone();
             }
             s.run(self.start(tid, mem));
             if !s.live_failed {
@@ -1302,20 +1382,57 @@ impl<'a> Explorer<'a> {
 
     /// What each thread may do after `mem` (`Mode::Observe`), or None if
     /// that is not known.
+    ///
+    /// Where the analysis does not know what a later write may store (a
+    /// counter, which it widens to any value), the values come from the
+    /// explorations themselves, in rounds: in the first, a read of those
+    /// bytes returns no later write; in each next one, it returns the
+    /// values the other threads wrote in the rounds before. Once a round
+    /// adds no value, every later write's is among them: in Promising-ARM
+    /// a write depends only on reads of earlier messages, so (by induction
+    /// on the memory order) the `k`th later write's value is found by
+    /// round `k`, and that round has added it.
     fn observe(&mut self, mem: &[Msg]) -> Option<crate::reduce::Observed> {
-        let mut obs = crate::reduce::Observed::default();
-        for tid in 0..self.test.threads.len() {
-            let mut o = self.solo(tid, mem, Mode::Observe);
-            if o.gave_up.get() {
-                self.results.stats.observe_failed += 1;
-                return None;
+        let n = self.test.threads.len();
+        let mut written: Vec<Written> = vec![Written::default(); n];
+        for _ in 0..MAX_OBSERVE_ROUNDS {
+            let mut obs = crate::reduce::Observed::default();
+            let mut used_unknown = false;
+            let mut grown = false;
+            let mut new_written = written.clone();
+            for tid in 0..n {
+                let mut unknown = Written::default();
+                for (t, w) in written.iter().enumerate() {
+                    if t != tid {
+                        for (fp, vals) in w {
+                            unknown.entry(*fp).or_default().extend(vals);
+                        }
+                    }
+                }
+                let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::new(unknown));
+                if o.gave_up.get() {
+                    self.results.stats.observe_failed += 1;
+                    return None;
+                }
+                used_unknown |= o.used_unknown.get();
+                for (fp, vals) in std::mem::take(&mut o.written) {
+                    let e = new_written[tid].entry(fp).or_default();
+                    let before = e.len();
+                    e.extend(vals);
+                    grown |= e.len() > before;
+                }
+                obs.reads.push(o.observed_reads.take());
+                obs.writes.push(std::mem::take(&mut o.observed_writes));
+                obs.reads_x.push(o.reads_x.get());
             }
-            obs.reads.push(o.observed_reads.take());
-            obs.writes.push(std::mem::take(&mut o.observed_writes));
-            obs.reads_x.push(o.reads_x.get());
+            if !used_unknown || !grown {
+                self.results.stats.observed += 1;
+                return Some(obs);
+            }
+            written = new_written;
         }
-        self.results.stats.observed += 1;
-        Some(obs)
+        self.results.stats.observe_failed += 1;
+        None
     }
 
     fn start(&self, tid: usize, mem: &[Msg]) -> TState {

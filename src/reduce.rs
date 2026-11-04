@@ -78,12 +78,17 @@ const MAX_BYTE_VALUES: usize = 16;
 const MAX_STATES: usize = 300_000;
 /// Most rounds of the value fixpoint before the analysis gives up.
 const MAX_ROUNDS: usize = 64;
-/// A byte whose set of values grows in this many consecutive rounds is
+/// A byte whose set of values grows in this many rounds of a streak is
 /// taken to hold any value (widening). A counter, such as a sequence
 /// number that each round's writes increase, would otherwise add values
 /// round after round until it reached `MAX_BYTE_VALUES`, while the runs
 /// that read it grew with every value.
 const WIDEN_AFTER: usize = 3;
+/// A streak ends after this many rounds in a row without growth. A single
+/// round is not enough: a counter that one thread increments and others
+/// copy (an epoch, and each thread's record of the epoch it observed)
+/// grows every other round, as the copies follow the counter.
+const STREAK_GAP: usize = 2;
 
 /// Memory footprints: (address, length) pairs.
 type Footprints = BTreeSet<(u64, u64)>;
@@ -296,6 +301,47 @@ const UNKNOWN: View = 2;
 
 fn taint(v: RV) -> View {
     v.view.max(v.pick)
+}
+
+/// Most values `masked_values` splits an unknown value into.
+const MAX_MASKED_VALUES: u32 = 16;
+
+/// If `ins` keeps only a few bits of an unknown value (an AND with an
+/// immediate, or an unsigned bitfield extract), the register it sets, the
+/// values it may set it to, and whether it sets the flags too. An index
+/// into a small array is often computed this way (`e & 3`), and with the
+/// value split, the address of the element stays known.
+fn masked_values(core: &Core, ins: &Instr) -> Option<(crate::isa::RegOp, Vec<u64>, bool)> {
+    use crate::isa::{AluOp, BfKind, Operand};
+    let (rd, mask, shift, flags) = match *ins {
+        Instr::Alu { op: AluOp::And, rd, rn, op2: Operand::Imm(m), flags } if taint(core.get(rn)) >= UNKNOWN => {
+            (rd, if rd.wide { m } else { m & 0xffff_ffff }, 0, flags)
+        }
+        Instr::Bitfield { kind: BfKind::Unsigned, rd, rn, immr, imms } if taint(core.get(rn)) >= UNKNOWN => {
+            let bits = if rd.wide { 64 } else { 32 };
+            let (immr, imms) = (immr as u32, imms as u32);
+            let (width, to) = if imms >= immr { (imms - immr + 1, 0) } else { (imms + 1, bits - immr) };
+            if width > 32 {
+                return None;
+            }
+            (rd, (1u64 << width) - 1, to, false)
+        }
+        _ => return None,
+    };
+    if mask.count_ones() > MAX_MASKED_VALUES.ilog2() || rd.idx == crate::isa::ZR && !flags {
+        return None;
+    }
+    // Every subset of the mask's bits.
+    let mut vals = Vec::new();
+    let mut v = 0u64;
+    loop {
+        vals.push(v << shift);
+        if v == mask {
+            break;
+        }
+        v = (v.wrapping_sub(mask)) & mask;
+    }
+    Some((rd, vals, flags))
 }
 
 /// The values a byte may hold besides its initial value (None: any).
@@ -612,8 +658,29 @@ impl<'a> Havoc<'a> {
                     return None;
                 }
             }
+            let split = prog.instrs.get(pc).and_then(|ins| masked_values(&core, ins));
             match core.step(prog) {
                 Step::Done | Step::Fault(_) => return Some(vec![]),
+                Step::Local { .. } if split.is_some() => {
+                    // A few bits of an unknown value: take each value they
+                    // may have, as loaded from memory (so still a
+                    // dependency on the read).
+                    let (rd, vals, flags) = split.unwrap();
+                    return Some(
+                        vals.into_iter()
+                            .map(|v| {
+                                let mut c = core.clone();
+                                c.set(rd, reg(v, LOADED));
+                                if flags {
+                                    let sign = if rd.wide { 1u64 << 63 } else { 1 << 31 };
+                                    let nz = ((v & sign != 0) as u64) << 3 | ((v == 0) as u64) << 2;
+                                    c.flags = reg(nz, LOADED);
+                                }
+                                (c, mon, own.clone(), after)
+                            })
+                            .collect(),
+                    );
+                }
                 Step::Local { ctrl: Some(t), .. } if t >= UNKNOWN => {
                     // A branch on an unknown value: take both ways.
                     let other = match prog.instrs[pc] {
@@ -839,8 +906,9 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
     let mut addr_dep = vec![false; n];
     let mut read_bytes = vec![HashSet::new(); n];
     let mut budget = MAX_STATES;
-    // Consecutive rounds in which each byte's values have grown.
-    let mut streaks: HashMap<u64, usize> = HashMap::new();
+    // For each byte in a streak of rounds in which its values grow: the
+    // rounds it has grown in, and the rounds since it last grew.
+    let mut streaks: HashMap<u64, (usize, usize)> = HashMap::new();
     let mut writers: HashMap<u64, BTreeSet<usize>> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
         let mut grown: BTreeSet<u64> = BTreeSet::new();
@@ -904,10 +972,16 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
                 }
             }
         }
-        streaks.retain(|b, _| grown.contains(b));
+        for (b, (_, idle)) in streaks.iter_mut() {
+            if !grown.contains(b) {
+                *idle += 1;
+            }
+        }
+        streaks.retain(|_, &mut (_, idle)| idle < STREAK_GAP);
         for &b in &grown {
-            let n = streaks.entry(b).or_insert(0);
+            let (n, idle) = streaks.entry(b).or_insert((0, 0));
             *n += 1;
+            *idle = 0;
             if *n >= WIDEN_AFTER {
                 new_vals.bytes.insert(b, None);
             }

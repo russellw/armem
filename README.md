@@ -761,34 +761,39 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   and atomics. `cargo test` runs 200 small random tests; larger ones,
   which can take hours, run with
   `cargo test --release --test por -- --ignored` and are worth running
-  after changing the model or the reduction. The pre-pass widens a
-  byte whose set of values grows in three rounds in a row (a counter,
-  such as a sequence number) to any value, rather than adding values
-  round after round. A byte that only one thread writes is read by that
-  thread exactly as it last wrote it (by coherence, no other write to it
-  exists), so the indices and counters a thread owns stay precise; this
-  is what lets the analysis bound `buf[head % N]` in a ring buffer.
-  (It keeps such values only for bytes the thread reads; when a run
-  reads one it dropped, the thread's run is repeated.) The pre-pass also
-  keeps the whole values written with each footprint. An aligned read
-  of bytes that every write covers with the read's own footprint reads
-  them all from one write (or initial memory), since an aligned access
-  is single-copy atomic, so it returns only those values. Byte by byte,
-  a pointer that may be null or point to one of two nodes would combine
-  into many addresses no write stored. Reading through those found yet
-  more values until the bytes were widened, and the pre-pass gave up on
-  the [Treiber stack](#c-programs). Being more precise, it also cut the
-  correct double-checked initialization at `-O2` from 178 memories to
-  47, all of them now from private memory rather than the reduction.
-  Besides barriers,
-  a thread orders reads by dependencies: by an address dependency, by
-  reading back a write whose address or data depends on a read, and
-  after an acquire so ordered. Where a thread may do so, the pre-pass
-  runs it again once for each instruction that may read another
-  thread's writes, tracking which later reads depend on that one, so a
-  dependency that orders only a ring buffer's index reads does not count
-  as ordering its data reads. If
-  the pre-pass gets too big, or a thread accesses memory at an address it
+  after changing the model or the reduction. The pre-pass widens a byte
+  whose set of values grows in three rounds (a counter, such as a sequence
+  number) to any value, rather than adding values round after round. The
+  rounds need not be consecutive, as long as no two in a row pass without
+  growth: in `ck_epoch`, the global epoch grows in one round and each
+  thread's copy of it in the next, so neither grew in consecutive rounds,
+  and the analysis ran out of states. An AND with an immediate, or an
+  unsigned bitfield extract, that keeps at most four bits of a value the
+  analysis does not know gives each value those bits may have, so an array
+  index computed that way (`epoch & 3` in `ck_epoch`) keeps the address
+  known. A byte that only one thread writes is read by that thread exactly
+  as it last wrote it (by coherence, no other write to it exists), so the
+  indices and counters a thread owns stay precise; this is what lets the
+  analysis bound `buf[head % N]` in a ring buffer. (It keeps such values
+  only for bytes the thread reads; when a run reads one it dropped, the
+  thread's run is repeated.) The pre-pass also keeps the whole values
+  written with each footprint. An aligned read of bytes that every write
+  covers with the read's own footprint reads them all from one write (or
+  initial memory), since an aligned access is single-copy atomic, so it
+  returns only those values. Byte by byte, a pointer that may be null or
+  point to one of two nodes would combine into many addresses no write
+  stored. Reading through those found yet more values until the bytes were
+  widened, and the pre-pass gave up on the [Treiber stack](#c-programs).
+  Being more precise, it also cut the correct double-checked
+  initialization at `-O2` from 178 memories to 47, all of them now from
+  private memory rather than the reduction. Besides barriers, a thread
+  orders reads by dependencies: by an address dependency, by reading back
+  a write whose address or data depends on a read, and after an acquire so
+  ordered. Where a thread may do so, the pre-pass runs it again once for
+  each instruction that may read another thread's writes, tracking which
+  later reads depend on that one, so a dependency that orders only a ring
+  buffer's index reads does not count as ordering its data reads. If the
+  pre-pass gets too big, or a thread accesses memory at an address it
   cannot bound, it gives up and nothing is pruned.
 * **Private memory** (on by default; `--no-private` turns it off). Every
   write another thread might see is a promise, and memories multiply with

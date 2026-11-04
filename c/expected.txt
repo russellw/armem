@@ -162,3 +162,11 @@ ck_fifo_spsc -O2 yes no -DWEAK_DEQ
 ck_fifo_spsc -O0 no no fuel=2000
 ck_fifo_spsc -O0 yes no -DWEAK_ENQ sample=10 fuel=2000
 ck_fifo_spsc -O0 yes no -DWEAK_DEQ fuel=2000
+
+# ck's multi-producer FIFO, each thread dequeuing and at once re-enqueuing
+# in the node it gets back. As written, a dequeue's read of the value is not
+# ordered before the compare-and-swap that claims its node, and the other
+# thread can refill the node in between. (With -DFENCE_DEQ, which fences
+# them, the search is too long for this suite.)
+ck_fifo_mpmc -O2 yes no sample=3
+ck_fifo_mpmc -O1 yes no sample=3

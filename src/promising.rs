@@ -211,8 +211,13 @@ struct Solo<'a> {
     fuel: u32,
     lse2: bool,
     mode: Mode,
-    /// Visited states (with the step counter zeroed) -> fewest steps seen.
+    /// Visited states (with the step counter zeroed, and dead registers
+    /// cleared if `live` is given) -> fewest steps seen.
     visited: FxHashMap<(TState, Vec<Msg>), u32>,
+    live: Option<Arc<crate::live::Liveness>>,
+    /// A return the liveness did not expect was reached: the results are
+    /// void, and the run must be repeated without it.
+    live_failed: bool,
     candidates: BTreeSet<Candidate>,
     finals: BTreeSet<Vec<u64>>,
     final_regs: &'a [u8],
@@ -254,8 +259,18 @@ fn dep(view: View, pick: View) -> RV {
 }
 
 impl<'a> Solo<'a> {
-    fn new(test: &'a Test, cfg: &Options, proj: &'a Projection, tid: usize, base: Vec<Msg>, mode: Mode) -> Solo<'a> {
+    fn new(
+        test: &'a Test,
+        cfg: &Options,
+        proj: &'a Projection,
+        tid: usize,
+        base: Vec<Msg>,
+        mode: Mode,
+        live: Option<Arc<crate::live::Liveness>>,
+    ) -> Solo<'a> {
         Solo {
+            live,
+            live_failed: false,
             test,
             prog: &test.threads[tid].code,
             tid,
@@ -566,6 +581,10 @@ impl<'a> Solo<'a> {
     fn successors(&mut self, st: &TState, ext: &[Msg]) -> Vec<Succ> {
         let mut s = st.clone();
         loop {
+            if self.live.as_ref().is_some_and(|l| !l.ret_ok(self.prog, &s.core)) {
+                self.live_failed = true;
+                return vec![];
+            }
             match s.core.step(self.prog) {
                 Step::Local { ctrl, write } => {
                     if let Some(w) = write {
@@ -996,6 +1015,9 @@ impl<'a> Solo<'a> {
             // to offer; this collapses spin loops.
             let mut key = st.clone();
             key.core.steps = 0;
+            if let Some(l) = &self.live {
+                l.canon(&mut key.core);
+            }
             match self.visited.entry((key, ext.clone())) {
                 Entry::Occupied(e) if *e.get() <= st.core.steps => continue,
                 Entry::Occupied(mut e) => *e.get_mut() = st.core.steps,
@@ -1010,6 +1032,9 @@ impl<'a> Solo<'a> {
             for x in self.successors(&st, &ext) {
                 queue.push(x.0.core.steps, x);
             }
+            if self.live_failed {
+                return;
+            }
         }
     }
 }
@@ -1018,10 +1043,10 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
     if test.threads.len() == 1 {
         // A lone thread sees its own accesses in program order: its behaviors
         // are exactly the sequentially consistent ones.
-        return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel, cfg.private);
+        return crate::interleave::explore(test, crate::interleave::Kind::Sc, cfg.fuel, cfg.private, cfg.live);
     }
     let mut proj = Projection::new(test);
-    let analysis = if cfg.por || cfg.private { crate::reduce::analyze(test, cfg.fuel) } else { None };
+    let analysis = if cfg.por || cfg.private { crate::reduce::analyze(test, cfg.fuel, cfg.live) } else { None };
     let n = test.threads.len();
     let private = match &analysis {
         Some(r) if cfg.private => {
@@ -1053,6 +1078,12 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
         cfg,
         proj: &proj,
         private: private.into_iter().map(Arc::new).collect(),
+        live: (0..n)
+            .map(|t| {
+                let exit = proj.thread_regs[t].iter().filter(|&&r| r < 31).fold(0, |m, &r| m | 1 << r);
+                cfg.live.then(|| Arc::new(crate::live::Liveness::new(&test.threads[t].code, exit)))
+            })
+            .collect(),
         reduction: if cfg.por { analysis } else { None },
         results: Outcomes::new(test.observables()),
     };
@@ -1070,13 +1101,24 @@ struct Explorer<'a> {
     proj: &'a Projection,
     /// Each thread's private memory (see `Reduction::private`).
     private: Vec<Arc<Vec<(u64, u64)>>>,
+    /// Each thread's register liveness, with the observed registers live
+    /// at the end; None once a run has returned where it did not expect.
+    live: Vec<Option<Arc<crate::live::Liveness>>>,
     reduction: Option<crate::reduce::Reduction>,
     results: Outcomes,
 }
 
 impl<'a> Explorer<'a> {
-    fn solo(&self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
-        Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode)
+    /// Run thread `tid` alone against `mem`.
+    fn solo(&mut self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
+        loop {
+            let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
+            s.run(self.start(tid, mem));
+            if !s.live_failed {
+                return s;
+            }
+            self.live[tid] = None;
+        }
     }
 
     fn start(&self, tid: usize, mem: &[Msg]) -> TState {
@@ -1103,7 +1145,6 @@ impl<'a> Explorer<'a> {
         let mut candidates = Vec::new();
         for tid in 0..test.threads.len() {
             let mut c = self.solo(tid, mem, Mode::Collect);
-            c.run(self.start(tid, mem));
             self.results.truncated |= c.truncated;
             faulted |= !c.faults.is_empty();
             self.results.faults.extend(std::mem::take(&mut c.faults));
@@ -1139,8 +1180,7 @@ impl<'a> Explorer<'a> {
                 if skip(&m2) {
                     continue;
                 }
-                let mut cert = self.solo(tid, &m2, Mode::Certify);
-                cert.run(self.start(tid, &m2));
+                let cert = self.solo(tid, &m2, Mode::Certify);
                 if cert.certified {
                     out.push(m2);
                 } else {

@@ -15,6 +15,7 @@ pub mod image;
 pub mod interleave;
 pub mod isa;
 pub mod litmus;
+pub mod live;
 pub mod memory;
 pub mod outcome;
 pub mod promising;
@@ -56,6 +57,10 @@ pub struct Options {
     /// to its stack: in the ARM model without write messages, and in the
     /// reference models as local steps (see `reduce::Reduction::private`).
     pub private: bool,
+    /// Merge states that differ only in registers that are never read
+    /// again (see `live`): in the ARM model's solo explorations, the
+    /// reduction's pre-pass and the reference models.
+    pub live: bool,
     /// Instead of exploring every memory, follow this many random paths
     /// through them. The final states found are possible, but others may be
     /// missed.
@@ -70,14 +75,14 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, private: true, sample: None, seed: 0, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, private: true, live: true, sample: None, seed: 0, max_memories: None }
     }
 }
 
 pub fn run(test: &litmus::Test, model: Model, opts: &Options) -> Outcomes {
     match model {
         Model::Arm => promising::explore(test, opts),
-        Model::Tso => interleave::explore(test, interleave::Kind::Tso, opts.fuel, opts.private),
-        Model::Sc => interleave::explore(test, interleave::Kind::Sc, opts.fuel, opts.private),
+        Model::Tso => interleave::explore(test, interleave::Kind::Tso, opts.fuel, opts.private, opts.live),
+        Model::Sc => interleave::explore(test, interleave::Kind::Sc, opts.fuel, opts.private, opts.live),
     }
 }

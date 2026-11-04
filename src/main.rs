@@ -24,6 +24,9 @@ options:
       --no-private   give every write to memory a place in the order of
                      writes, even to memory only one thread accesses
                      (slower; for checking that optimization)
+      --no-live      keep registers that are never read again in the
+                     states explored (slower; for checking that
+                     optimization)
       --elf FILE     start from the memory of an AArch64 ELF file (an
                      object file is relocated first); its global variables
                      can be named in the tests
@@ -50,6 +53,7 @@ fn main() -> ExitCode {
             "--lse2" => opts.lse2 = true,
             "--no-por" => opts.por = false,
             "--no-private" => opts.private = false,
+            "--no-live" => opts.live = false,
             "--sample" | "--seed" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) if a == "--sample" => opts.sample = Some(n),
                 Some(n) => opts.seed = n,

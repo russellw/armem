@@ -1,8 +1,9 @@
 //! Checks the partial-order reduction (`src/reduce.rs`), and the handling
 //! of memory private to one thread that relies on its analysis: on every
 //! litmus test, and on randomly generated tests, the ARM model must reach
-//! exactly the same final states with and without each of them, and the
-//! TSO and SC models with and without private memory.
+//! exactly the same final states with and without each of them (and
+//! without register liveness, see `src/live.rs`), and the TSO and SC models
+//! with and without private memory and liveness.
 
 use armem::{Model, litmus, run};
 use std::path::Path;
@@ -11,17 +12,19 @@ fn options(por: bool, private: bool, lse2: bool) -> armem::Options {
     armem::Options { por, private, lse2, ..Default::default() }
 }
 
-/// Explore `t` with neither the reduction nor private memory, and check
-/// that both together, and private memory alone, give the same results.
+/// Explore `t` with neither the reduction nor private memory nor register
+/// liveness, and check that the reduction and private memory together,
+/// private memory alone, and liveness alone (which the others use too)
+/// give the same results.
 /// Returns the memories explored without and with both, or None if the
 /// search without them would explore more than `budget` memories.
 fn check_within(t: &litmus::Test, src: &str, lse2: bool, budget: Option<u64>) -> Option<(u64, u64)> {
-    let full = run(t, Model::Arm, &armem::Options { max_memories: budget, ..options(false, false, lse2) });
+    let full = run(t, Model::Arm, &armem::Options { max_memories: budget, live: false, ..options(false, false, lse2) });
     if full.over_budget {
         return None;
     }
     let mut reduced_memories = 0;
-    for (por, private) in [(true, true), (false, true)] {
+    for (por, private) in [(true, true), (false, true), (false, false)] {
         let reduced = run(t, Model::Arm, &options(por, private, lse2));
         let what = format!("por={} private={} lse2={}", por, private, lse2);
         assert_eq!(full.states.keys().collect::<Vec<_>>(), reduced.states.keys().collect::<Vec<_>>(), "{}\n{}", what, src);
@@ -32,7 +35,8 @@ fn check_within(t: &litmus::Test, src: &str, lse2: bool, budget: Option<u64>) ->
         }
     }
     for model in [Model::Tso, Model::Sc] {
-        let [plain, private] = [false, true].map(|private| run(t, model, &options(false, private, lse2)));
+        let plain = run(t, model, &armem::Options { live: false, ..options(false, false, lse2) });
+        let private = run(t, model, &options(false, true, lse2));
         let what = format!("{:?} private lse2={}", model, lse2);
         assert_eq!(plain.states.keys().collect::<Vec<_>>(), private.states.keys().collect::<Vec<_>>(), "{}\n{}", what, src);
         assert_eq!(plain.faults, private.faults, "{}\n{}", what, src);
@@ -313,4 +317,38 @@ fn sampling() {
     let t = litmus::parse(&src).unwrap();
     let sampled = run(&t, Model::Arm, &armem::Options { sample: Some(20), ..Default::default() });
     assert_eq!(sampled.observed(&t), Some(true));
+}
+
+/// A return to an address that is not after a `BL` (here, the return
+/// address is changed): liveness assumes it cannot happen, so the searches
+/// must notice it and start again without liveness. `X1` holds 0 or 1 from
+/// the load, and is dead at the load in `f` if `RET` returns after the
+/// `BL` (where `X1` is overwritten); it is read where `RET` really goes.
+/// P1 reads `z` too, so that the load in `f` is not private memory: it is
+/// a step of the search, where states differing only in `X1` could merge.
+#[test]
+fn unexpected_return() {
+    let src = "AArch64 unexpected-return
+{ 0:X2=x; 0:X3=y; 0:X4=z; 1:X2=x; 1:X4=z; }
+ P0              | P1          ;
+ LDR X1,[X2]     | MOV X0,#1   ;
+ BL f            | STR X0,[X2] ;
+ MOV X1,#0       | LDR X5,[X4] ;
+ B end           |             ;
+ STR X1,[X3]     |             ;
+ B end           |             ;
+ f:              |             ;
+ LDR X5,[X4]     |             ;
+ ADD X30,X30,#8  |             ;
+ RET             |             ;
+ end:            |             ;
+exists (y=1)
+";
+    let t = litmus::parse(src).unwrap();
+    for model in [Model::Arm, Model::Tso, Model::Sc] {
+        let [dead, live] = [false, true].map(|live| run(&t, model, &armem::Options { live, ..Default::default() }));
+        assert_eq!(dead.states.keys().collect::<Vec<_>>(), live.states.keys().collect::<Vec<_>>(), "{:?}", model);
+        assert_eq!(live.states.len(), 2, "{:?}: y may be 0 or 1", model);
+    }
+    check(&t, src, false);
 }

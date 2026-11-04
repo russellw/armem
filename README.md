@@ -32,6 +32,7 @@ cargo build --release
 ./target/release/armem --sample 100 FILE           # 100 random paths, for big tests
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
+./target/release/armem --no-live FILE              # without register liveness
 cargo test --release                               # check the litmus suite
 ```
 
@@ -631,6 +632,48 @@ search with `-DWEAK_ENQ`: the producer's writes are then unordered, and
 the consumer sees them in many orders, so it takes 2 minutes, and
 `expected.txt` samples 10 paths instead (0.1 to 0.4 s).
 
+`ck_fifo_mpmc.c` runs ck's multi-producer, multi-consumer FIFO, a
+Michael-Scott queue whose head, tail and links are (pointer, generation)
+pairs, each updated by a 16-byte compare-and-swap (`LDXP`/`STXP` on
+aarch64). As in the test of node re-use that ck added in commit `e78c421`
+(June 2026), the queue starts with the entries 1 and 2, and each of two
+threads dequeues once and at once enqueues the value again, in the node
+the dequeue gave back. The queue is never empty, so the condition is a
+dequeue that reports it empty, or the threads receiving anything but 1
+and 2.
+
+As written (ck `8f0847c`, the latest commit as of November 2026), the
+condition is reachable on ARM only: both threads can receive 2, and
+item 1 is lost. A dequeue reads the value of the node after the head
+("Save value before commit") and then claims it by moving the head with
+`ck_pr_cas_ptr_2`, which on aarch64 orders nothing. So ARM may perform
+the read after the compare-and-swap. Meanwhile the other thread dequeues
+the next entry, which moves the head past that node and gives it back
+as garbage, and it re-enqueues its own value, 2, in it. The late read
+returns 2. In Arm's model this is load buffering: the second thread's
+write of the value is ordered after its read of the head (a control
+dependency), but nothing orders the first thread's read of the value
+before its write of the head. x86 cannot do this, since its
+compare-and-swap is a full barrier. `-DFENCE_DEQ` adds
+`ck_pr_fence_load_store()` (`DMB SY`) between the read and the
+compare-and-swap, and then 20 sampled paths no longer reach the
+condition; exhaustive search did not finish in 20 minutes, so that is
+evidence for the fix, not proof. `ck_fifo_mpmc_trydequeue` reads the
+value the same way. The bug needs a node to be re-used while another
+thread may still read it, which ck's own test does on purpose.
+
+ck changed this FIFO twice in 2026, and `ck_fifo_mpmc_variants.c` has
+the code from before each change. `-DOLD_DEQ` uses the dequeue from
+before `e78c421`, which could report the queue empty when its snapshot
+of the head had been re-used. With `-DFENCE_DEQ -DOLD_DEQ`, a thread
+receives nothing even under SC: that bug is not about the memory
+model. `-DOLD_ENQ` uses the enqueue from before `ed6bace` (September
+2026), which started a node's generation at 0 and had no load fence
+before re-checking the tail's generation; with `-DFENCE_DEQ -DOLD_ENQ`,
+20 sampled paths did not reach the condition. The sampled tests take
+5 to 7 s at `-O1` to `-O2` (and the same verdict at `-Os`), and TSO
+about 2 s; at `-O0`, 20 sampled paths take over 10 minutes.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -829,6 +872,39 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   buffer's index reads does not count as ordering its data reads. If the
   pre-pass gets too big, or a thread accesses memory at an address it
   cannot bound, it gives up and nothing is pruned.
+  Two rules keep the pre-pass precise on `ck_fifo_mpmc`, whose head, tail
+  and links are each a pointer and a generation counter written together
+  by a 16-byte store-exclusive and read as a pair or as separate 8-byte
+  loads. The pre-pass keeps the values of each half of a 16-byte write as
+  well as those of the whole, and reads an exclusive pair as two halves,
+  so a widened generation leaves its pointer known; an aligned read inside
+  a write's footprint reads a slice of that write's values. And a byte is
+  widened only once it holds more than four values: a pointer that comes
+  to point to one more of three nodes in each of three rounds, as values
+  spread between the threads, is not a counter. Before these rules, the
+  pre-pass gave up on `ck_fifo_mpmc` and nothing was pruned.
+* **Register liveness** (on by default; `--no-live` turns it off,
+  `src/live.rs`). Compiled code leaves values in registers it no longer
+  needs: the comparison results of a retry loop, a value loaded only to be
+  thrown away (a volatile read), the status of a store-exclusive. States
+  that differ only in such registers behave alike, so the solo
+  explorations, the pre-pass and the reference models clear the registers
+  that are dead at a state's next instruction before they look the state
+  up. Liveness is found by the usual backward analysis. At the end of the
+  code, the registers the test observes are live (for the pre-pass, none),
+  and before `BR` and `BLR` all are. A `RET` is taken to return to the end
+  of the code or after a `BL` or `BLR`, the only addresses compiled code
+  puts in X30; each search checks this before a `RET`, and if it fails it
+  starts again without liveness (the pre-pass gives up). That check is
+  enough: merged states agree on the live registers, X30 included, so
+  they take the same path until the first unexpected `RET`, which the
+  state kept also takes. In `ck_fifo_mpmc`, liveness took the pre-pass's
+  second round from 25,419 states to 1,276, and with it the pre-pass
+  finishes instead of running out of states: on two threads that each
+  enqueue once, it then finds their private memory, and the search takes
+  1,221 memories in 4.4 s rather than 39,421 in 232 s. `tests/por.rs` compares every search with one without liveness,
+  including a test whose `RET` goes elsewhere: without the check, TSO and
+  SC miss one of its final states.
 * **Private memory** (on by default; `--no-private` turns it off). Every
   write another thread might see is a promise, and memories multiply with
   each one, its value included. But a C program's results, and variables
@@ -995,11 +1071,10 @@ lets a lone `LDXP` be torn.
   counter that several threads increment, and a spinlock that spins on
   an exchange, which writes on every turn (see [C programs](#c-programs)).
   Beyond that, `--sample` gives up completeness. ck's multi-producer
-  FIFO (`ck_fifo_mpmc`) is out of reach for now: two threads that each
-  enqueue once explore thousands of memories, as the pre-pass cannot
-  tell that the other thread reads a new node only after the link that
-  publishes it, so the order of the node's initializing writes looks
-  observable. Each memory
+  FIFO (`ck_fifo_mpmc`), with two threads that each dequeue and enqueue
+  once, does not finish in 20 minutes: each memory costs about 10,000
+  solo states, most of them in certifications that fail, at about 30
+  memories a second. Each memory
   also costs a solo exploration of every thread, which grows with
   the threads' own branching.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
@@ -1024,9 +1099,9 @@ lets a lone `LDXP` be torn.
    bugs that ck fixed in June 2026 in it and in `ck_epoch`, and ck's
    seven spinlocks and its sequence lock run too (see [Concurrency
    Kit](#concurrency-kit)), and with a second poller armem finds the
-   ARM-only bug ck fixed in `ck_epoch_poll`, and its single-producer
-   FIFO runs too; next come ck's multi-producer FIFO (see
-   [Limitations](#limitations-current)) and other libraries.
+   ARM-only bug ck fixed in `ck_epoch_poll`, and its FIFOs run too: in
+   the multi-producer one, armem finds an ARM-only bug that ck has not
+   fixed. Next come other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at
@@ -1039,8 +1114,11 @@ lets a lone `LDXP` be torn.
    coherence kept as ranges to 5 s), and private memory for atomics
    that neither acquire nor release (`ck_epoch_poll` from over 2
    minutes to 3.4 s), and private memory and interned thread states in
-   the reference models; next comes guiding the sampling
-   towards reads that disagree with what TSO would return.
+   the reference models, and register liveness (two enqueuers on ck's
+   multi-producer FIFO from 39,421 memories in 232 s to 1,221 in 4.4 s); next come cheaper
+   failed certifications, which dominate that FIFO's full test, and
+   guiding the sampling towards reads that disagree with what TSO would
+   return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

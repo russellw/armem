@@ -1,0 +1,5 @@
+AArch64 ck_fifo_mpmc
+"Each thread must dequeue a different one of 1 and 2"
+{ uint64_t got0[1]; uint64_t got1[1]; }
+ P0 = t0 | P1 = t1 ;
+exists (~(got0[0]=1 /\ got1[0]=2 \/ got0[0]=2 /\ got1[0]=1))

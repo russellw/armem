@@ -26,6 +26,7 @@ use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, low_bytes, pair_value, r
 use crate::hash::FxHashMap;
 use crate::isa::{Barrier, Size};
 use crate::litmus::{Obs, Test};
+use crate::live::Liveness;
 use crate::outcome::Outcomes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,8 +119,18 @@ impl Global {
 /// its code, a fault or the fuel limit. `Core::step` leaves the core
 /// unchanged unless the step is local, so the next instruction is left for
 /// the explorer.
-fn run_local(core: &mut Core, prog: &crate::isa::Code, fuel: u32) {
-    while core.steps < fuel && matches!(core.step(prog), Step::Local { .. }) {}
+/// Take `core`'s local steps. False if it reached a return that `live`
+/// does not expect (see `Liveness::ret_ok`).
+fn run_local(core: &mut Core, prog: &crate::isa::Code, fuel: u32, live: Option<&Liveness>) -> bool {
+    while core.steps < fuel {
+        if live.is_some_and(|l| !l.ret_ok(prog, core)) {
+            return false;
+        }
+        if !matches!(core.step(prog), Step::Local { .. }) {
+            break;
+        }
+    }
+    true
 }
 
 /// An exclusive or atomic access by thread `t` to its private memory, if
@@ -184,11 +195,30 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
 /// Explore every interleaving of `test` under `kind`. With `private`,
 /// memory that only one thread accesses is treated like its stack (see
 /// the module comment).
-pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
+/// With `live`, thread states that differ only in registers never read
+/// again are merged (see `crate::live`).
+pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -> Outcomes {
+    live.then(|| explore_with(test, kind, fuel, private, true))
+        .flatten()
+        .unwrap_or_else(|| explore_with(test, kind, fuel, private, false).unwrap())
+}
+
+/// `explore`, merging thread states that differ only in dead registers if
+/// `live`. None if a thread returned where the liveness did not expect.
+fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -> Option<Outcomes> {
     let obs = test.observables();
+    let lives: Vec<Option<Liveness>> = (0..test.threads.len())
+        .map(|t| {
+            let exit = obs.iter().fold(0, |m, o| match *o {
+                Obs::Reg(u, r) if u == t && r < 31 => m | 1 << r,
+                _ => m,
+            });
+            live.then(|| Liveness::new(&test.threads[t].code, exit))
+        })
+        .collect();
     let mut results = Outcomes::new(obs.clone());
     let n = test.threads.len();
-    let ranges: Vec<Arc<Vec<(u64, u64)>>> = match private.then(|| crate::reduce::analyze(test, fuel)).flatten() {
+    let ranges: Vec<Arc<Vec<(u64, u64)>>> = match private.then(|| crate::reduce::analyze(test, fuel, true)).flatten() {
         Some(r) => {
             let observed: Vec<(u64, u64)> = obs
                 .iter()
@@ -201,6 +231,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
         }
         None => vec![Arc::new(Vec::new()); n],
     };
+    let mut ok = true;
     let start = Global {
         threads: test
             .threads
@@ -210,13 +241,16 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
             .map(|(i, (p, r))| {
                 let mut core = Core::new(test.init_regs[i], i, n, p.entry);
                 core.stack.set_private(r, &|b| test.init_byte(b));
-                run_local(&mut core, &p.code, fuel);
+                ok &= run_local(&mut core, &p.code, fuel, lives[i].as_ref());
                 Arc::new(Thread { core, buf: Vec::new(), mon: None })
             })
             .collect(),
         ids: vec![None; n],
         mem: BTreeMap::new(),
     };
+    if !ok {
+        return None;
+    }
     // Visited states (step counters zeroed) -> the per-thread step counts
     // they have been explored with, none using at least as many steps as
     // another on every thread. A state reached again with no thread having
@@ -238,6 +272,11 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
             if g.ids[i].is_none() {
                 let t = Arc::make_mut(&mut g.threads[i]);
                 t.core.steps = 0;
+                // Interned with its dead registers cleared.
+                let (regs, flags) = (t.core.regs, t.core.flags);
+                if let Some(l) = &lives[i] {
+                    l.canon(&mut t.core);
+                }
                 let id = match interned.get(t) {
                     Some(&id) => id,
                     None => {
@@ -246,6 +285,7 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
                         id
                     }
                 };
+                (t.core.regs, t.core.flags) = (regs, flags);
                 t.core.steps = steps[i];
                 g.ids[i] = Some(id);
             }
@@ -283,6 +323,9 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
             let mut n = g.clone();
             let buf_empty = n.thread(tid).buf.is_empty();
             let prog = &*test.threads[tid].code;
+            if lives[tid].as_ref().is_some_and(|l| !l.ret_ok(prog, &n.thread(tid).core)) {
+                return None;
+            }
             let step = n.thread(tid).core.step(prog);
             let ok = match step {
                 Step::Done => false,
@@ -417,7 +460,9 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
                 },
             };
             if ok {
-                run_local(&mut n.thread(tid).core, prog, fuel);
+                if !run_local(&mut n.thread(tid).core, prog, fuel, lives[tid].as_ref()) {
+                    return None;
+                }
                 queue.push(total(&n), n);
                 any = true;
             }
@@ -441,5 +486,5 @@ pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool) -> Outcomes {
             results.insert(state);
         }
     }
-    results
+    Some(results)
 }

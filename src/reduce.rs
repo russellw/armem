@@ -59,7 +59,7 @@
 //! (such a read is ordered after the reads the store depends on). If the
 //! analysis gives up (or gets too big), nothing is pruned.
 
-use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
+use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, rmw_result};
 use crate::hash::FxHashMap;
 use crate::isa::{Addr, Barrier, Code, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::Test;
@@ -84,6 +84,11 @@ const MAX_ROUNDS: usize = 64;
 /// round after round until it reached `MAX_BYTE_VALUES`, while the runs
 /// that read it grew with every value.
 const WIDEN_AFTER: usize = 3;
+/// A byte is widened only once it holds more than this many values (its
+/// initial value aside). A pointer that comes to point to each of a few
+/// nodes, one more in each round as the values spread from thread to
+/// thread, is not a counter.
+const WIDEN_MIN_VALUES: usize = 4;
 /// A streak ends after this many rounds in a row without growth. A single
 /// round is not enough: a counter that one thread increments and others
 /// copy (an epoch, and each thread's record of the epoch it observed)
@@ -369,17 +374,42 @@ struct Known {
 
 impl Known {
     /// The values an aligned read of `n` bytes at `a` may return besides
-    /// the initial value, if they can be found from whole writes.
-    fn whole(&self, a: u64, n: u64) -> Option<&BTreeSet<u128>> {
+    /// the initial value, if they can be found from whole writes: when
+    /// every write to its bytes has a footprint that contains the whole
+    /// read (the same one, or a pair or 16-byte write around it). An
+    /// aligned read is single-copy atomic, so at the point where it reads,
+    /// one such write is the latest for all its bytes, and it returns a
+    /// slice of that write's value.
+    fn whole(&self, a: u64, n: u64) -> Option<BTreeSet<u128>> {
         if !matches!(n, 1 | 2 | 4 | 8) || a % n != 0 {
             return None;
         }
-        let only = |b: u64| self.cover.get(&b).is_some_and(|c| c.len() == 1 && c.contains(&(a, n)));
-        let known = |b: u64| matches!(self.bytes.get(&b), Some(Some(_)));
-        if !(a..a + n).all(|b| only(b) && known(b)) {
-            return None;
+        let mut fps: BTreeSet<(u64, u64)> = BTreeSet::new();
+        for b in a..a + n {
+            if !matches!(self.bytes.get(&b), Some(Some(_))) {
+                return None;
+            }
+            fps.extend(self.cover.get(&b)?);
         }
-        self.words.get(&(a, n))?.as_ref()
+        let contains = |(wa, wn): (u64, u64)| wa <= a && a + n <= wa + wn;
+        let mut out = BTreeSet::new();
+        for &(wa, wn) in &fps {
+            if !contains((wa, wn)) {
+                return None;
+            }
+            // A 16-byte write's values are kept per half too (see
+            // `Havoc::write_parts`), so the half within which the read
+            // lies has them all, and stays known when the other half (of a
+            // pair) is not.
+            if wn == 16 && [wa, wa + 8].iter().any(|&h| contains((h, 8)) && fps.contains(&(h, 8))) {
+                continue;
+            }
+            let mask = if n == 16 { u128::MAX } else { (1u128 << (8 * n)) - 1 };
+            for v in self.words.get(&(wa, wn))?.as_ref()? {
+                out.insert((v >> (8 * (a - wa))) & mask);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -442,6 +472,9 @@ struct Havoc<'a> {
     pc: usize,
     after: bool,
     ordered: bool,
+    /// Live registers at each instruction (see `crate::live`), with none
+    /// live at the end, as the analysis ignores final registers.
+    live: Option<&'a crate::live::Liveness>,
 }
 
 impl<'a> Havoc<'a> {
@@ -455,6 +488,7 @@ impl<'a> Havoc<'a> {
         read_bytes: &'a HashSet<u64>,
         budget: &'a mut usize,
         dep: Option<Dep>,
+        live: Option<&'a crate::live::Liveness>,
     ) -> Havoc<'a> {
         Havoc {
             test,
@@ -480,6 +514,7 @@ impl<'a> Havoc<'a> {
             pc: 0,
             after: false,
             ordered: false,
+            live,
         }
     }
 
@@ -497,13 +532,26 @@ impl<'a> Havoc<'a> {
         if acquire {
             self.acquire_reads.insert((a, n));
         }
-        if !(a..a + n).any(|b| self.own_only(b))
-            && let Some(ws) = self.vals.whole(a, n)
-        {
-            let init = self.stand_in(a, n);
-            if ws.len() < MAX_READ_VALUES {
-                let t = self.dep_taint(own, addr, n);
-                return std::iter::once(init).chain(ws.iter().copied()).collect::<BTreeSet<_>>().into_iter().map(|v| (v, t)).collect();
+        if !(a..a + n).any(|b| self.own_only(b)) {
+            if let Some(ws) = self.vals.whole(a, n) {
+                let init = self.stand_in(a, n);
+                if ws.len() < MAX_READ_VALUES {
+                    let t = self.dep_taint(own, addr, n);
+                    return std::iter::once(init).chain(ws).collect::<BTreeSet<_>>().into_iter().map(|v| (v, t)).collect();
+                }
+            }
+            // A 16-byte read (of a pair) is two single-copy-atomic halves
+            // at most, so it returns any combination of their values.
+            if n == 16
+                && a % 8 == 0
+                && let (Some(lo), Some(hi)) = (self.vals.whole(a, 8), self.vals.whole(a + 8, 8))
+            {
+                let lo: BTreeSet<u128> = std::iter::once(self.stand_in(a, 8)).chain(lo).collect();
+                let hi: BTreeSet<u128> = std::iter::once(self.stand_in(a + 8, 8)).chain(hi).collect();
+                if lo.len() * hi.len() < MAX_READ_VALUES {
+                    let t = self.dep_taint(own, addr, n);
+                    return lo.iter().flat_map(|&l| hi.iter().map(move |&h| (h << 64) | l)).map(|v| (v, t)).collect();
+                }
             }
         }
         let mut out = vec![0u128];
@@ -580,7 +628,23 @@ impl<'a> Havoc<'a> {
 
     /// A write of `n` bytes of `v` at `addr`; `data` is the taint of `v`.
     fn write(&mut self, own: &mut Own, addr: RV, n: u64, v: u128, data: View) {
+        self.write_parts(own, addr, n, &[(v, data)]);
+    }
+
+    /// A single-copy-atomic write of `n` bytes at `addr` made of equal
+    /// parts (the registers of a pair), each a value and its taint. The
+    /// whole values of each half of a 16-byte write are kept as well as
+    /// those of the whole write, so a register whose value is unknown (a
+    /// counter) leaves the other (a pointer) known.
+    fn write_parts(&mut self, own: &mut Own, addr: RV, n: u64, parts: &[(u128, View)]) {
         let a = addr.val;
+        let h = n / parts.len() as u64;
+        let data = parts.iter().map(|p| p.1).max().unwrap();
+        let part = |i: u64| parts[(i / h) as usize];
+        let byte = |i: u64| {
+            let (v, t) = part(i);
+            (t < UNKNOWN).then_some((v >> (8 * (i % h))) as u8)
+        };
         self.write_fps.insert((a, n));
         if taint(addr) != 0 || data != 0 {
             self.dep_writes.insert((a, n));
@@ -594,24 +658,36 @@ impl<'a> Havoc<'a> {
         };
         for i in 0..n {
             if self.own_only(a + i) {
-                let e = if self.read_bytes.contains(&(a + i)) { ((data < UNKNOWN).then_some((v >> (8 * i)) as u8), depends) } else { (None, false) };
+                let e = if self.read_bytes.contains(&(a + i)) { (byte(i), depends) } else { (None, false) };
                 own.insert(a + i, e);
             }
         }
-        let w = self.word_writes.entry((a, n)).or_insert_with(|| Some(BTreeSet::new()));
-        match w {
-            Some(set) if data < UNKNOWN => {
-                set.insert(v);
+        let whole = parts.iter().enumerate().fold(0u128, |w, (j, p)| w | p.0 << (8 * h * j as u64));
+        let mut words = vec![((a, n), whole, data)];
+        // A 16-byte write's values are kept per 8-byte half too (see
+        // `Known::whole`), each with its own taint if it is a pair.
+        if n == 16 {
+            for j in 0..2u64 {
+                let t = if parts.len() == 2 { parts[j as usize].1 } else { data };
+                words.push(((a + 8 * j, 8), (whole >> (64 * j)) & u64::MAX as u128, t));
             }
-            _ => *w = None,
+        }
+        for (fp, v, t) in words {
+            let w = self.word_writes.entry(fp).or_insert_with(|| Some(BTreeSet::new()));
+            match w {
+                Some(set) if t < UNKNOWN => {
+                    set.insert(v);
+                }
+                _ => *w = None,
+            }
         }
         for i in 0..n {
             let e = self.writes.entry(a + i).or_insert_with(|| Some(BTreeSet::new()));
-            match e {
-                Some(set) if data < UNKNOWN => {
-                    set.insert((v >> (8 * i)) as u8);
+            match (e, byte(i)) {
+                (Some(set), Some(b)) => {
+                    set.insert(b);
                 }
-                _ => *e = None,
+                (e, _) => *e = None,
             }
         }
     }
@@ -624,6 +700,9 @@ impl<'a> Havoc<'a> {
         while let Some(st) = queue.pop() {
             let mut key = st.clone();
             key.0.steps = 0;
+            if let Some(l) = self.live {
+                l.canon(&mut key.0);
+            }
             match visited.entry(key) {
                 Entry::Occupied(e) if *e.get() <= st.0.steps => continue,
                 Entry::Occupied(mut e) => *e.get_mut() = st.0.steps,
@@ -657,6 +736,11 @@ impl<'a> Havoc<'a> {
                 if taint(core.addr(a)) >= UNKNOWN {
                     return None;
                 }
+            }
+            // A return the liveness does not expect: give up, as states may
+            // have been merged that this return tells apart.
+            if self.live.is_some_and(|l| !l.ret_ok(prog, &core)) {
+                return None;
             }
             let split = prog.instrs.get(pc).and_then(|ins| masked_values(&core, ins));
             match core.step(prog) {
@@ -718,13 +802,24 @@ impl<'a> Havoc<'a> {
                 }
             }
             MemOp::LoadExclPair { addr, rt, rt2, size, acquire } => {
+                // Read as two halves, each with its own values and taint
+                // (a superset of the pair's single-copy-atomic values), so
+                // that a counter in one half that the analysis does not
+                // know leaves the other half, a pointer say, known.
                 let total = size.double();
-                for (v, t) in self.read(&own, addr, total.bytes(), acquire) {
-                    let (lo, hi) = split_pair(v, size);
-                    let mut c = core.clone();
-                    c.set(rt, reg(lo, t));
-                    c.set(rt2, reg(hi, t));
-                    push(c, Some((addr.val, total)), own.clone());
+                let n = size.bytes();
+                self.reads.insert((addr.val, total.bytes()));
+                if acquire {
+                    self.acquire_reads.insert((addr.val, total.bytes()));
+                }
+                let second = self.read(&own, RV { val: addr.val + n, ..addr }, n, acquire);
+                for (lo, t1) in self.read(&own, addr, n, acquire) {
+                    for &(hi, t2) in &second {
+                        let mut c = core.clone();
+                        c.set(rt, reg(lo as u64, t1));
+                        c.set(rt2, reg(hi as u64, t2));
+                        push(c, Some((addr.val, total)), own.clone());
+                    }
                 }
             }
             MemOp::LoadPair { addr, rt, rt2, size, signed } => {
@@ -803,9 +898,9 @@ impl<'a> Havoc<'a> {
                     self.release_writes.insert((addr.val, total.bytes()));
                 }
                 if mon == Some((addr.val, total)) {
-                    let t = taint(data).max(taint(data2));
                     let mut o = own.clone();
-                    self.write(&mut o, addr, total.bytes(), pair_value(data.val, data2.val, size), t);
+                    let (d1, d2) = (size.mask(data.val) as u128, size.mask(data2.val) as u128);
+                    self.write_parts(&mut o, addr, total.bytes(), &[(d1, taint(data)), (d2, taint(data2))]);
                     let mut c = core.clone();
                     c.set(rs, status(0));
                     push(c, None, o);
@@ -864,6 +959,7 @@ fn dep_orders(
     writers: &HashMap<u64, BTreeSet<usize>>,
     read_bytes: &HashSet<u64>,
     pcs: &BTreeSet<usize>,
+    live: Option<&crate::live::Liveness>,
 ) -> Option<Vec<(Footprints, Footprints)>> {
     let mut budget = MAX_STATES;
     let mut out = Vec::new();
@@ -871,7 +967,7 @@ fn dep_orders(
         let mut tainted = BTreeSet::new();
         for _ in 0..MAX_ROUNDS {
             let dep = Dep { source, tainted: tainted.clone(), new_tainted: BTreeSet::new(), sources: Footprints::new(), after: Footprints::new() };
-            let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep));
+            let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep), live);
             h.run(h.start())?;
             if !h.missed.is_empty() {
                 return None;
@@ -890,8 +986,10 @@ fn dep_orders(
 
 /// Compute what the reduction needs for `test`, or None if the analysis
 /// gives up (then nothing should be pruned).
-pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
+pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
     let n = test.threads.len();
+    let lives: Vec<Option<crate::live::Liveness>> =
+        test.threads.iter().map(|th| live.then(|| crate::live::Liveness::new(&th.code, 0))).collect();
     let mut vals = Known::default();
     let mut red = Reduction {
         reads: vec![Footprints::new(); n],
@@ -918,7 +1016,7 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
         let mut words_grown = false;
         for tid in 0..n {
             let mut h = loop {
-                let mut h = Havoc::new(test, tid, fuel, &vals, &writers, &read_bytes[tid], &mut budget, None);
+                let mut h = Havoc::new(test, tid, fuel, &vals, &writers, &read_bytes[tid], &mut budget, None, lives[tid].as_ref());
                 let r = h.run(h.start());
                 if h.missed.is_empty() {
                     r?;
@@ -982,7 +1080,7 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
             let (n, idle) = streaks.entry(b).or_insert((0, 0));
             *n += 1;
             *idle = 0;
-            if *n >= WIDEN_AFTER {
+            if *n >= WIDEN_AFTER && new_vals.bytes.get(&b).is_some_and(|v| v.as_ref().is_some_and(|v| v.len() > WIDEN_MIN_VALUES)) {
                 new_vals.bytes.insert(b, None);
             }
         }
@@ -1011,7 +1109,7 @@ pub fn analyze(test: &Test, fuel: u32) -> Option<Reduction> {
                         f.iter().any(|&(a, len)| (a..a + len).any(|b| writers.get(&b).is_some_and(|w| w.iter().any(|&t| t != tid))))
                     };
                     let pcs: BTreeSet<usize> = read_pcs[tid].iter().filter(|(_, f)| others(f)).map(|(&pc, _)| pc).collect();
-                    dep_orders(test, tid, fuel, &vals, &writers, &read_bytes[tid], &pcs)
+                    dep_orders(test, tid, fuel, &vals, &writers, &read_bytes[tid], &pcs, lives[tid].as_ref())
                 } else {
                     Some(Vec::new())
                 };

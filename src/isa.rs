@@ -456,6 +456,113 @@ impl Instr {
     }
 
     /// The general-purpose registers (0..=30, or `SP`) the instruction
+    /// reads, including address registers and destinations it only
+    /// partly replaces (`MOVK`, `BFM`). A register branch (`BR`, `BLR`,
+    /// `RET`) reads only its target here, though where it goes, any
+    /// register may be read.
+    pub fn reads(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut reg = |r: RegOp| {
+            if r.idx != ZR {
+                out.push(r.idx)
+            }
+        };
+        let op = |o: Operand, reg: &mut dyn FnMut(RegOp)| match o {
+            Operand::Reg(r) | Operand::RegExt(r, _) => reg(r),
+            Operand::Imm(_) => {}
+        };
+        let mut addr = None;
+        match *self {
+            Instr::Nop
+            | Instr::Invalid
+            | Instr::MovImm { .. }
+            | Instr::B { .. }
+            | Instr::Bl { .. }
+            | Instr::BCond { .. }
+            | Instr::Barrier(_)
+            | Instr::Clrex
+            | Instr::VMovImm { .. }
+            | Instr::VMov { .. }
+            | Instr::VLogic { .. }
+            | Instr::VInsElem { .. }
+            | Instr::VDupElem { .. }
+            | Instr::VMovToGp { .. }
+            | Instr::VCnt { .. }
+            | Instr::VAddv { .. } => {}
+            Instr::Movk { rd, .. } => reg(rd),
+            Instr::MovReg { rn, .. } | Instr::Unary { rn, .. } => reg(rn),
+            Instr::Alu { rn, op2, .. } | Instr::Ccmp { rn, op2, .. } => {
+                reg(rn);
+                op(op2, &mut reg);
+            }
+            Instr::Csel { rn, rm, .. }
+            | Instr::Extr { rn, rm, .. }
+            | Instr::Adc { rn, rm, .. }
+            | Instr::Mulh { rn, rm, .. } => {
+                reg(rn);
+                reg(rm);
+            }
+            Instr::Bitfield { kind, rd, rn, .. } => {
+                reg(rn);
+                if kind == BfKind::Insert {
+                    reg(rd);
+                }
+            }
+            Instr::Madd { rn, rm, ra, .. } => {
+                reg(rn);
+                reg(rm);
+                reg(ra);
+            }
+            Instr::BrReg { rn, .. } => reg(rn),
+            Instr::Cbz { rt, .. } | Instr::Tbz { rt, .. } => reg(rt),
+            Instr::Load { addr: a, .. }
+            | Instr::LoadExclPair { addr: a, .. }
+            | Instr::LoadPair { addr: a, .. }
+            | Instr::VLoad { addr: a, .. }
+            | Instr::VStore { addr: a, .. } => addr = Some(a),
+            Instr::Store { rt, addr: a, .. } | Instr::StoreExcl { rt, addr: a, .. } => {
+                reg(rt);
+                addr = Some(a);
+            }
+            Instr::StoreExclPair { rt, rt2, addr: a, .. } | Instr::StorePair { rt, rt2, addr: a, .. } => {
+                reg(rt);
+                reg(rt2);
+                addr = Some(a);
+            }
+            Instr::Rmw { rs, addr: a, .. } => {
+                reg(rs);
+                addr = Some(a);
+            }
+            Instr::Cas { rs, rt, addr: a, .. } => {
+                reg(rs);
+                reg(rt);
+                addr = Some(a);
+            }
+            Instr::VIns { rn, .. } | Instr::VDup { rn, .. } => reg(rn),
+        }
+        if let Some(a) = addr {
+            reg(a.base);
+            if let Offset::Reg(r, _) = a.offset {
+                reg(r);
+            }
+        }
+        out
+    }
+
+    /// Whether the instruction reads the condition flags.
+    pub fn reads_flags(&self) -> bool {
+        matches!(self, Instr::Csel { .. } | Instr::Ccmp { .. } | Instr::Adc { .. } | Instr::BCond { .. })
+    }
+
+    /// Whether the instruction sets the condition flags.
+    pub fn writes_flags(&self) -> bool {
+        matches!(
+            self,
+            Instr::Alu { flags: true, .. } | Instr::Adc { flags: true, .. } | Instr::Ccmp { .. }
+        )
+    }
+
+    /// The general-purpose registers (0..=30, or `SP`) the instruction
     /// writes, including base register writeback.
     pub fn writes(&self) -> Vec<u8> {
         let mut out = Vec::new();

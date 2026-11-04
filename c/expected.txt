@@ -137,3 +137,10 @@ ck_sequence -O2 yes no -DWEAK_READER
 ck_sequence -O0 no no
 ck_sequence -O0 yes no -DWEAK_WRITER
 ck_sequence -O0 yes no -DWEAK_READER
+
+# ck's epoch reclamation. OLD_BEGIN removes the fence ck commit 1faa673
+# added to ck_epoch_begin.
+ck_epoch -O2 no no
+ck_epoch -O2 yes no -DOLD_BEGIN
+ck_epoch -O0 no no
+ck_epoch -O0 yes no -DOLD_BEGIN

@@ -474,8 +474,9 @@ reachable, since sampling may miss states.
 
 `c/ck/include` holds the headers of [Concurrency
 Kit](https://github.com/concurrencykit/ck) that its ring buffer
-(`ck_ring.h`), spinlocks (`ck_spinlock.h`) and sequence lock
-(`ck_sequence.h`) need, unchanged from ck commit `8f0847c` (BSD license,
+(`ck_ring.h`), spinlocks (`ck_spinlock.h`), sequence lock
+(`ck_sequence.h`) and epoch-based reclamation (`ck_epoch.h`) need, and
+`c/ck/src/ck_epoch.c`, unchanged from ck commit `8f0847c` (BSD license,
 in `c/ck/LICENSE`). Its aarch64 port implements barriers and atomics in
 inline assembly. `c/ck/stub` holds the `ck_md.h` that ck's configure
 script generates for aarch64 Linux, and the declarations from
@@ -552,6 +553,28 @@ record once, and a reader copies it with `CK_SEQUENCE_READ`. The
 condition is a torn copy. It is correct as written. `-DWEAK_WRITER`
 (no store fences in the writer) and `-DWEAK_READER` (no load fences in
 the reader) both tear the copy on ARM only. Each test takes 0.1 s.
+
+`ck_epoch.c` runs ck's epoch-based reclamation. A reader reads an object
+through a shared pointer in an epoch section, twice. A writer replaces
+the pointer, waits for a grace period with `ck_epoch_synchronize`, then
+frees the old object (it overwrites the value). The condition is the
+reader seeing a freed value. The reader's record is in the epoch's list
+from the start, as `ck_epoch_register` would leave it.
+
+In June 2026, ck commit `1faa673` ("add missing barrier for RMO
+architectures in begin") added a `ck_pr_fence_load()` to
+`ck_epoch_begin`, between the load of the global epoch and the
+section's own loads. `-DOLD_BEGIN` removes it, which gives the same
+reader code as before the commit, and the condition becomes reachable on
+ARM only, at `-O0` and `-O2`. ARM may read the shared pointer before the
+global epoch. The reader's second section can read the old pointer, then
+observe the epoch the writer advanced to after replacing it. The writer
+checked the record while it still showed the epoch from the first
+section, which was current then, so it advanced the epoch again,
+stopped waiting, and freed the object that the reader still reads. With
+one section, the bug does not appear: the record's starting epoch, 0,
+is never current, so the writer waits for the section to end. The tests
+take up to 4 s (at `-O0`).
 
 ### Calls
 
@@ -910,9 +933,10 @@ lets a lone `LDXP` be torn.
    counting and a Treiber stack) run unchanged, and armem finds the
    ARM-only bugs in their weakened versions (see [C programs](#c-programs)).
    So does Concurrency Kit's ring buffer, and armem finds the ARM-only
-   bug that ck fixed in June 2026, and so do ck's seven spinlocks and its
-   sequence lock (see [Concurrency Kit](#concurrency-kit)); next come
-   more of ck (`ck_epoch`, its queues) and other libraries.
+   bugs that ck fixed in June 2026 in it and in `ck_epoch`, and ck's
+   seven spinlocks and its sequence lock run too (see [Concurrency
+   Kit](#concurrency-kit)); next come more of ck (`ck_epoch_poll`, its
+   queues) and other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

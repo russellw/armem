@@ -679,6 +679,51 @@ before re-checking the tail's generation; with `-DFENCE_DEQ -DOLD_ENQ`,
 5 to 7 s at `-O1` to `-O2` (and the same verdict at `-Os`), and TSO
 about 2 s; at `-O0`, 20 sampled paths take over 10 minutes.
 
+### DPDK
+
+`c/dpdk/include` holds the ring headers of [DPDK](https://www.dpdk.org)
+(`lib/ring/rte_ring*.h`, unchanged from DPDK commit `a13c105336`, 26.11-rc2;
+BSD license, in `c/dpdk/LICENSE`). `c/dpdk/stub` holds just enough of
+DPDK's EAL headers for them: `rte_stdatomic.h` unchanged, and small
+stand-ins for the rest (each says what it covers), configured as DPDK's
+build configures aarch64, with the C11 ring (`RTE_USE_C11_MEM_MODEL`).
+
+`dpdk_ring.c` runs the multi-producer, multi-consumer ring with 4 slots,
+holding the item 1; the empty slots hold 99. Thread `t0` acts first as a
+producer and then as a consumer: it enqueues 2, then dequeues two items
+at once. Thread `t1` dequeues one. The condition is any other outcome
+than `t0` receiving 1 and 2, or `t1` receiving 1 (or nothing).
+
+DPDK commit `a4ad0eba9d` (November 2025, by Arm) changed how a head move
+orders its read of the head and of the other side's tail. It says the
+old code fails "when a CPU first acts as a producer and later as a
+consumer", but only "when load-acquire is implemented with RCpc
+semantics (e.g. some AArch64 CPUs which support the LDAPR ... instructions)".
+`-DOLD_HEAD` restores the old code (in `c/dpdk_ring_variants.h`), and
+`-march=armv8.3-a` makes clang compile acquire loads to `LDAPR` instead
+of `LDAR`. Before that, DPDK commit `9bc2cbb007` (November 2017) added a
+fence between those two reads in the generic ring, after a crash on an
+ARM server. `-DRTE_GENERIC_RING` selects the generic ring, and
+`-DOLD_GENERIC` removes the fence:
+
+| Ring | Variant | `LDAR` (armv8-a) | `LDAPR` (armv8.3-a) |
+|---|---|---|---|
+| C11 | current | no | no |
+| C11 | before `a4ad0eba9d` | no | **ARM only** |
+| generic | current | no | no |
+| generic | before `9bc2cbb007` | **ARM only** | **ARM only** |
+
+That holds at `-O0` to `-O2` and `-Os`. With either old version, `t1`
+receives 99: it sees `t0`'s move of the consumer head but an older
+producer tail, so its count of entries is negative and wraps around, and
+it dequeues an empty slot. With the C11 ring, `t0` reads its own release
+store of the producer tail with `LDAPR`, which may happen before that
+store becomes visible to other threads (`LDAR` may not). So its move of
+the consumer head, which depends on that read, can be seen first. The
+tests take under 0.5 s, except the old C11 head move with `LDAPR`
+(4.4 s at `-O1` to `-O2`, 55 s at `-O0`, which is left out of the test
+suite).
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1145,7 +1190,9 @@ lets a lone `LDXP` be torn.
    Kit](#concurrency-kit)), and with a second poller armem finds the
    ARM-only bug ck fixed in `ck_epoch_poll`, and its FIFOs run too: in
    the multi-producer one, armem finds an ARM-only bug that ck has not
-   fixed. Next come other libraries.
+   fixed. On DPDK's ring, armem finds both of the ARM-only bugs DPDK fixed
+   in it, including one that needs RCpc acquire loads (see
+   [DPDK](#dpdk)). Next come other libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

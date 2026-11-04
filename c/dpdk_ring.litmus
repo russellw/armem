@@ -1,0 +1,5 @@
+AArch64 dpdk_ring
+"The items received must be distinct, from 1 and 2, with t0 receiving both or neither"
+{ uint64_t got0a; uint64_t got0b; uint64_t got1; }
+ P0 = t0 | P1 = t1 ;
+exists (~(got0a=1 /\ got0b=2 /\ got1=0 \/ got0a=0 /\ got0b=0 /\ got1=1 \/ got0a=0 /\ got0b=0 /\ got1=0))

@@ -170,3 +170,20 @@ ck_fifo_spsc -O0 yes no -DWEAK_DEQ fuel=2000
 # them, the search is too long for this suite.)
 ck_fifo_mpmc -O2 yes no sample=3
 ck_fifo_mpmc -O1 yes no sample=3
+
+# DPDK's ring. The C11 head move from before DPDK commit a4ad0eba9d is
+# wrong only where acquire loads are RCpc (LDAPR, with armv8.3-a), as the
+# commit says; the generic ring without the fence DPDK added in 9bc2cbb007
+# is wrong on any ARM.
+dpdk_ring -O2 no no
+dpdk_ring -O2 no no -march=armv8.3-a
+dpdk_ring -O2 no no -DOLD_HEAD
+dpdk_ring -O2 yes no -DOLD_HEAD -march=armv8.3-a
+dpdk_ring -O1 yes no -DOLD_HEAD -march=armv8.3-a
+dpdk_ring -Os yes no -DOLD_HEAD -march=armv8.3-a
+dpdk_ring -O2 no no -DRTE_GENERIC_RING
+dpdk_ring -O2 yes no -DRTE_GENERIC_RING -DOLD_GENERIC
+dpdk_ring -O0 no no
+dpdk_ring -O0 no no -march=armv8.3-a
+dpdk_ring -O0 no no -DOLD_HEAD
+dpdk_ring -O0 yes no -DRTE_GENERIC_RING -DOLD_GENERIC

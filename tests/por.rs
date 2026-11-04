@@ -24,13 +24,13 @@ fn check_within(t: &litmus::Test, src: &str, lse2: bool, budget: Option<u64>) ->
         return None;
     }
     let mut reduced_memories = 0;
-    for (por, private) in [(true, true), (false, true), (false, false)] {
-        let reduced = run(t, Model::Arm, &options(por, private, lse2));
-        let what = format!("por={} private={} lse2={}", por, private, lse2);
+    for (por, private, dynamic_por) in [(true, true, true), (true, true, false), (false, true, false), (false, false, false)] {
+        let reduced = run(t, Model::Arm, &armem::Options { dynamic_por, ..options(por, private, lse2) });
+        let what = format!("por={} dynamic_por={} private={} lse2={}", por, dynamic_por, private, lse2);
         assert_eq!(full.states.keys().collect::<Vec<_>>(), reduced.states.keys().collect::<Vec<_>>(), "{}\n{}", what, src);
         assert_eq!(full.faults, reduced.faults, "{}\n{}", what, src);
         assert_eq!(full.truncated, reduced.truncated, "{}\n{}", what, src);
-        if por {
+        if por && !dynamic_por {
             reduced_memories = reduced.stats.memories;
         }
     }

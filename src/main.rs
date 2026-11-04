@@ -21,6 +21,8 @@ options:
       --seed N       random seed for --sample (default: 0)
       --no-por       explore every order of writes, without partial-order
                      reduction (slower; for checking the reduction)
+      --dynamic-por  also prune memories by what the threads may do after
+                     each one (experimental)
       --no-private   give every write to memory a place in the order of
                      writes, even to memory only one thread accesses
                      (slower; for checking that optimization)
@@ -57,6 +59,7 @@ fn main() -> ExitCode {
             "-s" | "--summary" => summary = true,
             "--lse2" => opts.lse2 = true,
             "--no-por" => opts.por = false,
+            "--dynamic-por" => opts.dynamic_por = true,
             "--no-private" => opts.private = false,
             "--no-live" => opts.live = false,
             "--no-filter" => opts.filter = false,

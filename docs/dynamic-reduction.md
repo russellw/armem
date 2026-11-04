@@ -1,6 +1,9 @@
 # Design: a dynamic partial-order reduction
 
-Status: proposed (November 2026). Not implemented.
+Status: implemented as `--dynamic-por` (off by default), November 2026.
+See [Results](#results): it helps several tests, but on `ck_fifo_mpmc`,
+the test it was designed for, it gives up, because of a counter (see
+[Counters](#counters)).
 
 ## The problem
 
@@ -64,11 +67,27 @@ unless one of these holds:
 1. some thread may read (part of) `y`'s footprint from a message at or
    before `ts(x)` with `vpre = ts(x)` (with a mixed-size read that takes
    some bytes from `x`, the same read counts);
-2. `B` may write `y`'s footprint with `vpre = ts(x)`.
+2. `B` may write `y`'s footprint with `vpre = ts(x)`;
+3. `B` may read `x`.
+
+Conditions 1 and 2 cover ob. Condition 3 is not about ob, and the first
+version of this design left it out; the random tests in `tests/por.rs`
+found the gap. The argument shows that the least linearization of each
+execution is not pruned, but promise-first exploration must also *reach*
+it: `B` must be able to promise `y` with `x` absent, certifying it in a
+solo run. If `B` never reads `x`, a run certifying `y` after `Q·x` also
+certifies it after `Q`. If it may read `x`, it may need to. In the
+random test that found this, a thread's compare-and-swap on `y` fails
+only when another thread has written `y`. If it succeeds, its release
+write orders the thread's next write (an acquire atomic) after it. So
+that write can be promised only after some other thread's write to `y`,
+even though in the execution nothing orders it after that write. The
+static check has the same condition (`c == b` in `prunable`).
 
 These replace the `via_reader` and `internal` checks for pairs whose
-static check fails. Neither condition mentions which thread read `x`,
-so the case analysis of `reduce.rs` collapses into a view comparison.
+static check fails. Conditions 1 and 2 do not mention which thread read
+`x`, so the case analysis of `reduce.rs` collapses into a view
+comparison.
 
 ### An exploration with an abstract future
 
@@ -88,13 +107,24 @@ To find these reads and writes, run each thread alone against `Q·x`
 - **Promises.** The thread's messages in `Q·x` are promises that every
   execution in the subtree fulfills at their timestamps, so states with
   a promise that can no longer be fulfilled are dropped (`doomed`), as
-  now. Nothing else is required: a run may stop anywhere. The thread's
-  new writes are appended with timestamp `F`.
+  now. Nothing else is required: a run may stop anywhere.
+- **Own new writes.** These also come after `y`, so they get timestamp `F`
+  too, and are kept only in the forwarding bank (which now holds each
+  write's value). A later read of those bytes returns that write or a
+  future one. Appending them as messages instead made the states grow
+  with every turn of a retry loop (the Treiber stack's push did not
+  finish), since a future value can make a compare-and-swap fail any
+  number of times.
 
 The exploration records, per thread, the footprints of reads from
-messages at or before `ts(x)` with `vpre = ts(x)`, and of writes with
-`vpre = ts(x)`. If the pre-pass gave up, or the exploration exceeds a
-budget, `visit` falls back to the static check for that memory.
+messages at or before `ts(x)` with `vpre = ts(x)`, the footprints of
+writes with `vpre = ts(x)`, and whether it may read `x`. A future read
+stands for any read that takes some bytes from later writes. If such a
+read overlaps `x` and could also take bytes from `x` (it is not
+single-copy atomic, or some other thread's write covers only part of
+it), it counts as reading `x`, and is recorded. If the pre-pass gave
+up, a future read's values are unknown, or the exploration exceeds
+200,000 states, `visit` falls back to the static check for that memory.
 
 Dropping doomed runs is where the precision comes from. Deep in the
 search each thread has several promises in `Q`, which pin down which
@@ -126,6 +156,59 @@ Later, `Observe` might share states with `Collect`: both run from the
 same start against the same memory, and differ only in the future
 reads.
 
+## Results
+
+Step 0 (below) found the ceiling: pruning by conditions 1 and 2 with the
+`Collect` runs' accesses, which is unsound, took `ck_fifo_mpmc`'s
+exhaustive search to 3,811 memories in 11.5 s (2,821 in 7.2 s with
+`-DFENCE_DEQ`, where it shows the fix holds). The relaxed Treiber stack
+went from 7,824 memories to 677, and `ck_fifo_spsc -DWEAK_ENQ` from
+63,314 to 1,297.
+
+The sound version, with condition 3 and future reads, gives the same
+final states as the full search on every litmus test, on 15,000 small
+and 400 large random tests, and on the C programs. With condition 3,
+the gains shrink:
+
+| test | static reduction | `--dynamic-por` |
+|---|---|---|
+| Treiber stack, push relaxed | 7,824 memories, 1.6 s | 1,745, 1.2 s |
+| `ck_fifo_spsc -DWEAK_ENQ` | 63,314, 44 s | 5,624, 7.1 s |
+| `dcl -DPUB=relaxed` | 449 | 236 |
+| `ck_epoch -DOLD_BEGIN` | 437, 0.35 s | 437, 0.86 s |
+| `ck_epoch_poll3 -DOLD_POLL`, `ck_spmc`, `seqlock` | | no change |
+
+### Counters
+
+On `ck_fifo_mpmc` every observing exploration gives up, after two
+states. Each dequeue increments the head's generation, and the pre-pass
+widens that to any value, as it does any counter: it lets a load return
+any value some write may store, so a thread can read the other thread's
+incremented generation and increment it again, round after round.
+Without values, the future reads cannot be explored.
+
+Ways forward:
+
+- **A fixpoint per memory.** Find the values later writes may store
+  from the observing explorations themselves: run them with no future
+  values, then with the values the other threads wrote, and so on.
+  Promising-ARM's writes depend only on reads of earlier messages, so
+  the `k`th later write has a value found by round `k`, and the number
+  of rounds needed is bounded by the number of later writes. A
+  counter still grows by one each round, but only up to that bound,
+  which is small deep in the search. The bound needs the most writes
+  any run can still make, and a run with a write in a loop has none.
+- **Symbolic values.** Let an unknown value be a fresh symbol and allow
+  every equality with values the thread holds. Generations are only
+  compared for equality, but that would have to be checked (a sequence
+  number compared by size would break it).
+- **Runs that can complete.** Count only accesses of runs that can
+  still fulfill all their promises, as the certification filter does
+  with its candidates. Deep in the search each thread's promises fix
+  which dequeue it makes, so its runs that would increment the
+  generation again fall away. This also sharpens the reduction
+  everywhere else.
+
 ## Plan
 
 0. **Measure the ceiling first.** As a throwaway experiment, use the
@@ -151,9 +234,11 @@ reads.
 
 - Store-exclusives and atomics: whether one succeeds depends on writes
   between its read and its write, so with future messages both outcomes
-  have to be allowed. Check that this does not swamp the exploration.
+  have to be allowed. (Done: a future source never fails the atomicity
+  check. This has not swamped any test so far.)
 - Mixed-size reads that take bytes from both `x` and older writes: make
-  sure condition 1 is recorded for them.
+  sure condition 1 is recorded for them. (Done: `MP-bytes` caught the
+  first version.)
 - The `vpre ≥ ts(x)` characterization of ob covers the rules added to
   Arm's model since the Promising paper (pick dependencies, NoRet
   atomics, acquire+release atomics). armem follows those rules through

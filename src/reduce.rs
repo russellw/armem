@@ -96,7 +96,7 @@ const WIDEN_MIN_VALUES: usize = 4;
 const STREAK_GAP: usize = 2;
 
 /// Memory footprints: (address, length) pairs.
-type Footprints = BTreeSet<(u64, u64)>;
+pub type Footprints = BTreeSet<(u64, u64)>;
 
 fn hits(f: &Footprints, m: &Msg) -> bool {
     f.iter().any(|&(a, n)| a < m.addr + m.size.bytes() && m.addr < a + n)
@@ -133,6 +133,34 @@ pub struct Reduction {
     acquire: Vec<bool>,
     /// The thread has DMB ST.
     dmb_st: Vec<bool>,
+    /// What memory may hold, for `future_values`.
+    vals: Known,
+    /// The threads that may write each byte.
+    writers: HashMap<u64, BTreeSet<usize>>,
+}
+
+/// The values a later write by another thread may give a read (see
+/// `Reduction::future_values`).
+pub enum Future {
+    /// No other thread writes these bytes.
+    None,
+    Values(Vec<u128>),
+    /// The analysis does not know them.
+    Unknown,
+}
+
+/// What threads may do after the memory `.., x`, as found by exploring each
+/// thread against it (`Mode::Observe` in `promising.rs`), for
+/// `Reduction::prunable_after`.
+#[derive(Debug, Default)]
+pub struct Observed {
+    /// Per thread: footprints of reads that are ordered after `x` (or read
+    /// part of it) and read some byte from a message up to `x`.
+    pub reads: Vec<Footprints>,
+    /// Per thread: footprints of writes ordered after `x`.
+    pub writes: Vec<Footprints>,
+    /// Per thread: whether it may read (part of) `x`.
+    pub reads_x: Vec<bool>,
 }
 
 impl Reduction {
@@ -171,6 +199,91 @@ impl Reduction {
 }
 
 impl Reduction {
+    /// Values a read of `n` bytes at `a` by thread `tid` may return from a
+    /// write that some other thread may make: an over-approximation, as
+    /// with any read of the analysis.
+    pub fn future_values(&self, tid: usize, a: u64, n: u64, init_byte: &dyn Fn(u64) -> u8) -> Future {
+        if (a..a + n).all(|b| self.writers.get(&b).is_none_or(|w| w.iter().all(|&t| t == tid))) {
+            return Future::None;
+        }
+        let init = |a: u64, n: u64| (a..a + n).rev().fold(0u128, |v, b| (v << 8) | init_byte(b) as u128);
+        if let Some(ws) = self.vals.whole(a, n) {
+            if ws.len() < MAX_READ_VALUES {
+                return Future::Values(std::iter::once(init(a, n)).chain(ws).collect::<BTreeSet<_>>().into_iter().collect());
+            }
+        }
+        if n == 16 && a % 8 == 0 {
+            if let (Some(lo), Some(hi)) = (self.vals.whole(a, 8), self.vals.whole(a + 8, 8)) {
+                let lo: BTreeSet<u128> = std::iter::once(init(a, 8)).chain(lo).collect();
+                let hi: BTreeSet<u128> = std::iter::once(init(a + 8, 8)).chain(hi).collect();
+                if lo.len() * hi.len() < MAX_READ_VALUES {
+                    return Future::Values(lo.iter().flat_map(|&l| hi.iter().map(move |&h| (h << 64) | l)).collect());
+                }
+            }
+        }
+        let mut out = vec![0u128];
+        for b in (a..a + n).rev() {
+            let mut byte = match self.vals.bytes.get(&b) {
+                None => BTreeSet::new(),
+                Some(Some(v)) => v.clone(),
+                Some(None) => return Future::Unknown,
+            };
+            byte.insert(init_byte(b));
+            if out.len() * byte.len() > MAX_READ_VALUES {
+                return Future::Unknown;
+            }
+            out = out.iter().flat_map(|v| byte.iter().map(move |&x| (v << 8) | x as u128)).collect();
+        }
+        Future::Values(out)
+    }
+
+    /// May a single-copy-atomic read of `n` bytes at `a` by thread `tid`
+    /// take some bytes from a write by another thread and others from
+    /// another write? Only if such a write covers part of the read: its
+    /// footprint overlaps the read without containing it, or it is split
+    /// into pieces (it is unaligned, or larger than 8 bytes, as is the read).
+    pub fn may_mix(&self, tid: usize, a: u64, n: u64) -> bool {
+        self.writes.iter().enumerate().any(|(t, f)| {
+            t != tid
+                && f.iter().any(|&(wa, wn)| {
+                    wa < a + n && a < wa + wn && (!(wa <= a && a + n <= wa + wn) || wa % wn != 0 || wn > 8 && n > 8)
+                })
+        })
+    }
+
+    /// Whether `prunable_after` might prune `.., x, y` where `prunable`
+    /// does not (so whether `Observed` is worth finding).
+    pub fn may_prune_after(&self, x: &Msg, y: &Msg) -> bool {
+        priority(y) < priority(x) && !overlaps(x, y)
+    }
+
+    /// May the memory `.., x, y` be skipped, given what the threads may do
+    /// after `.., x`? (A sharper `prunable`, for one memory.)
+    ///
+    /// As in `prunable`, `x` and `y` are adjacent, so any ob path from `x`
+    /// to `y` passes through no other write: some thread reads `y`'s
+    /// footprint from a write before `y` (a from-read edge into `y`) in a
+    /// read ordered after `x`, or `y`'s writer orders `y` after `x`. In
+    /// Promising-ARM an access ordered after `x` has a pre-view of at least
+    /// `ts(x)`; a read of `y`'s footprint from a write before `y` has one
+    /// below `ts(y)` (`y` would lie between otherwise), and so does the
+    /// write `y`. So both have a pre-view of exactly `ts(x)`, and
+    /// `Observed` records every such access in any execution whose memory
+    /// extends `.., x` (with a read that takes some bytes from `x` itself
+    /// counted as ordered after it).
+    ///
+    /// The swapped memory `.., y, x` must also be reachable: `y`'s writer
+    /// must be able to promise `y` without `x`. A thread certifies a
+    /// promise running alone, so if it may read `x`, it may need to (a
+    /// compare-and-swap that fails only on `x`, say). As in `prunable`,
+    /// `y`'s writer must not read `x`.
+    pub fn prunable_after(&self, x: &Msg, y: &Msg, obs: &Observed) -> bool {
+        self.may_prune_after(x, y)
+            && !obs.reads_x[y.tid]
+            && !obs.reads.iter().any(|r| hits(r, y))
+            && !hits(&obs.writes[y.tid], y)
+    }
+
     /// The memory private to each thread, as sorted, disjoint byte ranges:
     /// bytes that no other thread may read or write, and that the thread
     /// accesses with no acquire or release instruction (exclusive and
@@ -364,7 +477,7 @@ type WordVals = Option<BTreeSet<u128>>;
 /// all written only with its own footprint reads them from one write (or
 /// initial memory), as an aligned access is single-copy atomic, and so
 /// returns only those whole values.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct Known {
     bytes: HashMap<u64, ByteVals>,
     words: HashMap<(u64, u64), WordVals>,
@@ -1119,6 +1232,8 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
                 red.acquire.push(acquire);
                 red.dmb_st.push(st);
             }
+            red.vals = vals;
+            red.writers = writers;
             return Some(red);
         }
     }

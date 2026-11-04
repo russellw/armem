@@ -72,6 +72,11 @@ struct Fwd {
     /// An acquire read of this write is ordered after that read (Arm's
     /// `[M]; rmw; lrs; [A|Q]`), though not after the write itself.
     xview: View,
+    /// The write's address and value (determined by `ts`, except for the
+    /// new writes of `Mode::Observe`, which all have the timestamp
+    /// `FUTURE`).
+    addr: u64,
+    val: u128,
 }
 
 /// Exclusive monitor set by a load-exclusive.
@@ -162,7 +167,28 @@ enum Mode {
     /// Search for a run that fulfills all outstanding promises; new writes
     /// may be appended to (a local copy of) memory.
     Certify,
+    /// Explore every run of the thread in any execution whose memory
+    /// extends this one (`.., x`), and record its accesses ordered after
+    /// `x` (see `reduce::Observed`). Besides the messages of the memory and
+    /// its own new writes, a read may return a later write by another
+    /// thread: any value the reduction's analysis found such a write may
+    /// store, with the timestamp `FUTURE`. That stands for every timestamp
+    /// after the next message (`y`), and is above them all, so views that
+    /// include it are at least the real ones; this allows at least the
+    /// reads, fulfillments and writes the real ones would (a read with such
+    /// a pre-view may still read the latest write in the memory), and drops
+    /// a state only if a promise can no longer be fulfilled, which then
+    /// holds for the real views too. Runs need not fulfill their promises,
+    /// but those that can no longer do so are dropped (`doomed`): every
+    /// execution fulfills them.
+    Observe,
 }
+
+/// The timestamp of every later write by another thread (`Mode::Observe`).
+const FUTURE: View = View::MAX / 2;
+
+/// Most states `Mode::Observe` may visit before it gives up.
+const MAX_OBSERVE_STATES: u64 = 200_000;
 
 /// How a read orders later accesses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,6 +246,14 @@ struct Solo<'a> {
     /// void, and the run must be repeated without it.
     live_failed: bool,
     candidates: BTreeSet<Candidate>,
+    /// For `Mode::Observe`: the analysis, and what it found (reads in a
+    /// `RefCell`, as `do_read` takes `&self`); set if it gave up.
+    reduction: Option<Arc<crate::reduce::Reduction>>,
+    observed_reads: std::cell::RefCell<crate::reduce::Footprints>,
+    observed_writes: crate::reduce::Footprints,
+    reads_x: std::cell::Cell<bool>,
+    gave_up: std::cell::Cell<bool>,
+    states: u64,
     /// Candidates written, in some run, where a promise right after `base`
     /// could be fulfilled: see `promising`.
     placeable: FxHashSet<Candidate>,
@@ -286,6 +320,12 @@ impl<'a> Solo<'a> {
             mode,
             visited: FxHashMap::default(),
             candidates: BTreeSet::new(),
+            reduction: None,
+            observed_reads: Default::default(),
+            observed_writes: Default::default(),
+            reads_x: Default::default(),
+            gave_up: Default::default(),
+            states: 0,
             placeable: FxHashSet::default(),
             fulfilling: FxHashSet::default(),
             finals: BTreeSet::new(),
@@ -312,7 +352,7 @@ impl<'a> Solo<'a> {
 
     /// Is message `t` (0 = initial memory) written by another thread?
     fn external(&self, ext: &[Msg], t: View) -> bool {
-        t == 0 || self.msg(ext, t).tid != self.tid
+        t == 0 || t != FUTURE && self.msg(ext, t).tid != self.tid
     }
 
     /// Timestamps byte `b` may be read from, given the lower bound `bound`:
@@ -410,6 +450,12 @@ impl<'a> Solo<'a> {
             // than itself), so those are never candidates.
             let cands: Vec<Vec<View>> = (p..p + len)
                 .map(|b| {
+                    // In `Mode::Observe`, a byte the thread has written
+                    // since is read from that write (or, in `observe_read`,
+                    // a later one by another thread).
+                    if st.fwd.get(b).is_some_and(|f| f.ts == FUTURE) {
+                        return vec![FUTURE];
+                    }
                     let mut c = self.byte_choices(ext, b, vpre.max(st.coh(b)));
                     c.retain(|t| !st.promises.contains(t));
                     c
@@ -435,7 +481,11 @@ impl<'a> Solo<'a> {
             let mut rpick = 0;
             for (i, &t) in srcs.iter().enumerate().rev() {
                 let b = a + i as u64;
-                val = (val << 8) | self.byte_value(ext, b, t) as u128;
+                let byte = match st.fwd.get(b) {
+                    Some(f) if t == FUTURE => (f.val >> (8 * (b - f.addr))) as u8,
+                    _ => self.byte_value(ext, b, t),
+                };
+                val = (val << 8) | byte as u128;
                 match st.fwd.get(b) {
                     Some(f) if f.ts == t => {
                         rview = rview.max(f.view);
@@ -465,7 +515,72 @@ impl<'a> Solo<'a> {
             s.v_cap = s.v_cap.max(addr.pick);
             out.push(ReadResult { state: s, val, srcs, dep: dep(vpost, ppost) });
         }
+        if self.mode == Mode::Observe {
+            let single = pieces(a, n, granule, self.lse2).len() == 1;
+            self.observe_read(st, addr, kind, n, single, vpre, &mut out);
+        }
         out
+    }
+
+    /// For `Mode::Observe`: record the reads ordered after `x` (the last
+    /// message of `base`) among `out`, the results of a read of `n` bytes
+    /// (single-copy atomic if `single`) with pre-view `vpre`, and whether
+    /// one reads `x`; and add those that read a later write by another
+    /// thread.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_read(&self, st: &TState, addr: RV, kind: ReadKind, n: u64, single: bool, vpre: View, out: &mut Vec<ReadResult>) {
+        let a = addr.val;
+        let l = self.base.len() as View;
+        let x = &self.base[l as usize - 1];
+        let mut record = false;
+        for r in out.iter() {
+            record |= (vpre == l || r.srcs.contains(&l)) && r.srcs.iter().any(|&t| t <= l);
+            if r.srcs.contains(&l) {
+                self.reads_x.set(true);
+            }
+        }
+        let Some(red) = &self.reduction else { return };
+        let vals = match red.future_values(self.tid, a, n, &|b| self.test.init_byte(b)) {
+            crate::reduce::Future::None => Vec::new(),
+            crate::reduce::Future::Unknown => {
+                self.gave_up.set(true);
+                return;
+            }
+            crate::reduce::Future::Values(v) => v,
+        };
+        // A read taking some bytes from later writes and some from the
+        // memory is represented by a read of later writes only (its views
+        // are the same), so it counts as reading `x` if it might, and is
+        // recorded if it might read `x` or is ordered after it.
+        let mixed_x = x.addr < a + n && a < x.addr + x.size.bytes() && (!single || red.may_mix(self.tid, a, n));
+        if !vals.is_empty() && mixed_x {
+            self.reads_x.set(true);
+        }
+        if !vals.is_empty() && (vpre == l || mixed_x) {
+            record = true;
+        }
+        if record {
+            self.observed_reads.borrow_mut().insert((a, n));
+        }
+        let acquire = kind.load != LoadKind::Plain;
+        for val in vals {
+            let (vpost, ppost) = (FUTURE, FUTURE);
+            let mut s = st.clone();
+            s.coh.update(a, a + n, |v| Some(v.unwrap_or(0).max(vpost)));
+            if kind.noret {
+                s.v_rnoret = vpost;
+                s.v_rnoret_p = ppost;
+            } else {
+                s.v_rold = vpost;
+                s.v_rold_p = ppost;
+            }
+            if acquire {
+                s.v_rnew = vpost;
+                s.v_wnew = ppost;
+            }
+            s.v_cap = s.v_cap.max(addr.pick);
+            out.push(ReadResult { state: s, val, srcs: vec![FUTURE; n as usize], dep: dep(vpost, ppost) });
+        }
     }
 
     /// No write to the footprint between each byte's source and `t`
@@ -503,6 +618,9 @@ impl<'a> Solo<'a> {
         if kind.release {
             vpre = vpre.max(st.v_rold_p).max(st.v_rnoret_p).max(st.v_wold);
         }
+        if self.mode == Mode::Observe && vpre == self.base.len() as View {
+            self.observed_writes.insert((a, n));
+        }
         let apply = |t: View| {
             let mut s = st.clone();
             let fwd = Fwd {
@@ -510,6 +628,8 @@ impl<'a> Solo<'a> {
                 view: addr.view.max(data.view),
                 pick: addr.pick.max(data.pick),
                 xview: kind.xview,
+                addr: a,
+                val,
             };
             s.coh.set(a, a + n, t);
             s.fwd.set(a, a + n, fwd);
@@ -536,6 +656,14 @@ impl<'a> Solo<'a> {
             if *self.msg(ext, t) == new_msg && vpre < t && coh_ok(t) && ok_atomic(t) {
                 out.push((apply(t), ext.to_vec()));
             }
+        }
+        // In `Mode::Observe`, a new write comes after `y`, like every other
+        // write after the memory, and is kept only in the forwarding bank.
+        if self.mode == Mode::Observe {
+            if ok_atomic(self.len(ext) + 1) {
+                out.push((apply(FUTURE), ext.to_vec()));
+            }
+            return out;
         }
         // Or write a new message at the end of memory.
         let t = self.len(ext) + 1;
@@ -1040,6 +1168,13 @@ impl<'a> Solo<'a> {
         let mut queue = StepQueue::new();
         queue.push(start.core.steps, (start, Vec::new()));
         while let Some((st, ext)) = queue.pop() {
+            if self.mode == Mode::Observe {
+                self.states += 1;
+                if self.gave_up.get() || self.states > MAX_OBSERVE_STATES {
+                    self.gave_up.set(true);
+                    return;
+                }
+            }
             if self.mode == Mode::Certify && st.promises.is_empty() {
                 self.certified = true;
                 return;
@@ -1125,7 +1260,7 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
                 cfg.live.then(|| Arc::new(crate::live::Liveness::new(&test.threads[t].code, exit)))
             })
             .collect(),
-        reduction: if cfg.por { analysis } else { None },
+        reduction: if cfg.por { analysis.map(Arc::new) } else { None },
         results: Outcomes::new(test.observables()),
     };
     match cfg.sample {
@@ -1145,7 +1280,7 @@ struct Explorer<'a> {
     /// Each thread's register liveness, with the observed registers live
     /// at the end; None once a run has returned where it did not expect.
     live: Vec<Option<Arc<crate::live::Liveness>>>,
-    reduction: Option<crate::reduce::Reduction>,
+    reduction: Option<Arc<crate::reduce::Reduction>>,
     results: Outcomes,
 }
 
@@ -1154,12 +1289,33 @@ impl<'a> Explorer<'a> {
     fn solo(&mut self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
         loop {
             let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
+            if mode == Mode::Observe {
+                s.reduction = self.reduction.clone();
+            }
             s.run(self.start(tid, mem));
             if !s.live_failed {
                 return s;
             }
             self.live[tid] = None;
         }
+    }
+
+    /// What each thread may do after `mem` (`Mode::Observe`), or None if
+    /// that is not known.
+    fn observe(&mut self, mem: &[Msg]) -> Option<crate::reduce::Observed> {
+        let mut obs = crate::reduce::Observed::default();
+        for tid in 0..self.test.threads.len() {
+            let mut o = self.solo(tid, mem, Mode::Observe);
+            if o.gave_up.get() {
+                self.results.stats.observe_failed += 1;
+                return None;
+            }
+            obs.reads.push(o.observed_reads.take());
+            obs.writes.push(std::mem::take(&mut o.observed_writes));
+            obs.reads_x.push(o.reads_x.get());
+        }
+        self.results.stats.observed += 1;
+        Some(obs)
     }
 
     fn start(&self, tid: usize, mem: &[Msg]) -> TState {
@@ -1209,12 +1365,23 @@ impl<'a> Explorer<'a> {
             found = true;
         }
         // Phase 1.
+        let need_observed = self.cfg.dynamic_por
+            && match (&self.reduction, mem.last()) {
+                (Some(r), Some(last)) => candidates.iter().enumerate().any(|(tid, cs)| {
+                    cs.iter().any(|&(addr, size, val)| {
+                        let m = Msg { addr, size, val, tid };
+                        !r.prunable(last, &m) && r.may_prune_after(last, &m)
+                    })
+                }),
+                _ => false,
+            };
+        let observed = if need_observed { self.observe(mem) } else { None };
         let mut out = Vec::new();
         for (tid, cands) in candidates.into_iter().enumerate() {
             for ((addr, size, val), promising) in cands.into_iter().zip(&promising[tid]) {
                 let msg = Msg { addr, size, val, tid };
                 if let (Some(r), Some(last)) = (&self.reduction, mem.last()) {
-                    if r.prunable(last, &msg) {
+                    if r.prunable(last, &msg) || observed.as_ref().is_some_and(|o| r.prunable_after(last, &msg, o)) {
                         self.results.stats.pruned += 1;
                         continue;
                     }

@@ -75,6 +75,10 @@ pub struct Stats {
     /// Promising: candidate promises not certified, since the thread's
     /// exploration shows they cannot certify.
     pub filtered: u64,
+    /// Promising: memories after which the threads were explored for the
+    /// dynamic reduction, and those for which that gave up.
+    pub observed: u64,
+    pub observe_failed: u64,
     /// Interleaving models: number of distinct global states explored.
     pub states: u64,
 }

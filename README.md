@@ -33,6 +33,7 @@ cargo build --release
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
 ./target/release/armem --no-live FILE              # without register liveness
+./target/release/armem --dynamic-por FILE          # also prune per memory (experimental)
 ./target/release/armem --no-filter FILE            # certify every candidate promise
 ./target/release/armem --check-filter FILE         # ... and check the filter's verdicts
 cargo test --release                               # check the litmus suite
@@ -1115,7 +1116,11 @@ lets a lone `LDXP` be torn.
   since the bug is the other thread still reading that node. Telling
   which orders some execution observes needs a reduction that knows
   which writes the threads read, not only where they may read; see
-  [docs/dynamic-reduction.md](docs/dynamic-reduction.md).
+  [docs/dynamic-reduction.md](docs/dynamic-reduction.md). That reduction
+  is implemented as `--dynamic-por`; it takes the relaxed Treiber stack
+  from 7,824 memories to 1,745 and `ck_fifo_spsc -DWEAK_ENQ` from 63,314
+  to 5,624, but gives up on this test, whose generation counter the
+  pre-pass cannot bound.
 * The TSO reference treats `LDAR/STLR` as ordinary x86 loads and stores, so
   `STLR; LDAR` (ordered on ARM) can show as a TSO-only outcome.
 

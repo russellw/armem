@@ -55,6 +55,9 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
             if o.stats.pruned > 0 {
                 write!(s, " ({} pruned by partial-order reduction)", o.stats.pruned).unwrap();
             }
+            if o.stats.observed + o.stats.observe_failed > 0 {
+                write!(s, " (threads explored after {} memories, given up after {})", o.stats.observed, o.stats.observe_failed).unwrap();
+            }
             if o.stats.filtered > 0 {
                 write!(s, " ({} candidate promises left uncertified: they cannot certify)", o.stats.filtered).unwrap();
             }

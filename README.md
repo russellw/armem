@@ -904,6 +904,20 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   * A successful `CAS` may take the result register's dependencies
     either from the memory read or from the old register value. herd7
     explores both alternatives, and so does armem.
+
+  A `CAS` that fails writes nothing, so it orders nothing as a release
+  write would, and its failure is no dependency. A thread may therefore
+  need another thread's later write to make its `CAS` fail before it can
+  fulfill a promise placed earlier (`litmus/CAS-fail-promise`): running
+  alone against the memory so far, the comparison would succeed. So when
+  certifying promises (and collecting candidates), a `CAS` may also fail
+  on a later write by another thread, returning a value other than the
+  expected one, with a view above every timestamp. Whatever depends on
+  that value is ordered after every promise, so the value itself does not
+  matter. Such a run only certifies; final states come only from runs
+  against the whole memory. Before this, armem missed outcomes that Arm's
+  model allows in code using LSE `CAS`. A load-exclusive loop branches on
+  the value it loads, a control dependency, so it needed no such rule.
   Exploration is *promise-first*:
   1. enumerate every sequence of certified promises (memory states);
   2. for each one, run every thread alone to completion, fulfilling
@@ -1160,7 +1174,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   run from over 100 s to 0.2 s. If any execution runs out of fuel, the
   report includes a warning that the results may be incomplete.
 
-Validation: `litmus/` holds 86 tests. They include the classic shapes (MP,
+Validation: `litmus/` holds 87 tests. They include the classic shapes (MP,
 SB, LB, 2+2W, IRIW, WRC, S, CoRR, PPOCA/PPOAA, with fences, dependencies
 and acquire/release), lock and atomic examples, and mixed-size and pair
 tests (tearing, byte merging, mixed-size coherence, LDP/STP ordering),
@@ -1204,7 +1218,7 @@ Current results (herdtools7 7.58):
 | diy7, basic edges, 3 threads | 5428 | all match |
 | diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
 | diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
-| `litmus/` | 85 | 65 match, 1 known difference; herd7 times out or rejects 19 |
+| `litmus/` | 87 | 67 match, 1 known difference; herd7 times out or rejects 19 |
 
 The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
 a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when

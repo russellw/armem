@@ -1,0 +1,12 @@
+AArch64 CAS-fail-promise
+"A CAS that fails writes nothing, so P0 can promise its acquire swap of w before the write to x that makes the CAS fail"
+{ 0:X1=y; 0:X2=x; 0:X7=w; 1:X2=x; 1:X7=w; }
+ P0               | P1           ;
+ MOV W0,#1        | LDR W1,[X7]  ;
+ STR W0,[X1]      | CBZ W1,end   ;
+ MOV W3,#0        | MOV W8,#1    ;
+ MOV W4,#2        | STR W8,[X2]  ;
+ CASL W3,W4,[X2]  | end:         ;
+ MOV W6,#1        |              ;
+ SWPA W6,W5,[X7]  |              ;
+exists (1:X1=1 /\ 0:X3=1)

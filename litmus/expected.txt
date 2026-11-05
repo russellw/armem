@@ -39,6 +39,7 @@ spinlock-norelease     yes  no
 LLSC-counter           no   no
 LLSC-nonatomic         yes  yes
 CAS-mutex              no   no
+CAS-fail-promise       yes  no
 MP+dmb.sy+swp-acq      no   no
 MP+dmb.sy+swp          yes  no
 MP-spin                yes  no

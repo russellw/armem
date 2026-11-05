@@ -121,6 +121,10 @@ struct TState {
     xcl: Option<Monitor>,
     /// Outstanding (unfulfilled) promises.
     promises: BTreeSet<View>,
+    /// A `CAS` has failed on a later write by another thread (see
+    /// `Solo::cas_fails_later`): the run may certify promises, but does not
+    /// complete an execution.
+    speculative: bool,
 }
 
 impl TState {
@@ -140,6 +144,7 @@ impl TState {
             fwd: ByteMap::new(),
             xcl: None,
             promises: BTreeSet::new(),
+            speculative: false,
         }
     }
 
@@ -828,7 +833,7 @@ impl<'a> Solo<'a> {
     /// as it is: the thread has fulfilled all its promises and appended no
     /// new write.
     fn complete(&self, s: &TState, ext: &[Msg]) -> bool {
-        self.mode == Mode::Collect && s.promises.is_empty() && ext.is_empty()
+        self.mode == Mode::Collect && s.promises.is_empty() && ext.is_empty() && !s.speculative
     }
 
     fn nonlocal_successors(&mut self, s: TState, ext: &[Msg], step: Step) -> Vec<Succ> {
@@ -1158,6 +1163,13 @@ impl<'a> Solo<'a> {
             }
             MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release, noret } => {
                 let load = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
+                if let Some(c) = cmp {
+                    if let Some(mut s) = self.cas_fails_later(&st, addr, size, ReadKind { load, noret }) {
+                        s.core.set(rt, RV { val: size.mask(c.val ^ 1), view: FUTURE, pick: FUTURE });
+                        s.core.retire(prog);
+                        out.push((s, ext.to_vec()));
+                    }
+                }
                 for r in self.do_read(&st, ext, addr, ReadKind { load, noret }, size, size.bytes()) {
                     let old = r.val as u64;
                     let reg = RV { val: old, ..r.dep };
@@ -1204,6 +1216,52 @@ impl<'a> Solo<'a> {
             }
         }
         out
+    }
+
+    /// A `CAS` that fails on a later write by another thread, from `st`:
+    /// the state after its read, or None if no other thread may write its
+    /// footprint (or in `Mode::Observe`, whose reads of later writes already
+    /// include this).
+    ///
+    /// Running alone, a thread sees only the memory so far, where the
+    /// comparison may succeed. But in Arm's model a `CAS` that fails writes
+    /// nothing, so it orders nothing after it as a release would, and its
+    /// failure is no dependency. A thread may then need a later write to
+    /// make its `CAS` fail before it can fulfill a promise that the
+    /// execution places earlier (`CAS-fail-promise`). So the runs that
+    /// certify promises and collect candidates may also let a `CAS` read a
+    /// later write by another thread, with a value other than the expected
+    /// one and the view `FUTURE`, which is above every timestamp. Whatever
+    /// depends on that value is then ordered after every promise, and so
+    /// cannot help to fulfill one: the value itself does not matter. Such a
+    /// run only certifies; it never completes an execution, whose threads
+    /// all run against the whole memory (`complete`), so no final state
+    /// comes from it.
+    fn cas_fails_later(&self, st: &TState, addr: RV, size: Size, kind: ReadKind) -> Option<TState> {
+        let (a, n) = (addr.val, size.bytes());
+        let others = match &self.reduction {
+            Some(r) => !matches!(r.future_values(self.tid, a, n, &|b| self.test.init_byte(b)), crate::reduce::Future::None),
+            None => true,
+        };
+        if self.mode == Mode::Observe || !others {
+            return None;
+        }
+        let mut s = st.clone();
+        s.speculative = true;
+        s.coh.set(a, a + n, FUTURE);
+        if kind.noret {
+            s.v_rnoret = FUTURE;
+            s.v_rnoret_p = FUTURE;
+        } else {
+            s.v_rold = FUTURE;
+            s.v_rold_p = FUTURE;
+        }
+        if kind.load != LoadKind::Plain {
+            s.v_rnew = FUTURE;
+            s.v_wnew = FUTURE;
+        }
+        s.v_cap = s.v_cap.max(addr.pick);
+        Some(s)
     }
 
     /// Can some outstanding promise no longer be fulfilled? Fulfilling
@@ -1368,8 +1426,8 @@ impl<'a> Explorer<'a> {
     fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>) -> Solo<'a> {
         loop {
             let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
+            s.reduction = self.reduction.clone();
             if mode == Mode::Observe {
-                s.reduction = self.reduction.clone();
                 s.unknown = unknown.clone();
             }
             s.run(self.start(tid, mem));

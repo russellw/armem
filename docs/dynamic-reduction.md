@@ -241,10 +241,43 @@ may read `x`), which is what led to finding the compare-and-swap gap.
 But with the condition gone, the exhaustive search still does not
 finish in 30 minutes, because of the shallow memories.
 
-To make the observing explorations affordable on shallow memories:
-merge views below `ts(x)` that no comparison can tell apart, or explore
-only the runs that can still fulfill their promises (the third way
-forward above).
+### Where the shallow memories' states go
+
+To see what fills the 200,000 states, the first 40 memories of
+`ck_fifo_mpmc -O2` were run with a print at each give-up. Every one
+was thread 0's exploration, on memories of 1 to 10 messages, which ends
+with 100,000 to 140,000 distinct states. On these memories thread 0
+has no promise outstanding: the messages are thread 1's, or thread 0
+fulfills its own early. And 97 to 99% of the states are past `x`:
+`v_rnew`, `v_wnew` and `v_cap` are all above `ts(x)`, and nearly all
+have read a later write (`v_rold = F`). Each read of a later write
+branches on every value the pre-pass (or an earlier round) allows, so
+the exploration is thread 0 running its whole program against
+arbitrary values from thread 1.
+
+That rules out the two fixes proposed before:
+
+- **Runs that can complete.** A thread with no promise outstanding can
+  complete from every state, so counting only such runs drops nothing.
+  It would bite deep in the search, where the explorations already fit.
+- **Merging views below `ts(x)`.** Almost no view is below `ts(x)`.
+
+A state past `x` can no longer make an access with `vpre = ts(x)`, so
+it adds nothing to conditions 1 and 2, except by reading `x` itself
+(a read with `vpre = F` may still read the latest message, and `x` is
+the latest to its bytes until the thread's coherence passes it). Cutting
+such states off would remove nearly all of them, but they also make the
+later writes whose values feed the next round (`Solo::written`), and
+on this test those are the generation counters, written by both
+threads, whose values the pre-pass cannot bound. Cutting them off would
+lose values and make the reduction unsound. The cut would be sound
+where every byte the thread may still write has values the pre-pass
+knows, but here that fails for exactly the bytes that matter.
+
+So `ck_fifo_mpmc` needs a coarser abstraction of the counter values
+(the symbolic values above, in which a generation is a fresh symbol
+compared only for equality), or a cut-off that keeps the counter's
+values some other way. That is where this work stopped.
 
 ## Plan
 

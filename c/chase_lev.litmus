@@ -1,0 +1,6 @@
+AArch64 chase_lev
+"No value may be taken twice, nor one taken that was never pushed"
+{ }
+ P0 = owner | P1 = thief ;
+locations [top; bottom;]
+exists (~(took=2 /\ stole1=99 /\ stole2=99 \/ took=2 /\ stole1=1 /\ stole2=99 \/ took=2 /\ stole1=99 /\ stole2=1 \/ took=2 /\ stole1=1 /\ stole2=98 \/ took=99 /\ stole1=1 /\ stole2=2))

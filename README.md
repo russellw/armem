@@ -370,6 +370,12 @@ is installed:
   compare-and-swap. One thread pushes 1, then 2, and another pops once.
   The condition is the pop returning a value never pushed, or the stack
   left with anything but the nodes not popped (a lost node).
+* `chase_lev.c`: the Chase–Lev work-stealing deque, in the C11 version of
+  Lê, Pop, Cohen and Zappa Nardelli ("Correct and Efficient
+  Work-Stealing for Weak Memory Models", PPoPP 2013), with a fixed-size
+  buffer. The owner pushes 1, then 2, and takes once from the bottom;
+  a thief steals twice from the top. The condition is a value taken
+  twice, or one taken that was never pushed.
 
 Each program is correct as written. Macros name the orderings it relies
 on, and defining one as `__ATOMIC_RELAXED` removes it:
@@ -406,6 +412,13 @@ verdicts at `-O0`, `-O1`, `-Os` and `-O2`, except where noted:
 | refcount | acquire fence before destruction (`ACQ`) | yes, but no at `-O0` | no |
 | treiber | push's release (`PUSH`) | yes, but no at `-O0` | no |
 | treiber | pop's acquire (`POP`) | no | no |
+| chase_lev | none | no | no |
+| chase_lev | push's release fence (`PUSH_FENCE`) | yes | no |
+| chase_lev | take's seq_cst fence (`TAKE_FENCE`) | yes | yes |
+| chase_lev | steal's seq_cst fence (`STEAL_FENCE`) | no, but yes with `-march=armv8.3-a+nolse` | no |
+| chase_lev | steal's fence and its compare-and-swap's order (`STEAL_FENCE`, `CAS`) | yes, but no at `-O0` | no |
+| chase_lev | steal's acquire of `bottom` (`STEAL_BOTTOM`) | yes | no |
+| chase_lev | steal's acquire of `top` (`STEAL_TOP`), push's (`PUSH_TOP`), or the compare-and-swaps' order (`CAS`) | no | no |
 
 Two results are worth a note. With `SEE` relaxed, clang `-O2` reuses its
 first read of `buf[0]` for the second item, which C allows, so the
@@ -441,6 +454,43 @@ implementations. As a plain field, clang `-O1` and above moves the
 push's store of it out of the retry loop, after the compare-and-swap
 that publishes the node, and with `PUSH` relaxed that loses nodes on
 every machine.
+
+In `chase_lev`, the take's fence (`TAKE_FENCE`) is the owner's half of
+a store-buffering pattern: the take stores the decremented `bottom`,
+then loads `top`. Without the fence, the load can be satisfied before
+the store is visible, on x86 too. The thief's second steal then takes
+the slot the owner takes, as it read the old `bottom`, while the owner
+read the `top` from before the first steal. With `STEAL_BOTTOM` relaxed,
+only a branch on `bottom` comes before the thief's read of the slot,
+and ARM may read the slot early.
+
+The steal's fence (`STEAL_FENCE`) is the thief's half of the same
+pattern: the compare-and-swap of the first steal writes `top`, and the
+second steal must not read `bottom` before that write is visible. A
+seq_cst compare-and-swap followed by an acquire load of `top` usually
+orders that already:
+
+* With the default `-march`, clang compiles the compare-and-swap to an
+  `LDAXR`/`STLXR` loop and the load to `LDAR`, and a release write is
+  ordered before a later `LDAR`.
+* With LSE (`-march=armv8.1-a` and later), the compare-and-swap is
+  `CASAL`. Arm's model orders the write of an acquire-release LSE
+  atomic before every later access.
+* At `-march=armv8.3-a+nolse`, the load is the RCpc `LDAPR`, and nothing
+  orders an `STLXR` before an `LDAPR`.
+
+So the program needs the fence only with RCpc acquire loads and no LSE,
+and with a relaxed compare-and-swap. herd7 agrees on both
+two-instruction patterns (`CASAL; LDAPR` is ordered, `STLXR; LDAPR` is
+not). At `-O0`, clang uses `LDAXR`/`STLXR` even for a relaxed
+compare-and-swap, so with the default `-march` the fence and `CAS`
+relaxed together are still correct there, but not with LSE
+(`-march=armv8.1-a`), where the relaxed compare-and-swap is a plain `CAS`.
+
+`STEAL_TOP`, `PUSH_TOP` and `CAS` alone are harmless in this test: the
+fences order what it needs. (The test leaves out the resize, and has
+only two steals and one take.) The `chase_lev` tests take at
+most 1.3 s each (`PUSH_FENCE` at `-O0`).
 
 A condition compares a location with a value, and a symbol on the right
 is an address: `out_a=out_b` means "`out_a` holds the address of
@@ -1301,7 +1351,10 @@ lets a lone `LDXP` be torn.
    in the old HTS and RTS modes that DPDK's commits changed without
    describing them as bugs (see [DPDK](#dpdk)). In liburcu's QSBR and mb
    flavors, armem finds the lost grace-period wakeups liburcu fixed in
-   January 2026 (see [liburcu](#liburcu)). Next come other libraries.
+   January 2026 (see [liburcu](#liburcu)). In the Chase–Lev
+   work-stealing deque, armem finds which of its fences each compiler
+   mapping needs (see [C programs](#c-programs)). Next come other
+   libraries.
 3. Scalable exploration for large programs: seeded sampling and a
    partial-order reduction of promise orders are done (see
    [How it works](#how-it-works)), and so are taking local steps at

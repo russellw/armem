@@ -243,3 +243,30 @@ urcu_mb -O2 yes yes -DOLD_MB -march=armv8.3-a
 urcu_mb -O2 no no -DOLD_MB -std=gnu99
 urcu_mb -O0 no no
 urcu_mb -O0 yes yes -DOLD_MB
+
+chase_lev -O2 no no
+chase_lev -O2 yes no -DPUSH_FENCE=__ATOMIC_RELAXED
+chase_lev -O2 yes yes -DTAKE_FENCE=__ATOMIC_RELAXED
+chase_lev -O2 no no -DSTEAL_FENCE=__ATOMIC_RELAXED
+chase_lev -O2 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -march=armv8.3-a+nolse
+chase_lev -O2 no no -DSTEAL_FENCE=__ATOMIC_RELAXED -march=armv8.3-a
+chase_lev -O2 no no -DSTEAL_TOP=__ATOMIC_RELAXED
+chase_lev -O2 yes no -DSTEAL_BOTTOM=__ATOMIC_RELAXED
+chase_lev -O2 no no -DPUSH_TOP=__ATOMIC_RELAXED
+chase_lev -O2 no no -DCAS=__ATOMIC_RELAXED
+chase_lev -O0 no no
+chase_lev -O0 yes no -DPUSH_FENCE=__ATOMIC_RELAXED
+chase_lev -O0 yes yes -DTAKE_FENCE=__ATOMIC_RELAXED
+chase_lev -O0 no no -DSTEAL_FENCE=__ATOMIC_RELAXED
+chase_lev -O0 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -march=armv8.3-a+nolse
+chase_lev -O0 no no -DSTEAL_FENCE=__ATOMIC_RELAXED -march=armv8.3-a
+chase_lev -O0 no no -DSTEAL_TOP=__ATOMIC_RELAXED
+chase_lev -O0 yes no -DSTEAL_BOTTOM=__ATOMIC_RELAXED
+chase_lev -O0 no no -DPUSH_TOP=__ATOMIC_RELAXED
+chase_lev -O0 no no -DCAS=__ATOMIC_RELAXED
+chase_lev -O2 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
+chase_lev -O1 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
+chase_lev -Os yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
+chase_lev -O0 no no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
+chase_lev -O0 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED -march=armv8.1-a
+chase_lev -O2 no no -march=armv8.3-a+nolse

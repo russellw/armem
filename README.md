@@ -1264,9 +1264,10 @@ lets a lone `LDXP` be torn.
   which writes the threads read, not only where they may read; see
   [docs/dynamic-reduction.md](docs/dynamic-reduction.md). That reduction
   is implemented as `--dynamic-por`; it takes the relaxed Treiber stack
-  from 7,824 memories to 1,745 and `ck_fifo_spsc -DWEAK_ENQ` from 63,314
-  to 5,624, but gives up on this test, whose generation counter the
-  pre-pass cannot bound.
+  from 7,824 memories to 677 and `ck_fifo_spsc -DWEAK_ENQ` from 63,314
+  to 1,297, but on this test it still does not finish: on memories with
+  few messages, a thread's run against the memory exceeds its state
+  limit, and those memories fall back to the static reduction.
 * The TSO reference cannot tell a seq_cst store from a release store,
   since both compile to `STLR` on ARM, so it runs every `STLR` as an
   ordinary x86 store. x86 compilers make a seq_cst store an `XCHG`, a

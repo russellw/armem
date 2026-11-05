@@ -159,8 +159,6 @@ pub struct Observed {
     pub reads: Vec<Footprints>,
     /// Per thread: footprints of writes ordered after `x`.
     pub writes: Vec<Footprints>,
-    /// Per thread: whether it may read (part of) `x`.
-    pub reads_x: Vec<bool>,
 }
 
 impl Reduction {
@@ -273,13 +271,18 @@ impl Reduction {
     /// counted as ordered after it).
     ///
     /// The swapped memory `.., y, x` must also be reachable: `y`'s writer
-    /// must be able to promise `y` without `x`. A thread certifies a
-    /// promise running alone, so if it may read `x`, it may need to (a
-    /// compare-and-swap that fails only on `x`, say). As in `prunable`,
-    /// `y`'s writer must not read `x`.
+    /// must be able to promise `y` without `x`. It may read `x` on the way
+    /// to `y`, but not in a read ordered before `y` (`y` would be ordered
+    /// after `x`), so in `.., y, x` that read may return an older value
+    /// instead and the thread take the same path to `y`: the value read
+    /// reaches `y` only through dependencies, which would order the read
+    /// before `y`. A store-exclusive may fail anyway, and so may a
+    /// compare-and-swap on a later write (see `cas_fails_later` in
+    /// `promising.rs`), which is what lets `y`'s writer certify `y` without
+    /// the write that made it fail. (Tested by `tests/por.rs` and the
+    /// random tests, not proved.)
     pub fn prunable_after(&self, x: &Msg, y: &Msg, obs: &Observed) -> bool {
         self.may_prune_after(x, y)
-            && !obs.reads_x[y.tid]
             && !obs.reads.iter().any(|r| hits(r, y))
             && !hits(&obs.writes[y.tid], y)
     }

@@ -266,7 +266,6 @@ struct Solo<'a> {
     reduction: Option<Arc<crate::reduce::Reduction>>,
     observed_reads: std::cell::RefCell<crate::reduce::Footprints>,
     observed_writes: crate::reduce::Footprints,
-    reads_x: std::cell::Cell<bool>,
     /// For `Mode::Observe`: the values other threads' later writes may
     /// store, for bytes whose values the analysis does not know (see
     /// `Explorer::observe`); whether a read used them; and the values of
@@ -345,7 +344,6 @@ impl<'a> Solo<'a> {
             reduction: None,
             observed_reads: Default::default(),
             observed_writes: Default::default(),
-            reads_x: Default::default(),
             unknown: Default::default(),
             used_unknown: Default::default(),
             written: Default::default(),
@@ -549,9 +547,8 @@ impl<'a> Solo<'a> {
 
     /// For `Mode::Observe`: record the reads ordered after `x` (the last
     /// message of `base`) among `out`, the results of a read of `n` bytes
-    /// (in single-copy-atomic pieces `ps`) with pre-view `vpre`, and whether
-    /// one reads `x`; and add those that read a later write by another
-    /// thread.
+    /// (in single-copy-atomic pieces `ps`) with pre-view `vpre`; and add
+    /// those that read a later write by another thread.
     #[allow(clippy::too_many_arguments)]
     fn observe_read(&self, st: &TState, addr: RV, kind: ReadKind, n: u64, ps: &[(u64, u64)], vpre: View, out: &mut Vec<ReadResult>) {
         let single = ps.len() == 1;
@@ -561,9 +558,6 @@ impl<'a> Solo<'a> {
         let mut record = false;
         for r in out.iter() {
             record |= (vpre == l || r.srcs.contains(&l)) && r.srcs.iter().any(|&t| t <= l);
-            if r.srcs.contains(&l) {
-                self.reads_x.set(true);
-            }
         }
         let Some(red) = &self.reduction else { return };
         let vals = match red.future_values(self.tid, a, n, &|b| self.test.init_byte(b)) {
@@ -582,12 +576,9 @@ impl<'a> Solo<'a> {
         };
         // A read taking some bytes from later writes and some from the
         // memory is represented by a read of later writes only (its views
-        // are the same), so it counts as reading `x` if it might, and is
-        // recorded if it might read `x` or is ordered after it.
+        // are the same), so it is recorded if it might read `x` or is
+        // ordered after it.
         let mixed_x = x.addr < a + n && a < x.addr + x.size.bytes() && (!single || red.may_mix(self.tid, a, n));
-        if !vals.is_empty() && mixed_x {
-            self.reads_x.set(true);
-        }
         if !vals.is_empty() && (vpre == l || mixed_x) {
             record = true;
         }
@@ -1481,7 +1472,6 @@ impl<'a> Explorer<'a> {
                 }
                 obs.reads.push(o.observed_reads.take());
                 obs.writes.push(std::mem::take(&mut o.observed_writes));
-                obs.reads_x.push(o.reads_x.get());
             }
             if !used_unknown || !grown {
                 self.results.stats.observed += 1;

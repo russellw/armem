@@ -67,22 +67,31 @@ unless one of these holds:
 1. some thread may read (part of) `y`'s footprint from a message at or
    before `ts(x)` with `vpre = ts(x)` (with a mixed-size read that takes
    some bytes from `x`, the same read counts);
-2. `B` may write `y`'s footprint with `vpre = ts(x)`;
-3. `B` may read `x`.
+2. `B` may write `y`'s footprint with `vpre = ts(x)`.
 
-Conditions 1 and 2 cover ob. Condition 3 is not about ob, and the first
-version of this design left it out; the random tests in `tests/por.rs`
-found the gap. The argument shows that the least linearization of each
-execution is not pruned, but promise-first exploration must also *reach*
-it: `B` must be able to promise `y` with `x` absent, certifying it in a
-solo run. If `B` never reads `x`, a run certifying `y` after `Q·x` also
-certifies it after `Q`. If it may read `x`, it may need to. In the
-random test that found this, a thread's compare-and-swap on `y` fails
-only when another thread has written `y`. If it succeeds, its release
-write orders the thread's next write (an acquire atomic) after it. So
-that write can be promised only after some other thread's write to `y`,
-even though in the execution nothing orders it after that write. The
-static check has the same condition (`c == b` in `prunable`).
+The argument shows that the least linearization of each execution is
+not pruned, but promise-first exploration must also *reach* it: `B`
+must be able to promise `y` with `x` absent, certifying it in a solo
+run. `B` may read `x` on the way to `y`, but not in a read ordered
+before `y` (condition 2 would hold), so after `Q` alone that read may
+return an older value and `B` take the same path to `y`. The value
+read reaches `y` only through dependencies, and those would order the
+read before `y`. What else a read's value decides can go either way
+regardless: a store-exclusive may fail, and so may a compare-and-swap
+(certification lets one fail on a later write, as `cas_fails_later` in
+`promising.rs` explains).
+
+An earlier version had a third condition, `B` may read `x`, after the
+random tests in `tests/por.rs` found a counterexample without it. In
+that test a thread's compare-and-swap fails only when another thread
+has written its location; on success, its release write orders the
+thread's next write (an acquire atomic) after it. So that write could
+be promised only after the other thread's write, though nothing in the
+execution orders it after that write. That was a gap in the model,
+not in the reduction: Promising-ARM lets a compare-and-swap fail on a
+write that is not yet in memory, and armem did not. With that fixed,
+the third condition is gone, and the same tests pass without it. The
+static check still has the same condition (`c == b` in `prunable`).
 
 These replace the `via_reader` and `internal` checks for pairs whose
 static check fails. Conditions 1 and 2 do not mention which thread read
@@ -118,11 +127,10 @@ To find these reads and writes, run each thread alone against `Q·x`
 
 The exploration records, per thread, the footprints of reads from
 messages at or before `ts(x)` with `vpre = ts(x)`, the footprints of
-writes with `vpre = ts(x)`, and whether it may read `x`. A future read
-stands for any read that takes some bytes from later writes. If such a
-read overlaps `x` and could also take bytes from `x` (it is not
-single-copy atomic, or some other thread's write covers only part of
-it), it counts as reading `x`, and is recorded. If the pre-pass gave
+writes with `vpre = ts(x)`. A future read stands for any read that
+takes some bytes from later writes. If such a read overlaps `x` and
+could also take bytes from `x` (it is not single-copy atomic, or some
+other thread's write covers only part of it), it is recorded. If the pre-pass gave
 up, a future read's values are unknown, or the exploration exceeds
 200,000 states, `visit` falls back to the static check for that memory.
 
@@ -165,18 +173,22 @@ exhaustive search to 3,811 memories in 11.5 s (2,821 in 7.2 s with
 went from 7,824 memories to 677, and `ck_fifo_spsc -DWEAK_ENQ` from
 63,314 to 1,297.
 
-The sound version, with condition 3 and future reads, gives the same
-final states as the full search on every litmus test, on 15,000 small
-and 400 large random tests, and on the C programs. With condition 3,
-the gains shrink:
+The sound version, with future reads, gives the same final states as
+the full search on every litmus test, on 45,000 small and 800 large
+random tests, and on the C programs. On the tests where the observing
+explorations stay affordable, it reaches the ceiling:
 
 | test | static reduction | `--dynamic-por` |
 |---|---|---|
-| Treiber stack, push relaxed | 7,824 memories, 1.6 s | 1,745, 1.2 s |
-| `ck_fifo_spsc -DWEAK_ENQ` | 63,314, 44 s | 5,624, 7.1 s |
-| `dcl -DPUB=relaxed` | 449 | 236 |
-| `ck_epoch -DOLD_BEGIN` | 437, 0.35 s | 437, 0.86 s |
-| `ck_epoch_poll3 -DOLD_POLL`, `ck_spmc`, `seqlock` | | no change |
+| Treiber stack, push relaxed | 7,824 memories, 1.6 s | 677, 0.6 s |
+| `ck_fifo_spsc -DWEAK_ENQ` | 63,314, 38 s | 1,297, 1.7 s |
+| `dcl -DPUB=relaxed` | 449 | 149 |
+| `ck_epoch -DOLD_BEGIN` | 437, 0.35 s | 203, 0.44 s |
+| `ck_epoch_poll3 -DOLD_POLL` | 913 | 479 |
+| `ck_spmc`, `seqlock` | | no change |
+
+(With the third condition, since dropped, Treiber took 1,745 memories,
+`ck_fifo_spsc` 5,624, `dcl` 236, and `ck_epoch` did not shrink.)
 
 ### Counters
 
@@ -222,22 +234,14 @@ where the threads have made few promises, a thread's observing
 exploration exceeds its 200,000 states even in the first round, so the
 search still falls back to the static reduction there.
 
-Condition 3 also limits what this test can gain. Pruning by the
-observing explorations without future reads (unsound, so a ceiling)
-explores 70,264 memories in 355 s (51,298 in 250 s with `-DFENCE_DEQ`),
-against 3,811 without condition 3: both threads read every location,
-so each may read `x`. Ways to get closer to 3,811:
+Without the third condition, step 0's ceiling of 3,811 memories
+applies. With it, the ceiling (pruning by the observing explorations
+without future reads, which is unsound) was 70,264 (both threads read every location, so each
+may read `x`), which is what led to finding the compare-and-swap gap.
+But with the condition gone, the exhaustive search still does not
+finish in 30 minutes, because of the shallow memories.
 
-- **Check reachability directly.** Instead of condition 3, certify `y`
-  after `Q` without `x`. This is not enough alone: the rest of the
-  swapped memory (`x` after `Q·y`, and every later message) must stay
-  reachable too, and that argument is not worked out.
-- **Read `x` only before `y`.** `B` needs `x` to certify `y` only if it
-  may read `x` before it writes `y`, or before it fulfills a promise
-  that the certification of `y` needs. That needs the same kind of
-  argument.
-
-And to make the observing explorations affordable on shallow memories:
+To make the observing explorations affordable on shallow memories:
 merge views below `ts(x)` that no comparison can tell apart, or explore
 only the runs that can still fulfill their promises (the third way
 forward above).

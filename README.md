@@ -89,7 +89,9 @@ exists (1:X2=0)
 `MOV/MOVZ/MOVN`, `MOVK`, `ADD(S)`, `SUB(S)`, `NEG(S)`, `CMP`, `CMN`, and
 `B`, `B.cond`, `CBZ/CBNZ`, `TBZ/TBNZ`, calls and returns (`BL`, `BLR`, `BR`,
 `RET`; see [Calls](#calls)), `NOP` (and the hints `YIELD`, `WFE`, `WFI`,
-`SEV`, `SEVL`, run as `NOP`), and:
+`SEV`, `SEVL`, run as `NOP`, and `XPACLRI`, which strips a pointer
+authentication code from X30 and so does nothing to code that signs no
+pointers), and:
 
 * logical: `AND(S)`, `ORR`, `EOR`, `TST`, and with the second operand
   inverted `BIC(S)`, `ORN`, `EON`, `MVN`
@@ -858,6 +860,58 @@ which is a full barrier. So it hits ARM and other weak architectures
 only. Compiled without C11 atomics (`-std=gnu99`), liburcu puts a full
 barrier on each side of the store, and the old code is right.
 
+### QEMU
+
+`c/qemu` holds QEMU's `util/event.c` and `include/qemu/atomic.h` and
+`compiler.h`, unchanged from QEMU commit `f71afb4` (November 2026;
+GPL-2.0-or-later, see `c/qemu/COPYING` and `c/qemu/LICENSE`).
+`c/qemu/stub` holds a `qemu/thread.h` with just the `QemuEvent` type
+and functions, a `qemu/osdep.h` with the little that `event.c` uses,
+and a `qemu/futex.h` (Linux's, with `HAVE_FUTEX`) whose `FUTEX_WAKE`
+is recorded. Its `FUTEX_WAIT` makes the full barrier the kernel makes,
+then checks the futex word: if the thread would sleep, it records that
+and ends the thread, by branching to the address its thread function
+returns to.
+
+`qemu_event.c` tests the call_rcu thread of `util/rcu.c` waiting for
+work. The event is set, as `call_rcu1` leaves it, and no work is
+pending. The thread, `t0`, runs the loop at the top of
+`call_rcu_thread`: it resets the event, reads `rcu_call_count`, and if
+that is 0 waits on the event. `t1` runs `call_rcu1` without the queue:
+it increments `rcu_call_count` and sets the event. The condition is
+that `t0` sleeps and no one wakes it, which leaves the work, and every
+later `call_rcu`, waiting.
+
+QEMU commit `9586a132` ("qemu-thread-posix: cleanup, fix, document
+QemuEvent", March 2023, in QEMU 8.0) says that "QemuEvent is currently
+broken on ARM due to missing memory barriers after qatomic_*()".
+`-DOLD_EVENT` undoes it (`c/qemu/old/util/event.c`, the current file
+with just that commit's changes undone):
+
+| Variant | LDAXR/STLXR (armv8-a) | LSE (armv8.1-a) | TSO |
+|---|---|---|---|
+| current | no | no | no |
+| before `9586a132` | **yes** | no | no |
+
+That holds at `-O0` to `-O2` and `-Os`, and each test takes under 2 s.
+The old `qemu_event_reset` changes `EV_SET` to `EV_FREE` with a seq_cst
+`qatomic_or` and nothing after it. Without LSE, that is an
+LDAXR/STLXR loop, and the caller's relaxed load of `rcu_call_count` may
+be satisfied before the `STLXR`'s write is visible. `qemu_event_set`
+makes the mirror-image store and load, `rcu_call_count` then the
+event, with a full barrier between them. That is store buffering: `t1`
+still sees `EV_SET`, so it does not wake anyone, and `t0` sees no work,
+so it waits, turns the event from `EV_FREE` to `EV_BUSY` and sleeps.
+On x86 the OR is a locked instruction, a full barrier. With LSE it is an
+`LDSETAL`, whose write Arm's model orders before later loads (herd7
+agrees), so the old code is right there. Of the commit's changes, only
+the one to `qemu_event_reset` matters here: undoing it alone brings the
+bug back, and the old `qemu_event_reset` with just
+`smp_mb__after_rmw()` added at its end is right. The commit also adds
+`smp_mb__after_rmw()` after the exchange in `qemu_event_set`, to pair
+with the kernel's barrier in `FUTEX_WAIT`, and the stub futex does not
+model the kernel's side of that.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -968,6 +1022,12 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   against the whole memory. Before this, armem missed outcomes that Arm's
   model allows in code using LSE `CAS`. A load-exclusive loop branches on
   the value it loads, a control dependency, so it needed no such rule.
+  Nor does a `CAS` with acquire (`CASA`, `CASAL`): one that read a later
+  write would order every later write after all the promises, so the run
+  could neither fulfill an outstanding promise nor make a write that can
+  be promised. Letting it fail anyway only sent a retry loop round and
+  round until it ran out of fuel (`qemu_event_wait`, in
+  [QEMU](#qemu)).
   Exploration is *promise-first*:
   1. enumerate every sequence of certified promises (memory states);
   2. for each one, run every thread alone to completion, fulfilling
@@ -1355,7 +1415,8 @@ lets a lone `LDXP` be torn.
    in the old HTS and RTS modes that DPDK's commits changed without
    describing them as bugs (see [DPDK](#dpdk)). In liburcu's QSBR and mb
    flavors, armem finds the lost grace-period wakeups liburcu fixed in
-   January 2026 (see [liburcu](#liburcu)). In the Chase–Lev
+   January 2026 (see [liburcu](#liburcu)), and in QEMU's QemuEvent the
+   lost wakeup QEMU fixed in March 2023 (see [QEMU](#qemu)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

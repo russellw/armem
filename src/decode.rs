@@ -28,7 +28,10 @@
 //! or `SXTX` extends become `LSL`. Bitfield moves and `MADD` become the
 //! `Alu` form of an alias where they have one (`Instr::bitfield`,
 //! `Instr::madd`), as the assembler's do. The hints `YIELD`, `WFE`, `WFI`, `SEV`
-//! and `SEVL` become `Nop`, which is a valid implementation of each.
+//! and `SEVL` become `Nop`, which is a valid implementation of each. So does
+//! `XPACLRI` (what `__builtin_return_address` emits), which strips a pointer
+//! authentication code from X30: no code here signs pointers, so it has
+//! none to strip.
 
 use crate::isa::*;
 
@@ -446,9 +449,9 @@ fn branch_system(w: u32, index: usize) -> Result<Instr> {
             target: rel(sext(bits(w, 23, 5), 19))?,
         });
     }
-    // Hints: NOP, YIELD, WFE, WFI, SEV, SEVL.
+    // Hints: NOP, YIELD, WFE, WFI, SEV, SEVL, and XPACLRI (HINT #7).
     if w & 0xffff_f01f == 0xd503_201f {
-        return if bits(w, 11, 5) <= 5 { Ok(Instr::Nop) } else { unsupported() };
+        return if bits(w, 11, 5) <= 5 || bits(w, 11, 5) == 7 { Ok(Instr::Nop) } else { unsupported() };
     }
     // Barriers.
     if w & 0xffff_f01f == 0xd503_301f {

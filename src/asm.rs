@@ -399,7 +399,7 @@ fn parse_instr_unchecked(line: &str, labels: &HashMap<String, usize>) -> Result<
 
     let ins = match m {
         // Hints that may be implemented as NOP, which is all the emulator needs.
-        "NOP" | "YIELD" | "WFE" | "WFI" | "SEV" | "SEVL" => Instr::Nop,
+        "NOP" | "YIELD" | "WFE" | "WFI" | "SEV" | "SEVL" | "XPACLRI" => Instr::Nop,
         "CLREX" => {
             match ops.len() {
                 0 => {}
@@ -1247,6 +1247,7 @@ mod tests {
         );
         assert!(matches!(p("CMP X0,X1,LSL #2").unwrap(), Instr::Alu { op2: Operand::RegExt(_, Extend::Lsl(2)), .. }));
         assert_eq!(p("WFE").unwrap(), Instr::Nop);
+        assert_eq!(p("XPACLRI").unwrap(), Instr::Nop);
         assert_eq!(p("ISB SY").unwrap(), Instr::Barrier(Barrier::Isb));
     }
 

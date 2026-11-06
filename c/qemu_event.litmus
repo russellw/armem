@@ -1,0 +1,5 @@
+AArch64 qemu_event
+"The call_rcu thread must not sleep with no wakeup to come"
+{ uint64_t qemu_test_blocked; uint64_t qemu_test_woken; }
+ P0 = t0 | P1 = t1 ;
+exists (qemu_test_blocked=1 /\ qemu_test_woken=0)

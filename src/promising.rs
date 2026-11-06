@@ -1228,13 +1228,21 @@ impl<'a> Solo<'a> {
     /// run only certifies; it never completes an execution, whose threads
     /// all run against the whole memory (`complete`), so no final state
     /// comes from it.
+    ///
+    /// An acquiring `CAS` that fails so gains nothing: its `v_wnew` becomes
+    /// `FUTURE`, so a promise still outstanding can no longer be fulfilled
+    /// (`doomed`), and a later write can never be placed among the
+    /// promises. So only a `CAS` without acquire may fail on a later write.
+    /// (An acquiring one would only lead the run on to no purpose: in a
+    /// retry loop, such as `qemu_event_wait` in `c/qemu_event.c`, round
+    /// and round until the fuel runs out.)
     fn cas_fails_later(&self, st: &TState, addr: RV, size: Size, kind: ReadKind) -> Option<TState> {
         let (a, n) = (addr.val, size.bytes());
         let others = match &self.reduction {
             Some(r) => !matches!(r.future_values(self.tid, a, n, &|b| self.test.init_byte(b)), crate::reduce::Future::None),
             None => true,
         };
-        if self.mode == Mode::Observe || !others {
+        if self.mode == Mode::Observe || !others || kind.load != LoadKind::Plain {
             return None;
         }
         let mut s = st.clone();
@@ -1246,10 +1254,6 @@ impl<'a> Solo<'a> {
         } else {
             s.v_rold = FUTURE;
             s.v_rold_p = FUTURE;
-        }
-        if kind.load != LoadKind::Plain {
-            s.v_rnew = FUTURE;
-            s.v_wnew = FUTURE;
         }
         s.v_cap = s.v_cap.max(addr.pick);
         Some(s)

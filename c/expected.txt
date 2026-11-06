@@ -270,3 +270,20 @@ chase_lev -Os yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
 chase_lev -O0 no no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED
 chase_lev -O0 yes no -DSTEAL_FENCE=__ATOMIC_RELAXED -DCAS=__ATOMIC_RELAXED -march=armv8.1-a
 chase_lev -O2 no no -march=armv8.3-a+nolse
+
+# QEMU's QemuEvent (util/event.c): the call_rcu thread resets the event,
+# finds no work and waits, while call_rcu1 adds work and sets the event.
+# OLD_EVENT undoes QEMU commit 9586a132, whose qemu_event_reset has no
+# barrier after its seq_cst OR: with an LDAXR/STLXR loop, the caller's
+# load of rcu_call_count may pass the store, and the thread sleeps with
+# no wakeup to come. An LSE LDSETAL orders that load already.
+qemu_event -O2 no no
+qemu_event -O2 yes no -DOLD_EVENT
+qemu_event -O1 yes no -DOLD_EVENT
+qemu_event -Os yes no -DOLD_EVENT
+qemu_event -O2 no no -march=armv8.1-a
+qemu_event -O2 no no -DOLD_EVENT -march=armv8.1-a
+qemu_event -O0 no no
+qemu_event -O0 yes no -DOLD_EVENT
+qemu_event -O0 no no -march=armv8.1-a
+qemu_event -O0 no no -DOLD_EVENT -march=armv8.1-a

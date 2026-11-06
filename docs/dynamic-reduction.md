@@ -279,6 +279,45 @@ So `ck_fifo_mpmc` needs a coarser abstraction of the counter values
 compared only for equality), or a cut-off that keeps the counter's
 values some other way. That is where this work stopped.
 
+### Across the C programs
+
+Before making `--dynamic-por` the default (step 4 of the plan below),
+each of the 198 exhaustive lines of `c/expected.txt` was run in the
+ARM model with it and without it (clang 21, November 2026). Every line
+reached the same final states, faults and fuel cut-offs. But the
+dynamic reduction cut the memories explored by only 19% (from 142,933
+to 115,327), and the total time went from 125 s to 321 s.
+
+It wins where pruning a memory removes a subtree that nothing else
+reaches: the relaxed Treiber stack (7,824 memories in 3.0 s to 677 in
+1.1 s), `chase_lev -DPUSH_FENCE` (1,184 memories to 145; at `-O2`,
+1.1 s to 0.5 s) and `dcl` with a relaxed unlock (815 to about 195
+memories, twice as fast). It loses badly on ck's MCS spinlock (`-O0`:
+2.2 s to 45 s), its decrement lock (`-O0 -DWEAK_LOCK`: 0.6 s to 39 s)
+and `ck_epoch_poll3` (4.6 s to 15 s). A count of the states in each
+solo exploration shows why. In the MCS lock at `-O2`, the `Collect`
+runs of a memory take about 55 states, and observing it takes a
+median of 9.9 times as many, and at the 90th percentile 151 times.
+Most observes do prune (990 of 1,146), but the memories they prune are
+mostly reached by other paths anyway: 3,932 pruned candidates save
+690 memories. And the 156 observes that
+fail run all 8 rounds, their counters growing in each, and they take
+72% of the observing states. In the winners, the 90th percentile of
+that ratio is 20 or less.
+
+Limiting each observe to K times the `Collect` states of the same
+memory is sound, since a memory whose observe fails falls back to the
+static reduction. It cuts the tail but not the median: with K = 30 (and
+at least 1,000 states), the suite takes 193 s, with 19 lines markedly
+slower and 3 faster. A smaller K makes the observes of the Treiber
+stack and `chase_lev` fail, and their gains go too. So the dynamic
+reduction stays an option: what would make it pay is cheaper observing,
+not a budget. That means cutting off the states past `x` (see the
+section before this one), which is sound only where the thread can no
+longer read `x`'s bytes and no other thread needs the values of its
+later writes. In the spinlocks, the threads keep reading the lock word,
+so the cut may not help them.
+
 ## Plan
 
 0. **Measure the ceiling first.** As a throwaway experiment, use the
@@ -298,7 +337,8 @@ values some other way. That is where this work stopped.
 4. Measure `ck_fifo_mpmc` (exhaustive, and with `-DFENCE_DEQ`, whose fix
    the sampled tests only suggest), the relaxed Treiber stack and the
    `ck_fifo_spsc -DWEAK_ENQ` test. If it is a win, make it the default
-   and document it in the README's "How it works".
+   and document it in the README's "How it works". (Measured across
+   the C programs, it is not yet; see "Across the C programs" above.)
 
 ## Open questions
 

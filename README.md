@@ -912,6 +912,75 @@ bug back, and the old `qemu_event_reset` with just
 with the kernel's barrier in `FUTEX_WAIT`, and the stub futex does not
 model the kernel's side of that.
 
+### libuv
+
+`c/libuv` holds libuv's `src/uv-common.c` and `src/unix/async.c`, with
+the headers they include from libuv, unchanged from libuv 1.53.0
+(September 2026; MIT, see `c/libuv/LICENSE`). On master (November 2026)
+the two functions tested here are the same. `c/libuv/stub` holds stand-ins
+for the C library headers they include, compiled with `-nostdlibinc` so
+that none of the host's headers are used. Its `read` finds no data, and
+its `write` (the eventfd write that wakes the loop) is recorded.
+`externs.h` defines each function the two files call but do not define
+(the rest of libuv and the C library) as a single `BRK`, which armem
+reports as a fault if it runs.
+
+libuv's documentation says that `uv_async_send` and the callback it
+causes are sequentially consistent: everything the sending thread did
+before the call is visible to the callback, even when libuv coalesces
+the call with an earlier one that the loop has not yet handled.
+`libuv_async.c` tests the coalesced case. The handle is pending, as an
+earlier `uv_async_send` leaves it. `t0` runs the loop's
+`uv__async_io`, which clears the pending flag with a seq_cst
+`fetch_and` and runs the callback, which reads `data`. `t1` stores 1 to
+`data` and calls `uv_async_send`. The condition is that `t1`'s call is
+coalesced (no notification is written) and the callback reads 0. That
+callback is the one that answers `t1`'s call, so `t1`'s store is lost.
+
+libuv commit `cdc632c6` ("async: make seq_cst the default", June 2026,
+in 1.53.0) made the pending flag's CAS seq_cst and removed a relaxed
+load of the flag before it, which returned at once if the flag was set.
+`-DOLD_SEND` undoes it (`c/libuv/old/src/uv-common.c`). `-DDATA` gives
+`t1`'s store an ordering, and `-DSEE` the callback's load (both relaxed
+by default):
+
+| Variant | Store | Callback's load | LDAXR/STLXR (armv8-a) | LSE (armv8.1-a) | TSO |
+|---|---|---|---|---|---|
+| current | relaxed | relaxed | **yes** | **yes** | yes (no with LSE) |
+| current | release or seq_cst | relaxed | **yes** | no | no |
+| current | relaxed | acquire | **yes** | **yes** | yes (no with LSE) |
+| current | release | acquire | no | no | no |
+| before `cdc632c6` | any | any | yes | yes | yes |
+
+The first row holds at `-O0` to `-O2` and `-Os`, and the others at `-O0`
+and `-O2`. Each test takes under a second, and at `-O0` each thread
+needs 3,000 instructions. So the current code still loses a coalesced
+call on ARM, unless the caller stores with release and the callback
+loads with acquire, or, with LSE, the caller stores with release. A coalesced `uv_async_send` is a CAS that fails, because the flag is
+set. A failed CAS makes no write, so without LSE it is an `LDAXR` (then
+`CLREX`), and with LSE a `CASAL` that is only an acquire load. Neither
+orders `t1`'s earlier store, unless that store is a release (`STLR`
+before an acquire load is ordered), and so with a relaxed store it is
+store buffering against the loop. On the loop's side, without LSE the
+seq_cst `fetch_and` is an `LDAXR`/`STLXR` loop, and the callback's
+relaxed load may be satisfied before the `STLXR`'s write is visible, as
+in [QEMU](#qemu). With LSE it is an `LDCLRAL`, which orders later loads.
+herd7 agrees on both patterns: an `STLR` then a failing `LDAXR` against
+an `LDAXR`/`STLXR` then `LDR` is allowed (and forbidden with an `LDAR`),
+and an `STR` then a failing `CASAL` against an `LDCLRAL` then `LDR` is
+allowed (and forbidden with an `STLR`). Nor does the code keep its
+promise under C11: a failed seq_cst CAS is a seq_cst load, which does not order
+a relaxed store before it, and a seq_cst RMW does not order a relaxed
+load after it. A program that protects its data with a mutex is not
+affected, as an unlock is a release and a lock an acquire. Under TSO,
+armem runs the same ARM code, where the failing `LDAXR` is just a load.
+x86's `LOCK CMPXCHG` is a full barrier even when it fails.
+
+A seq_cst fence at the start of `uv_async_send` and another after the
+`fetch_and` in `uv__async_io` makes every row no, with and without LSE,
+at `-O0` and `-O2`. This version is not in `c/`; it was checked with
+copies of the two files.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1416,7 +1485,9 @@ lets a lone `LDXP` be torn.
    describing them as bugs (see [DPDK](#dpdk)). In liburcu's QSBR and mb
    flavors, armem finds the lost grace-period wakeups liburcu fixed in
    January 2026 (see [liburcu](#liburcu)), and in QEMU's QemuEvent the
-   lost wakeup QEMU fixed in March 2023 (see [QEMU](#qemu)). In the Chase–Lev
+   lost wakeup QEMU fixed in March 2023 (see [QEMU](#qemu)), and in
+   libuv's async handle a lost coalesced `uv_async_send` that libuv's
+   June 2026 fix does not prevent on ARM (see [libuv](#libuv)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

@@ -1,0 +1,5 @@
+AArch64 libuv_async
+"A coalesced uv_async_send's callback must see what came before the call"
+{ int uv_test_woken; int seen; }
+ P0 = t0 | P1 = t1 ;
+exists (uv_test_woken=0 /\ seen=1)

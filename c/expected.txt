@@ -287,3 +287,33 @@ qemu_event -O0 no no
 qemu_event -O0 yes no -DOLD_EVENT
 qemu_event -O0 no no -march=armv8.1-a
 qemu_event -O0 no no -DOLD_EVENT -march=armv8.1-a
+
+# libuv's async handle (uv-common.c, unix/async.c, v1.53.0): a coalesced
+# uv_async_send's callback must see the sender's store to data. Under TSO
+# the LDAXR of a failing CAS is only a load. In the current code, without
+# LSE the loop's LDAXR/STLXR fetch_and lets the callback's load pass its
+# store, unless that load is acquire (and the store release, before the
+# CAS's LDAXR); with LSE a failing CASAL is only an acquire load, which a
+# relaxed store may pass. OLD_SEND undoes libuv commit cdc632c6, whose
+# uv_async_send starts with a relaxed load of the pending flag.
+libuv_async -O2 yes yes
+libuv_async -O1 yes yes
+libuv_async -Os yes yes
+libuv_async -O2 yes no -march=armv8.1-a
+libuv_async -O1 yes no -march=armv8.1-a
+libuv_async -O2 yes no -DDATA=__ATOMIC_SEQ_CST
+libuv_async -O2 yes no -DDATA=__ATOMIC_RELEASE
+libuv_async -O2 yes yes -DSEE=__ATOMIC_ACQUIRE
+libuv_async -O2 no no -DDATA=__ATOMIC_RELEASE -DSEE=__ATOMIC_ACQUIRE
+libuv_async -O2 no no -DDATA=__ATOMIC_RELEASE -march=armv8.1-a
+libuv_async -O2 no no -DDATA=__ATOMIC_SEQ_CST -march=armv8.1-a
+libuv_async -O2 yes no -DSEE=__ATOMIC_ACQUIRE -march=armv8.1-a
+libuv_async -O2 yes yes -DOLD_SEND
+libuv_async -O2 yes yes -DOLD_SEND -march=armv8.1-a
+libuv_async -O2 yes yes -DOLD_SEND -DDATA=__ATOMIC_SEQ_CST -DSEE=__ATOMIC_SEQ_CST
+libuv_async -O0 yes yes fuel=3000
+libuv_async -O0 yes no -march=armv8.1-a fuel=3000
+libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -DSEE=__ATOMIC_ACQUIRE fuel=3000
+libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -march=armv8.1-a fuel=3000
+libuv_async -O0 yes yes -DOLD_SEND fuel=3000
+libuv_async -O0 yes yes -DOLD_SEND -march=armv8.1-a fuel=3000

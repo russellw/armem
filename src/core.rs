@@ -249,6 +249,13 @@ impl Stack {
         (val, view, pick)
     }
 
+    /// Forget the views of the bytes stored.
+    fn erase_views(&mut self) {
+        for v in self.bytes.values_mut() {
+            (v.1, v.2) = (0, 0);
+        }
+    }
+
     fn write(&mut self, a: u64, n: u64, val: u128, view: View, pick: View) {
         for i in 0..n {
             self.bytes.insert(a + i, ((val >> (8 * i)) as u8, view, pick));
@@ -420,6 +427,23 @@ impl Core {
             flags: RV::default(),
             steps: 0,
         }
+    }
+
+    /// Forget the dependency views of every value held (making them 0), for
+    /// a state whose later accesses do not depend on them.
+    pub fn erase_views(&mut self) {
+        let erase = |val| RV { val, view: 0, pick: 0 };
+        for r in self.regs.iter_mut() {
+            *r = erase(r.val);
+        }
+        self.sp = erase(self.sp.val);
+        self.flags = erase(self.flags.val);
+        if let Some(v) = &mut self.vregs {
+            for r in Arc::make_mut(v).iter_mut() {
+                (r.view, r.pick) = (0, 0);
+            }
+        }
+        self.stack.erase_views();
     }
 
     pub fn get(&self, r: RegOp) -> RV {

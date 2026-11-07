@@ -1523,9 +1523,10 @@ lets a lone `LDXP` be torn.
   few messages, a thread's run against the memory exceeds its state
   limit, and those memories fall back to the static reduction. It is
   not the default: across the C programs it reaches the same final
-  states with 19% fewer memories, but takes 321 s rather than 125 s,
-  since running the threads against each memory can cost far more than
-  the memories it prunes (as in ck's spinlocks).
+  states with 13% fewer memories, but takes 90 s rather than 86 s, since
+  running the threads against each memory can cost more than the
+  memories it prunes. (It gives up on a memory, and on the memories that
+  extend it, when those runs grow too large, as in ck's spinlocks.)
 * The TSO reference cannot tell a seq_cst store from a release store,
   since both compile to `STLR` on ARM, so it runs every `STLR` as an
   ordinary x86 store. x86 compilers make a seq_cst store an `XCHG`, a
@@ -1587,8 +1588,8 @@ lets a lone `LDXP` be torn.
    can certify (that FIFO's full test from 30 memories a second to 300);
    next come a reduction that uses what each execution reads, which that
    test needs (see [docs/dynamic-reduction.md](docs/dynamic-reduction.md);
-   `--dynamic-por` is a first version, which needs cheaper runs against
-   each memory before it can be the default),
+   `--dynamic-por` is a first version, which costs little where it does
+   not help but needs to prune more before it can be the default),
    and guiding the sampling
    towards reads that disagree with what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and

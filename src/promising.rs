@@ -192,15 +192,24 @@ enum Mode {
 /// The timestamp of every later write by another thread (`Mode::Observe`).
 const FUTURE: View = View::MAX / 2;
 
-/// Most states `Mode::Observe` may visit before it gives up.
+/// Most states `Explorer::observe` may visit for one memory, as a multiple
+/// of the states of its `Mode::Collect` runs, and at least and at most.
+/// Observing pays only when it prunes more than it costs, and on memories
+/// whose observing explorations are far larger than their `Collect` runs
+/// (as in ck's spinlocks, where a thread spins on values from later
+/// writes) it seldom does.
+const OBSERVE_STATES_PER_COLLECT: u64 = 10;
+const MIN_OBSERVE_STATES: u64 = 1_000;
 const MAX_OBSERVE_STATES: u64 = 200_000;
 
 /// Most values a read of later writes may return in `Mode::Observe`, where
 /// the analysis does not know them, before it gives up.
 const MAX_UNKNOWN_VALUES: usize = 4096;
 
-/// Most rounds of `Explorer::observe` before it gives up.
-const MAX_OBSERVE_ROUNDS: usize = 8;
+/// Most rounds of `Explorer::observe` before it gives up. With values from
+/// the parent memory, nearly every observation that converges does so in
+/// one or two rounds; the rest are mostly counters that grow every round.
+const MAX_OBSERVE_ROUNDS: usize = 3;
 
 /// Values written, by footprint (address, length).
 type Written = FxHashMap<(u64, u64), BTreeSet<u128>>;
@@ -274,6 +283,8 @@ struct Solo<'a> {
     used_unknown: std::cell::Cell<bool>,
     written: Written,
     gave_up: std::cell::Cell<bool>,
+    /// For `Mode::Observe`: most states before it gives up.
+    max_states: u64,
     states: u64,
     /// Candidates written, in some run, where a promise right after `base`
     /// could be fulfilled: see `promising`.
@@ -348,6 +359,7 @@ impl<'a> Solo<'a> {
             used_unknown: Default::default(),
             written: Default::default(),
             gave_up: Default::default(),
+            max_states: MAX_OBSERVE_STATES,
             states: 0,
             placeable: FxHashSet::default(),
             fulfilling: FxHashSet::default(),
@@ -1291,13 +1303,60 @@ impl<'a> Solo<'a> {
         self.placeable.contains(c) && self.fulfilling.contains(c)
     }
 
+    /// For `Mode::Observe`: if `st` is past `x` (the last message of
+    /// `base`), erase its views, so that states that differ only in views
+    /// are explored once. (In `ck_fifo_mpmc`, nearly all the states of an
+    /// observing exploration are past `x`.)
+    ///
+    /// Views only grow, and in this mode each is at most `ts(x)` or
+    /// `FUTURE`. A read's pre-view is at least `v_rnew`, and a write's at
+    /// least `v_wnew` and `v_cap`, so once those are `FUTURE`, every later
+    /// access has the pre-view `FUTURE`, whatever the other views are. The
+    /// state has no outstanding promise (it would be `doomed`), so no write
+    /// fulfills one: each is a new write at `FUTURE`. Each read returns the
+    /// latest message to each byte, its own new write or a later write by
+    /// another thread, and is recorded only if it might take bytes from `x`
+    /// (see `observe_read`), which depends on the memory and the pieces of
+    /// the read, not on views. So the run goes on as it would have, reading
+    /// and writing the same values, and records the same accesses.
+    fn past(&self, st: &mut TState) {
+        let l = self.base.len() as View;
+        if st.v_rnew <= l || st.v_wnew <= l && st.v_cap <= l {
+            return;
+        }
+        debug_assert!(st.promises.is_empty());
+        st.core.erase_views();
+        for v in [
+            &mut st.v_rold,
+            &mut st.v_rold_p,
+            &mut st.v_rnoret,
+            &mut st.v_rnoret_p,
+            &mut st.v_wold,
+            &mut st.v_rnew,
+            &mut st.v_wnew,
+            &mut st.v_cap,
+            &mut st.v_rel,
+        ] {
+            *v = FUTURE;
+        }
+        // Coherence bounds a read only through `max` with its pre-view, and
+        // the forwarding bank matters only for the new writes, which a read
+        // of their bytes returns (a write in the memory is read from the
+        // memory, as the latest message to its bytes).
+        st.coh = ByteMap::new();
+        st.fwd.map_values(|f| (f.ts == FUTURE).then_some(Fwd { view: 0, pick: 0, xview: 0, ..f }));
+        if let Some(m) = &mut st.xcl {
+            m.view = 0;
+        }
+    }
+
     fn run(&mut self, start: TState) {
         let mut queue = StepQueue::new();
         queue.push(start.core.steps, (start, Vec::new()));
-        while let Some((st, ext)) = queue.pop() {
+        while let Some((mut st, ext)) = queue.pop() {
             if self.mode == Mode::Observe {
                 self.states += 1;
-                if self.gave_up.get() || self.states > MAX_OBSERVE_STATES {
+                if self.gave_up.get() || self.states > self.max_states {
                     self.gave_up.set(true);
                     return;
                 }
@@ -1310,6 +1369,9 @@ impl<'a> Solo<'a> {
             // certify nor complete, nor lead to a certifiable candidate.
             if self.doomed(&st, &ext) {
                 continue;
+            }
+            if self.mode == Mode::Observe {
+                self.past(&mut st);
             }
             // A state already reached with no more steps used has nothing new
             // to offer; this collapses spin loops.
@@ -1388,6 +1450,8 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
             })
             .collect(),
         reduction: if cfg.por { analysis.map(Arc::new) } else { None },
+        seeds: FxHashMap::default(),
+        failed: FxHashSet::default(),
         results: Outcomes::new(test.observables()),
     };
     match cfg.sample {
@@ -1408,20 +1472,27 @@ struct Explorer<'a> {
     /// at the end; None once a run has returned where it did not expect.
     live: Vec<Option<Arc<crate::live::Liveness>>>,
     reduction: Option<Arc<crate::reduce::Reduction>>,
+    /// For `observe`: the values that each thread's later writes may store
+    /// after each memory observed, and the memories whose observation gave
+    /// up (or was not tried, after its parent's gave up).
+    seeds: FxHashMap<Vec<Msg>, Arc<Vec<Written>>>,
+    failed: FxHashSet<Vec<Msg>>,
     results: Outcomes,
 }
 
 impl<'a> Explorer<'a> {
     /// Run thread `tid` alone against `mem`.
     fn solo(&mut self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
-        self.solo_with(tid, mem, mode, Arc::default())
+        self.solo_with(tid, mem, mode, Arc::default(), MAX_OBSERVE_STATES)
     }
 
-    /// The same, with `Solo::unknown` for `Mode::Observe`.
-    fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>) -> Solo<'a> {
+    /// The same, with `Solo::unknown` and `Solo::max_states` for
+    /// `Mode::Observe`.
+    fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>, max_states: u64) -> Solo<'a> {
         loop {
             let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
             s.reduction = self.reduction.clone();
+            s.max_states = max_states;
             if mode == Mode::Observe {
                 s.unknown = unknown.clone();
             }
@@ -1434,20 +1505,38 @@ impl<'a> Explorer<'a> {
     }
 
     /// What each thread may do after `mem` (`Mode::Observe`), or None if
-    /// that is not known.
+    /// that is not known, within `budget` states.
     ///
     /// Where the analysis does not know what a later write may store (a
     /// counter, which it widens to any value), the values come from the
-    /// explorations themselves, in rounds: in the first, a read of those
-    /// bytes returns no later write; in each next one, it returns the
-    /// values the other threads wrote in the rounds before. Once a round
-    /// adds no value, every later write's is among them: in Promising-ARM
-    /// a write depends only on reads of earlier messages, so (by induction
-    /// on the memory order) the `k`th later write's value is found by
-    /// round `k`, and that round has added it.
-    fn observe(&mut self, mem: &[Msg]) -> Option<crate::reduce::Observed> {
+    /// explorations themselves, in rounds: in each, a read of those bytes
+    /// returns the values the other threads wrote in the rounds before.
+    /// Once a round adds no value, every later write's is among them: in
+    /// Promising-ARM a write depends only on reads of earlier messages, so
+    /// (by induction on the memory order) if the values of the first `k`
+    /// later writes are among those a round starts from, the `k + 1`th is
+    /// among those it finds, and so among those it started from.
+    ///
+    /// That holds whatever values the first round starts from, so it starts
+    /// from those found for the parent memory (`mem` without its last
+    /// message), if that was observed: every execution whose memory extends
+    /// `mem` extends the parent too, and its writes after `mem` come after
+    /// the parent. Then the first round usually adds nothing. If the
+    /// parent's observation gave up, so does this one, without trying:
+    /// deeper memories rarely converge where a shallower one did not, and
+    /// trying them all costs more than they prune.
+    fn observe(&mut self, mem: &[Msg], mut budget: u64) -> Option<crate::reduce::Observed> {
         let n = self.test.threads.len();
-        let mut written: Vec<Written> = vec![Written::default(); n];
+        let parent = &mem[..mem.len() - 1];
+        if self.failed.contains(parent) {
+            self.failed.insert(mem.to_vec());
+            self.results.stats.observe_failed += 1;
+            return None;
+        }
+        let mut written: Vec<Written> = match self.seeds.get(parent) {
+            Some(w) => (**w).clone(),
+            None => vec![Written::default(); n],
+        };
         for _ in 0..MAX_OBSERVE_ROUNDS {
             let mut obs = crate::reduce::Observed::default();
             let mut used_unknown = false;
@@ -1462,8 +1551,10 @@ impl<'a> Explorer<'a> {
                         }
                     }
                 }
-                let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::new(unknown));
+                let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::new(unknown), budget);
+                budget = budget.saturating_sub(o.states);
                 if o.gave_up.get() {
+                    self.failed.insert(mem.to_vec());
                     self.results.stats.observe_failed += 1;
                     return None;
                 }
@@ -1479,10 +1570,12 @@ impl<'a> Explorer<'a> {
             }
             if !used_unknown || !grown {
                 self.results.stats.observed += 1;
+                self.seeds.insert(mem.to_vec(), Arc::new(new_written));
                 return Some(obs);
             }
             written = new_written;
         }
+        self.failed.insert(mem.to_vec());
         self.results.stats.observe_failed += 1;
         None
     }
@@ -1510,8 +1603,10 @@ impl<'a> Explorer<'a> {
         let mut faulted = false;
         let mut candidates = Vec::new();
         let mut promising = Vec::new();
+        let mut collect_states = 0u64;
         for tid in 0..test.threads.len() {
             let mut c = self.solo(tid, mem, Mode::Collect);
+            collect_states += c.visited.len() as u64;
             let cands = std::mem::take(&mut c.candidates);
             promising.push(cands.iter().map(|x| !self.cfg.filter || c.promising(x)).collect::<Vec<_>>());
             self.results.truncated |= c.truncated;
@@ -1544,7 +1639,8 @@ impl<'a> Explorer<'a> {
                 }),
                 _ => false,
             };
-        let observed = if need_observed { self.observe(mem) } else { None };
+        let budget = (OBSERVE_STATES_PER_COLLECT * collect_states).clamp(MIN_OBSERVE_STATES, MAX_OBSERVE_STATES);
+        let observed = if need_observed { self.observe(mem, budget) } else { None };
         let mut out = Vec::new();
         for (tid, cands) in candidates.into_iter().enumerate() {
             for ((addr, size, val), promising) in cands.into_iter().zip(&promising[tid]) {

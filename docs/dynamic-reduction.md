@@ -3,7 +3,9 @@
 Status: implemented as `--dynamic-por` (off by default), November 2026.
 See [Results](#results): it helps several tests, but on `ck_fifo_mpmc`,
 the test it was designed for, it gives up, because of a counter (see
-[Counters](#counters)).
+[Counters](#counters)). Across the C programs it now costs about 5% more
+time than the static reduction alone (see [Cheaper
+observing](#cheaper-observing)).
 
 ## The problem
 
@@ -317,6 +319,65 @@ section before this one), which is sound only where the thread can no
 longer read `x`'s bytes and no other thread needs the values of its
 later writes. In the spinlocks, the threads keep reading the lock word,
 so the cut may not help them.
+
+### Cheaper observing
+
+The measurements below are of the 248 exhaustive lines of
+`c/expected.txt` (clang 21, November 2026), run one at a time: runs in
+parallel had made some lines look several times slower or faster than
+they are. As it was, `--dynamic-por` took 176.7 s and 116,928 memories,
+against 86.0 s and 145,337 without it.
+
+**The cut is not needed, and would not be enough.** Cutting off the
+states past `x` would lose the values of their later writes, wherever
+another thread reads those bytes with values the pre-pass does not
+know. That turned out to be every thread of the slow tests: in ck's
+spinlocks the plain counter that the critical section increments is
+widened, like any counter. And in the decrement lock, only 7,004 of
+921,613 observing states were past `x`. The rest were the thread
+spinning on its lock word, whose values grew round after round.
+
+**Erasing views past `x`.** A state past `x` has no promise left (it
+would be doomed), and every access it makes has the pre-view `F`, so
+what it reads and writes, and what it records, no longer depend on its
+views. `Solo::past` therefore sets them all to one value, and states
+that differed only in views are explored once. The run goes on, so the
+later writes still give their values to the next round. This is sound
+whatever the test, but gains only about 10%.
+
+**Starting from the parent's values.** The rounds' argument holds
+whatever values the first round starts from, so `observe` starts from
+the values found for the parent memory: every execution whose memory
+extends `Q·x` extends `Q`, and its writes after `Q·x` come after `Q`.
+In the MCS lock at `-O0`, 850 of the 990 observations that converge now do so
+in one round instead of two.
+
+**Giving up sooner.** The observations that do not converge are where
+the states go: before these changes, 1,329 of them across the suite ran
+all 8 rounds, and took 11.5 million of the 20.9 million observing
+states. So an observation now gives up after 3 rounds; and if a memory's
+observation gave up, its children's are not tried (a counter that grows
+in one memory's rounds mostly grows in its children's too); and each
+observation may take at most 10 times as many states as the `Collect`
+runs of its memory (at least 1,000). Each of these only makes the
+search fall back to the static reduction, so all are sound.
+
+Together: 90.3 s and 127,173 memories, against 86.0 s and 145,337
+without the dynamic reduction, with the same final states on every
+line. No line is more than 0.5 s slower; the largest losses are ck's
+epoch tests and `ck_epoch_poll3` (about 0.5 s each). The wins are as
+before: the relaxed Treiber stack (1.6 s to 0.5 s), `chase_lev
+-DPUSH_FENCE` at `-O2` (1,184 memories to 145) and `dcl`. At `-O0`,
+that `chase_lev` test now prunes less (692 memories, not 145), as its
+observations exceed the budget. Outside the suite, `ck_fifo_spsc
+-DWEAK_ENQ` still goes from 63,314 memories in 37.6 s to 1,297 in
+1.8 s. `ck_fifo_mpmc` still does not finish. Its first 3,000 memories
+take 31 s, against 17 s with the static reduction (and more than 600 s
+before these changes), since its shallow memories' observations give up,
+and with them every deeper one.
+
+So the dynamic reduction no longer costs much where it does not help,
+but across the suite it does not pay either, and it stays an option.
 
 ## Plan
 

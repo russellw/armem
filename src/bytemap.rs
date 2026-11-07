@@ -101,6 +101,20 @@ impl<V: Copy + Eq> ByteMap<V> {
         self.runs.splice(range, new);
     }
 
+    /// Map the value of every mapped byte `b` to `f(self.get(b))` (`None`
+    /// unmaps it).
+    pub fn map_values(&mut self, f: impl Fn(V) -> Option<V>) {
+        let mut new: Vec<Run<V>> = Vec::with_capacity(self.runs.len());
+        for r in &self.runs {
+            let Some(val) = f(r.val) else { continue };
+            match new.last_mut() {
+                Some(last) if last.hi == r.lo && last.val == val => last.hi = r.hi,
+                _ => new.push(Run { val, ..*r }),
+            }
+        }
+        self.runs = new;
+    }
+
     /// Map every byte in `lo..hi` to `val`.
     pub fn set(&mut self, lo: u64, hi: u64, val: V) {
         self.update(lo, hi, |_| Some(val));
@@ -150,7 +164,13 @@ mod tests {
                 let lo = next(32);
                 let hi = lo + next(9);
                 let v = next(3) as u8;
-                match next(3) {
+                match next(4) {
+                    3 => {
+                        // Merge values 1 and 2, and unmap value `v`.
+                        let f = |x: u8| (x != v).then_some(x.min(1));
+                        m.map_values(f);
+                        model = model.into_iter().filter_map(|(b, x)| f(x).map(|y| (b, y))).collect();
+                    }
                     0 => {
                         m.set(lo, hi, v);
                         for b in lo..hi {

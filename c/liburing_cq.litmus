@@ -1,0 +1,5 @@
+AArch64 liburing_cq
+"Each CQE the application reaps must be the one the kernel posted in that slot"
+{ int bad; int got; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

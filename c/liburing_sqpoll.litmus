@@ -1,0 +1,5 @@
+AArch64 liburing_sqpoll
+"io_uring_submit must wake a polling thread that has gone to sleep"
+{ int uring_test_slept; int uring_test_woken; }
+ P0 = t0 | P1 = t1 ;
+exists (uring_test_slept=1 /\ uring_test_woken=0)

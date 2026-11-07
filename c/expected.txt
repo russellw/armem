@@ -317,3 +317,45 @@ libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -DSEE=__ATOMIC_ACQUIRE fuel=3000
 libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -march=armv8.1-a fuel=3000
 libuv_async -O0 yes yes -DOLD_SEND fuel=3000
 libuv_async -O0 yes yes -DOLD_SEND -march=armv8.1-a fuel=3000
+
+# liburing's submission to an SQPOLL ring (queue.c, liburing.h, commit
+# c63f4aa6): a polling thread that sets IORING_SQ_NEED_WAKEUP and then
+# finds no work sleeps, and io_uring_submit must see the flag and wake it.
+# The kernel's side is io_sq_thread's check, with arm64's atomic_or,
+# smp_mb and smp_load_acquire. OLD_SUBMIT undoes liburing commit
+# 744f4156, which put a full fence between the release store of the SQ
+# tail and the load of the flags: without it, that is store buffering,
+# on x86 too. NO_KERNEL_MB removes the kernel's smp_mb__after_atomic,
+# which x86's locked OR makes unnecessary there.
+liburing_sqpoll -O2 no no
+liburing_sqpoll -O1 no no
+liburing_sqpoll -Os no no
+liburing_sqpoll -O2 no no -march=armv8.1-a
+liburing_sqpoll -O2 yes yes -DOLD_SUBMIT
+liburing_sqpoll -O1 yes yes -DOLD_SUBMIT
+liburing_sqpoll -Os yes yes -DOLD_SUBMIT
+liburing_sqpoll -O2 yes yes -DOLD_SUBMIT -march=armv8.1-a
+liburing_sqpoll -O2 yes no -DNO_KERNEL_MB
+liburing_sqpoll -O2 yes no -DNO_KERNEL_MB -march=armv8.1-a
+liburing_sqpoll -O0 no no
+liburing_sqpoll -O0 yes yes -DOLD_SUBMIT
+liburing_sqpoll -O0 yes no -DNO_KERNEL_MB
+
+# liburing's completion queue with one entry: the application reaps two
+# CQEs that the kernel posts into the same slot, and each must be the
+# one posted. ACQ_HEAD undoes liburing commit a4d619a2 (June 2026), which
+# made __io_uring_peek_cqe load the CQ head (which only the application
+# writes) with a plain load rather than acquire; both are right.
+# NO_KERNEL_RELEASE makes the kernel's store of the CQ tail a WRITE_ONCE.
+liburing_cq -O2 no no
+liburing_cq -O1 no no
+liburing_cq -Os no no
+liburing_cq -O2 no no -march=armv8.1-a
+liburing_cq -O2 no no -march=armv8.3-a
+liburing_cq -O2 no no -DACQ_HEAD
+liburing_cq -O1 no no -DACQ_HEAD
+liburing_cq -O2 no no -DACQ_HEAD -march=armv8.3-a
+liburing_cq -O2 yes no -DNO_KERNEL_RELEASE
+liburing_cq -O0 no no
+liburing_cq -O0 no no -DACQ_HEAD
+liburing_cq -O0 yes no -DNO_KERNEL_RELEASE

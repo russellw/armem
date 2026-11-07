@@ -981,6 +981,80 @@ A seq_cst fence at the start of `uv_async_send` and another after the
 at `-O0` and `-O2`. This version is not in `c/`; it was checked with
 copies of the two files.
 
+### liburing
+
+`c/liburing/src` holds liburing's `src/queue.c` and the headers it
+includes from liburing, unchanged from liburing commit `c63f4aa6`
+(November 2026, 2.16; MIT or LGPL-2.1, see `c/liburing/LICENSE` and
+`c/liburing/COPYING`), with `liburing/compat.h` and
+`liburing/io_uring_version.h` as its `configure` generates them.
+`c/liburing/stub` holds stand-ins for the C library and Linux headers,
+compiled with `-nostdlibinc`. It also holds a stand-in for liburing's
+`src/arch/aarch64/syscall.h`, whose system calls are `SVC` instructions:
+here each one calls `uring_test_syscall`, which the test defines, and
+liburing's `src/arch/syscall-defs.h` (unchanged) builds its wrappers
+from those calls. The kernel's side of each test is a few lines of
+`io_uring/` from Linux commit `d4872371` (November 2026), with arm64's
+atomics and barriers written as the kernel's inline assembly. The only
+exception is the `PRFM` hint before the LL/SC loop, which is left out.
+
+With `IORING_SETUP_SQPOLL`, a kernel thread polls the submission queue,
+and when it finds no work it sleeps. `io_sq_thread` first sets
+`IORING_SQ_NEED_WAKEUP` in the ring's flags, then (after
+`smp_mb__after_atomic`) checks the SQ tail once more. `io_uring_submit`
+stores the tail with release, then reads the flags, and if the flag is
+set it calls `io_uring_enter` with `IORING_ENTER_SQ_WAKEUP`.
+`liburing_sqpoll.c` runs `io_uring_get_sqe`, `io_uring_prep_nop` and
+`io_uring_submit` in `t0`, and the kernel thread's check in `t1`. The
+condition is that the thread would sleep and `t0` does not wake it,
+which leaves the new entry unsubmitted.
+
+liburing commit `744f4156` ("Fix memory ordering in
+sq_ring_needs_enter", March 2022, liburing issue 541) added a full fence
+between the tail store and the load of the flags. `-DOLD_SUBMIT` undoes
+it (`c/liburing/old/src/queue.c`), and `-DNO_KERNEL_MB` removes the
+kernel's `smp_mb__after_atomic`:
+
+| Variant | LDXR/STXR (armv8-a) | LSE (armv8.1-a) | TSO |
+|---|---|---|---|
+| current | no | no | no |
+| before `744f4156` | yes | yes | yes |
+| kernel without `smp_mb__after_atomic` | **yes** | **yes** | no |
+
+That holds at `-O0` to `-O2` and `-Os`, and with `LDAPR`
+(`-march=armv8.3-a`), and each test takes under 0.1 s. The old code is
+store buffering: `t0`'s `STLR` of the tail and its later `LDR` of the
+flags are not ordered, on ARM or on x86 (where a release store is a
+plain `MOV`), so the bug was not ARM-only. The kernel's barrier is
+needed only on ARM. Its `atomic_or` is relaxed on arm64 (an
+`LDXR`/`STXR` loop, or `STSET`), and nothing orders it before the
+`LDAR` of the tail. On x86 it is a locked `OR`, a full barrier. herd7
+agrees on all three patterns, with the LSE atomic.
+
+`liburing_cq.c` tests the completion queue, with a single entry so that
+the kernel reuses its slot. `t1` posts two completions (res 1, then 2) as
+`io_cqe_cache_refill` and `io_commit_cqring` do: it reads the head the
+application last released (`READ_ONCE`), and only if the slot is free
+writes the CQE with `WRITE_ONCE` and releases the tail. If the slot is
+not free, the completion would overflow, and here `t1` stops. `t0` calls
+`io_uring_peek_cqe` twice, and for each CQE it gets, checks its res and
+calls `io_uring_cqe_seen`. The condition is that it reads a CQE other
+than the one posted for that slot.
+
+liburing commit `81cb9479` (July 2025) made `__io_uring_peek_cqe` load
+the CQ head with acquire, on the grounds that the CQE's address depends
+on the head, and C does not order address dependencies. Commit `a4d619a2`
+(June 2026) reverted it: only the application writes the head, and the
+acquire load of the tail already orders the CQE's contents.
+`-DACQ_HEAD` restores the acquire (`c/liburing/old/include/liburing.h`).
+Both versions are right at `-O0` to `-O2` and `-Os`, with and without
+LSE and `LDAPR`, so the revert is safe on ARM. Each takes under 0.1 s.
+The kernel's side of slot reuse is ordered by a control dependency, from
+its load of the head to its stores to the CQE, which ARM respects for
+stores. With `-DNO_KERNEL_RELEASE`, a `WRITE_ONCE` of the tail rather
+than `smp_store_release`, `t0` may read the slot before the kernel's
+writes to it. That is ARM-only (0.7 s, 1.5 s at `-O0`).
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1487,7 +1561,10 @@ lets a lone `LDXP` be torn.
    January 2026 (see [liburcu](#liburcu)), and in QEMU's QemuEvent the
    lost wakeup QEMU fixed in March 2023 (see [QEMU](#qemu)), and in
    libuv's async handle a lost coalesced `uv_async_send` that libuv's
-   June 2026 fix does not prevent on ARM (see [libuv](#libuv)). In the Chase–Lev
+   June 2026 fix does not prevent on ARM (see [libuv](#libuv)), and in
+   liburing the lost SQPOLL wakeup liburing fixed in March 2022, and that
+   its June 2026 change to the CQ head load is safe (see
+   [liburing](#liburing)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

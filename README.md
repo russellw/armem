@@ -979,7 +979,8 @@ x86's `LOCK CMPXCHG` is a full barrier even when it fails.
 A seq_cst fence at the start of `uv_async_send` and another after the
 `fetch_and` in `uv__async_io` makes every row no, with and without LSE,
 at `-O0` and `-O2`. This version is not in `c/`; it was checked with
-copies of the two files.
+copies of the two files. This was reported as
+[libuv/libuv#5416](https://github.com/libuv/libuv/issues/5416).
 
 ### liburing
 

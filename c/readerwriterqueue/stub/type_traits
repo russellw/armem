@@ -1,0 +1,13 @@
+// Stand-in for <type_traits>: what readerwriterqueue.h uses.
+#ifndef STUB_TYPE_TRAITS
+#define STUB_TYPE_TRAITS
+#include <cstddef>
+namespace std {
+template<typename T, T v> struct integral_constant { static constexpr T value = v; };
+template<typename T> struct alignment_of : integral_constant<size_t, alignof(T)> {};
+template<typename T> struct remove_reference { typedef T type; };
+template<typename T> struct remove_reference<T&> { typedef T type; };
+template<typename T> struct remove_reference<T&&> { typedef T type; };
+template<typename T> struct make_signed { typedef __make_signed(T) type; };
+}
+#endif

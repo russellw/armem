@@ -211,14 +211,42 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
 /// With `live`, thread states that differ only in registers never read
 /// again are merged (see `crate::live`).
 pub fn explore(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -> Outcomes {
-    live.then(|| explore_with(test, kind, fuel, private, true))
+    live.then(|| explore_with(test, kind, fuel, private, true, None))
         .flatten()
-        .unwrap_or_else(|| explore_with(test, kind, fuel, private, false).unwrap())
+        .unwrap_or_else(|| explore_with(test, kind, fuel, private, false, None).unwrap())
+}
+
+/// Run `test`'s only thread alone, under sequential consistency, with up
+/// to `fuel` instructions, and return the bytes of memory it wrote (its
+/// stack is not memory). For a test's setup functions (see
+/// `litmus::parse_with`).
+pub fn run_alone(test: &Test, fuel: u32) -> Result<BTreeMap<u64, u8>, String> {
+    assert_eq!(test.threads.len(), 1);
+    let mut finals = Vec::new();
+    let o = explore_with(test, Kind::Sc, fuel, false, false, Some(&mut finals)).unwrap();
+    if let Some(f) = o.faults.iter().next() {
+        return Err(format!("faulted: {}", f.strip_prefix("P0: ").unwrap_or(f)));
+    }
+    if o.truncated {
+        return Err(format!("did not return within {} instructions", fuel));
+    }
+    match <[_; 1]>::try_from(finals) {
+        Ok([mem]) => Ok(mem),
+        Err(_) => Err("did not return".into()),
+    }
 }
 
 /// `explore`, merging thread states that differ only in dead registers if
 /// `live`. None if a thread returned where the liveness did not expect.
-fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -> Option<Outcomes> {
+/// With `finals`, the memory written by each final state is pushed to it.
+fn explore_with(
+    test: &Test,
+    kind: Kind,
+    fuel: u32,
+    private: bool,
+    live: bool,
+    mut finals: Option<&mut Vec<BTreeMap<u64, u8>>>,
+) -> Option<Outcomes> {
     let obs = test.observables();
     let lives: Vec<Option<Liveness>> = (0..test.threads.len())
         .map(|t| {
@@ -493,6 +521,9 @@ fn explore_with(test: &Test, kind: Kind, fuel: u32, private: bool, live: bool) -
         }
         if !any && !stuck {
             // Every thread has finished and drained its buffer.
+            if let Some(f) = finals.as_deref_mut() {
+                f.push(g.mem.clone());
+            }
             let state = obs
                 .iter()
                 .map(|o| match *o {

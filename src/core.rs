@@ -103,7 +103,8 @@ pub fn stack_range(tid: usize) -> (u64, u64) {
 /// dependencies (Arm's `(addr | data); rfi`). A store still orders what it
 /// depends on before later writes after a `DMB ST` (see `Step::Local`).
 ///
-/// It is a fault for a thread to access the stack area outside its own
+/// It is a fault for a thread to access the null page (below `NULL_PAGE`),
+/// or to access the stack area outside its own
 /// stack (another thread's stack, a guard slot, or across the edge of its
 /// own), or to access its stack with an exclusive, atomic, acquire or
 /// release instruction.
@@ -141,6 +142,10 @@ impl Eq for Private {}
 impl std::hash::Hash for Private {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
+
+/// Accesses below this address fault, as a null pointer dereference does.
+/// No location is placed there (see `litmus::SYM_BASE`).
+pub const NULL_PAGE: u64 = 0x1000;
 
 /// Where an access goes.
 enum Place {
@@ -202,6 +207,9 @@ impl Stack {
         let Some(end) = a.checked_add(len) else {
             return Place::Memory;
         };
+        if a < NULL_PAGE {
+            return Place::Fault(format!("{}-byte access at {:#x} is in the null page (a null pointer dereference)", len, a));
+        }
         if a >= self.lo && end <= self.hi {
             if access == Access::Plain {
                 return Place::Stack;

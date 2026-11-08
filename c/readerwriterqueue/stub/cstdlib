@@ -1,0 +1,11 @@
+// Stand-in for <cstdlib>.
+#ifndef STUB_CSTDLIB
+#define STUB_CSTDLIB
+#include <cstddef>
+extern "C" {
+void abort(void) __attribute__((noreturn));
+void* malloc(size_t n);
+void free(void* p);
+}
+namespace std { using ::abort; using ::malloc; using ::free; }
+#endif

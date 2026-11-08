@@ -610,3 +610,96 @@ fn compiled_arithmetic() {
         assert!(!text.contains("fuel") && !text.contains("FAULT"), "{}:\n{}", opt, text);
     }
 }
+
+const C_SETUP: &str = r#"
+int cells[4];
+int *ptr;
+int sum;
+void fill(void) { for (int i = 0; i < 4; i++) cells[i] = i + 1; ptr = &cells[2]; }
+void total(void) { sum = cells[0] + cells[3]; }
+int deref(void) { return *ptr; }
+int deref_null(void) { return *(volatile int *)ptr; }
+void bad_setup(void) { *(volatile int *)ptr = 1; }
+"#;
+
+/// Setup functions (`f()` in the init block) run alone, in order, before
+/// the threads, and their writes become the initial memory. An access to
+/// the null page faults, in a thread or in a setup function.
+#[test]
+fn setup_functions_and_null_page() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let c = scratch("setup.c");
+    std::fs::write(&c, C_SETUP).unwrap();
+    for opt in ["-O2", "-O0"] {
+        let o = scratch(&format!("setup{}.o", opt));
+        let out = Command::new(&clang)
+            .args(["--target=aarch64-linux-gnu", opt, "-fno-pic", "-c", "-o"])
+            .arg(&o)
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let data = std::fs::read(&o).unwrap();
+        let pre = Image::load(&Elf::parse(&data).unwrap(), &LoadOptions::default()).and_then(|i| i.preload()).unwrap();
+        let parse = |init: &str, thread: &str, cond: &str| {
+            litmus::parse_with(&format!("AArch64 t\n{{ {} }}\n P0 = {} ;\n{}\n", init, thread, cond), &pre)
+        };
+        // `total` sees what `fill` wrote, and the thread sees both.
+        let t = parse("fill(); total();", "deref", "forall (0:X0=3 /\\ sum=5)").unwrap();
+        assert_eq!(t.setup, ["fill", "total"]);
+        let o2 = run(&t, Model::Arm, &Options::default());
+        assert!(o2.faults.is_empty() && o2.observed(&t).unwrap(), "{}", opt);
+        // In the other order, `total` runs first and sums zeros.
+        let t = parse("total(); fill();", "deref", "forall (sum=0)").unwrap();
+        assert!(observed(&t, Model::Arm), "{}", opt);
+        // Without `fill`, ptr is null.
+        let t = parse("", "deref_null", "exists (0:X0=0)").unwrap();
+        for model in [Model::Arm, Model::Tso, Model::Sc] {
+            let o2 = run(&t, model, &Options::default());
+            assert!(o2.faults.iter().any(|f| f.contains("null page")), "{} {:?}: {:?}", opt, model, o2.faults);
+        }
+        let e = parse("bad_setup();", "deref", "exists (0:X0=0)").unwrap_err();
+        assert!(e.contains("setup function 'bad_setup' faulted") && e.contains("null page"), "{}", e);
+        let e = parse("nosuch();", "deref", "exists (0:X0=0)").unwrap_err();
+        assert!(e.contains("no function 'nosuch'"), "{}", e);
+    }
+}
+
+const C_PAIR: &str = r#"
+struct { long a, b; } s;
+void pair(long x, long y) { s.a = x; s.b = y; }
+long half(void) { return s.b; }
+"#;
+
+/// clang stores both fields with one STP. Only the writer accesses `s.a`,
+/// but the STP is one access, so neither half may be private memory (an
+/// access partly private would be an internal error, reported as a fault).
+#[test]
+fn pair_store_partly_shared() {
+    let Some(mc) = llvm_mc() else { return };
+    let clang = mc.replace("llvm-mc", "clang");
+    if !Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: {} not found", clang);
+        return;
+    }
+    let c = scratch("pair.c");
+    std::fs::write(&c, C_PAIR).unwrap();
+    let o = scratch("pair.o");
+    let out = Command::new(&clang).args(["--target=aarch64-linux-gnu", "-O2", "-fno-pic", "-c", "-o"]).arg(&o).arg(&c).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let data = std::fs::read(&o).unwrap();
+    let pre = Image::load(&Elf::parse(&data).unwrap(), &LoadOptions::default()).and_then(|i| i.preload()).unwrap();
+    let pair = &pre.code.as_ref().unwrap().instrs;
+    assert!(pair.iter().any(|i| matches!(i, armem::isa::Instr::StorePair { .. })), "clang did not emit an STP");
+    let t = litmus::parse_with("AArch64 t\n{ 0:X0=1; 0:X1=2; }\n P0 = pair | P1 = half ;\nexists (1:X0=2)\n", &pre).unwrap();
+    for model in [Model::Arm, Model::Tso, Model::Sc] {
+        let o2 = run(&t, model, &Options::default());
+        assert!(o2.faults.is_empty(), "{:?}: {:?}", model, o2.faults);
+        assert!(o2.observed(&t).unwrap(), "{:?}", model);
+    }
+}

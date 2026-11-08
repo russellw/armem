@@ -1,0 +1,10 @@
+// Stand-in for <chrono>: names in BlockingReaderWriterQueue's timed
+// waits, which the tests do not use.
+#ifndef STUB_CHRONO
+#define STUB_CHRONO
+namespace std { namespace chrono {
+template<typename Rep, typename Period = void> class duration;
+template<typename To, typename Rep, typename Period> To duration_cast(const duration<Rep, Period>& d);
+typedef duration<long long> microseconds;
+} }
+#endif

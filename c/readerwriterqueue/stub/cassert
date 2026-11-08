@@ -1,0 +1,7 @@
+// Stand-in for <cassert>. Freestanding: a failed assertion traps.
+#undef assert
+#ifdef NDEBUG
+#define assert(x) ((void)0)
+#else
+#define assert(x) do { if (!(x)) __builtin_trap(); } while (0)
+#endif

@@ -2,7 +2,8 @@
 //! threads, and checks the verdicts in `c/expected.txt`.
 //!
 //! Each line of `expected.txt` gives a program, an optimization level, the
-//! expected ARM and TSO verdicts for its litmus test (`c/NAME.litmus`), and
+//! expected ARM and TSO verdicts for its litmus test (`c/NAME.litmus`:
+//! `yes`, `no`, or `fault` when some execution faults), and
 //! any further clang flags (usually a `-D` that weakens one ordering). A
 //! `sample=N` among the flags runs the ARM model on N random paths instead
 //! of exhaustively, for variants too big to explore; it may only confirm
@@ -10,8 +11,9 @@
 //! `fuel=N` gives the threads N instructions each rather than `FUEL`. The test
 //! is skipped (with a message) when clang is not installed.
 //!
-//! A program whose first line is `/* cflags: ... */` is compiled with those
-//! flags too, with `-I` paths relative to `c/`.
+//! A program is `c/NAME.c`, or `c/NAME.cpp` for C++. One whose first line
+//! is `/* cflags: ... */` is compiled with those flags too, with `-I` paths
+//! relative to `c/`.
 
 use armem::elf::Elf;
 use armem::image::{Image, LoadOptions};
@@ -27,8 +29,20 @@ struct Expectation {
     cflags: Vec<String>,
     sample: Option<u64>,
     fuel: u32,
-    arm: bool,
-    tso: bool,
+    arm: Verdict,
+    tso: Verdict,
+}
+
+/// What a model is expected to find.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// The condition is reachable (`yes`).
+    Yes,
+    /// It is not, and no execution faults (`no`).
+    No,
+    /// Some execution faults (`fault`), as one that dereferences a null
+    /// pointer does.
+    Fault,
 }
 
 fn expectations() -> Vec<Expectation> {
@@ -40,8 +54,9 @@ fn expectations() -> Vec<Expectation> {
         .map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
             let verdict = |s: &str| match s {
-                "yes" => true,
-                "no" => false,
+                "yes" => Verdict::Yes,
+                "no" => Verdict::No,
+                "fault" => Verdict::Fault,
                 _ => panic!("expected.txt: bad verdict '{}' in: {}", s, l),
             };
             let mut cflags = vec![f[1].to_string()];
@@ -57,7 +72,7 @@ fn expectations() -> Vec<Expectation> {
                 }
             }
             let arm = verdict(f[2]);
-            assert!(arm || sample.is_none(), "expected.txt: sampling cannot show that a condition is unreachable: {}", l);
+            assert!(arm != Verdict::No || sample.is_none(), "expected.txt: sampling cannot show that a condition is unreachable: {}", l);
             Expectation { line: l.to_string(), program: f[0].to_string(), cflags, sample, fuel, arm, tso: verdict(f[3]) }
         })
         .collect()
@@ -100,7 +115,7 @@ fn program_cflags(source: &Path, dir: &Path) -> Vec<String> {
 fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("c");
     let obj = scratch(&format!("{}-{}.o", e.program, i));
-    let source = dir.join(format!("{}.c", e.program));
+    let source = ["c", "cpp"].iter().map(|x| dir.join(format!("{}.{}", e.program, x))).find(|p| p.exists()).unwrap();
     let out = Command::new(clang)
         .args(["--target=aarch64-linux-gnu", "-fno-pic", "-c", "-o"])
         .arg(&obj)
@@ -124,12 +139,18 @@ fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
         if o.truncated {
             errors.push(format!("{} ran out of fuel", model.name()));
         }
+        if want == Verdict::Fault {
+            if o.faults.is_empty() {
+                errors.push(format!("{}: expected a fault, got none", model.name()));
+            }
+            continue;
+        }
         if !o.faults.is_empty() {
             errors.push(format!("{} faulted: {:?}", model.name(), o.faults));
         }
         let got = o.observed(&test).unwrap();
-        if got != want {
-            errors.push(format!("{}: expected {}, got {}", model.name(), want, got));
+        if got != (want == Verdict::Yes) {
+            errors.push(format!("{}: expected {}, got {}", model.name(), want == Verdict::Yes, got));
         }
     }
     (!errors.is_empty()).then(|| format!("{}: {}", e.line, errors.join("; ")))

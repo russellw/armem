@@ -95,6 +95,9 @@ pub struct Test {
     /// The ELF function each thread runs (`P0 = name`), if any.
     pub functions: Vec<Option<String>>,
     pub init_regs: Vec<[u64; 31]>,
+    /// The setup functions (`f()` in the init block), already run: their
+    /// writes are in `init_mem`.
+    pub setup: Vec<String>,
     /// Initial memory contents (absent bytes are 0).
     pub init_mem: InitMem,
     /// Declared types of named locations (default: signed 64-bit).
@@ -310,6 +313,32 @@ fn strip_comments(src: &str) -> String {
         .join("\n")
 }
 
+/// The most instructions a setup function may run.
+pub const SETUP_FUEL: u32 = 100_000;
+
+/// The preloaded ELF file's function `f`.
+fn elf_function(pre: &Preload, f: &str) -> Result<Program> {
+    match pre.functions.get(f) {
+        None if pre.functions.is_empty() => Err(format!("function '{}' needs an ELF file (--elf)", f)),
+        None => Err(format!("no function '{}' in the ELF file", f)),
+        Some(&addr) => {
+            let code = pre.code.as_ref().filter(|c| c.index(addr).is_some_and(|i| i < c.instrs.len()));
+            let Some(code) = code else {
+                return Err(format!("function '{}' at {:#x} is not in the loaded code", f, addr));
+            };
+            Ok(Program { code: code.clone(), entry: code.index(addr).unwrap() })
+        }
+    }
+}
+
+/// Registers for a setup function: zero, except that it returns to the
+/// code's exit.
+fn init_regs_for(p: &Program) -> [u64; 31] {
+    let mut r = [0; 31];
+    r[30] = p.code.exit();
+    r
+}
+
 pub fn parse(src: &str) -> Result<Test> {
     parse_with(src, &Preload::default())
 }
@@ -369,6 +398,7 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
 
     let mut syms = Symbols { syms: Vec::new(), arrays: BTreeMap::new(), allocated: 0, preloaded: BTreeMap::new() };
     let mut reg_inits: Vec<(usize, u8, u64)> = Vec::new();
+    let mut setup: Vec<String> = Vec::new();
     let mut init_mem = pre.mem.clone();
     let mut loc_types = BTreeMap::new();
     for (i, p) in pre.symbols.iter().enumerate() {
@@ -381,6 +411,11 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
     for stmt in init_text.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
+            continue;
+        }
+        // "f()": a setup function of the preloaded ELF file.
+        if let Some(f) = stmt.strip_suffix("()").filter(|f| is_ident(f)) {
+            setup.push(f.to_string());
             continue;
         }
         let (lhs, rhs) = match stmt.split_once('=') {
@@ -523,19 +558,7 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
             Some(f) if !c.is_empty() => {
                 return Err(format!("P{} runs function '{}', so its code column must be empty", i, f));
             }
-            Some(f) => match pre.functions.get(f) {
-                None if pre.functions.is_empty() => {
-                    return Err(format!("P{}: function '{}' needs an ELF file (--elf)", i, f));
-                }
-                None => return Err(format!("P{}: no function '{}' in the ELF file", i, f)),
-                Some(&addr) => {
-                    let code = pre.code.as_ref().filter(|c| c.index(addr).is_some_and(|i| i < c.instrs.len()));
-                    let Some(code) = code else {
-                        return Err(format!("P{}: function '{}' at {:#x} is not in the loaded code", i, f, addr));
-                    };
-                    Program { code: code.clone(), entry: code.index(addr).unwrap() }
-                }
-            },
+            Some(f) => elf_function(pre, f).map_err(|e| format!("P{}: {}", i, e))?,
         });
     }
     let mut init_regs = vec![[0u64; 31]; n];
@@ -586,7 +609,32 @@ pub fn parse_with(src: &str, pre: &Preload) -> Result<Test> {
             }
         }
     }
+    let setups = setup
+        .iter()
+        .map(|f| elf_function(pre, f).map(|p| (f.as_str(), p)).map_err(|e| format!("setup: {}", e)))
+        .collect::<Result<Vec<_>>>()?;
+    for (f, p) in setups {
+        let alone = Test {
+            name: f.to_string(),
+            init_regs: vec![init_regs_for(&p)],
+            threads: vec![p],
+            code: vec![Vec::new()],
+            functions: vec![Some(f.to_string())],
+            init_mem: init_mem.clone(),
+            loc_types: BTreeMap::new(),
+            symbols: Vec::new(),
+            arrays: BTreeMap::new(),
+            locations: Vec::new(),
+            condition: None,
+            setup: Vec::new(),
+        };
+        let written = crate::interleave::run_alone(&alone, SETUP_FUEL).map_err(|e| format!("setup function '{}' {}", f, e))?;
+        for (a, v) in written {
+            init_mem.set_byte(a, v);
+        }
+    }
     Ok(Test {
+        setup,
         name,
         threads,
         code,

@@ -1,0 +1,5 @@
+Freestanding stand-ins for the C++ and C library headers that
+readerwriterqueue.h and atomicops.h include: only what they use. <atomic>
+is built on clang's __atomic builtins, as libstdc++'s is. The C library
+functions are declared but not defined, as the tests never call them,
+except malloc, which c/rwq.h defines.

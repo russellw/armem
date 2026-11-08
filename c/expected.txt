@@ -1,7 +1,8 @@
 # Expected verdicts for the C programs, checked by tests/c_programs.rs.
-# Each program NAME has NAME.c and the litmus test NAME.litmus, whose
-# condition is the bug. Columns: program, optimization level, condition
-# reachable on ARM, under TSO, then any further clang flags.
+# Each program NAME has NAME.c (or NAME.cpp) and the litmus test
+# NAME.litmus, whose condition is the bug. Columns: program, optimization
+# level, condition reachable on ARM, under TSO (or "fault": some execution
+# faults), then any further clang flags.
 # W_FENCE etc. name an ordering; -DX=__ATOMIC_RELAXED removes it.
 # sample=N explores the ARM model on N random paths (for a "yes" only),
 # and fuel=N gives each thread N instructions (default 1000).
@@ -359,3 +360,19 @@ liburing_cq -O2 yes no -DNO_KERNEL_RELEASE
 liburing_cq -O0 no no
 liburing_cq -O0 no no -DACQ_HEAD
 liburing_cq -O0 yes no -DNO_KERNEL_RELEASE
+
+# moodycamel's ReaderWriterQueue<int>, built and given one element by the
+# setup function; t0 enqueues a second, which allocates a second block.
+# OLD is the code before 0a5aee4 (issue #171): size_approx can follow the
+# new block's next pointer before it is written, and faults on the null
+# pointer. MID is the code after 0a5aee4 and before ba8c662: try_dequeue
+# can see the new tail block and follow the old block's stale next
+# pointer back to it, dequeuing an element that was never enqueued. The
+# two commits were merged together in PR #172. (rwq_size -O1 gives the same
+# verdicts, in up to 133 s; rwq_dequeue's search without sampling did not
+# finish in 15 minutes, so its "no" verdicts are not checked.)
+rwq_size -O2 no no
+rwq_size -O2 no no -DMID
+rwq_size -O2 fault no -DOLD
+rwq_dequeue -O2 yes no -DMID sample=10
+rwq_dequeue -O1 yes no -DMID sample=10

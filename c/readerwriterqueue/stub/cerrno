@@ -1,0 +1,8 @@
+// Stand-in for <cerrno>: what atomicops.h's semaphore uses.
+#ifndef STUB_CERRNO
+#define STUB_CERRNO
+extern "C" int errno;
+#define EINTR 4
+#define EAGAIN 11
+#define ETIMEDOUT 110
+#endif

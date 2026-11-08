@@ -954,6 +954,9 @@ impl<'a> Havoc<'a> {
             }
             MemOp::VLoad { addr, vt, vt2, size } => {
                 let n = size.bytes();
+                if vt2.is_some() {
+                    self.reads.insert((addr.val, 2 * n));
+                }
                 let mut cores = vec![core];
                 for (i, v) in std::iter::once(vt).chain(vt2).enumerate() {
                     let vals = self.read(&own, RV { val: addr.val + i as u64 * n, ..addr }, n, false);
@@ -981,12 +984,18 @@ impl<'a> Havoc<'a> {
             }
             MemOp::StorePair { addr, data, data2, size } => {
                 let n = size.bytes();
+                // Two writes, but one access for finding private memory
+                // (see `Reduction::private`), as for `LoadPair`.
+                self.write_fps.insert((addr.val, 2 * n));
                 self.write(&mut own, addr, n, size.mask(data.val) as u128, taint(data));
                 self.write(&mut own, RV { val: addr.val + n, ..addr }, n, size.mask(data2.val) as u128, taint(data2));
                 push(core, mon, own);
             }
             MemOp::VStore { addr, data, data2, size } => {
                 let n = size.bytes();
+                if data2.is_some() {
+                    self.write_fps.insert((addr.val, 2 * n));
+                }
                 for (i, d) in std::iter::once(data).chain(data2).enumerate() {
                     self.write(&mut own, RV { val: addr.val + i as u64 * n, ..addr }, n, low_bytes(d.val, n), d.view.max(d.pick));
                 }

@@ -1,0 +1,5 @@
+AArch64 rwq_size
+"size_approx must not exceed the number of elements enqueued"
+{ setup(); int bad; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

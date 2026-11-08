@@ -1,0 +1,8 @@
+// Stand-in for <ctime>: what atomicops.h's semaphore uses.
+#ifndef STUB_CTIME
+#define STUB_CTIME
+typedef long time_t;
+struct timespec { time_t tv_sec; long tv_nsec; };
+#define CLOCK_REALTIME 0
+extern "C" int clock_gettime(int clock, struct timespec* ts);
+#endif

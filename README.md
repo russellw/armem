@@ -265,7 +265,16 @@ as a signed integer of that size. In the init block, `x=5` overrides the
 file's value, and a declaration without a value (`uint8_t x`) only
 changes the type. Other names get fresh locations, which must not
 overlap the file's memory. In the library this is `Image::preload` and
-`litmus::parse_with`. Memory permissions are not enforced: a store to
+`litmus::parse_with`.
+
+A *setup function* (`{ setup(); }` in the init block, an armem
+extension) is a function of the file that runs before the test, alone
+and under sequential consistency, after the init block's values are
+set; setup functions run in the order written. Its writes become part
+of the initial memory, so a test can start from a data structure built
+by the program's own code (a C++ constructor, say) without its writes
+multiplying the memories the threads explore. A setup function that
+faults, or does not return within 100,000 instructions, is an error. Memory permissions are not enforced: a store to
 read-only data or code succeeds.
 
 A thread can run a function of the file: write `P0 = name` in the
@@ -527,6 +536,9 @@ tests too big for that, a line of `expected.txt` may give `sample=N`
 reachable, since sampling may miss states. A line may also give
 `fuel=N`, for a program whose threads need more than the default 1,000
 instructions each.
+A program may be C++ (`NAME.cpp`), and a verdict may be `fault` rather
+than `yes` or `no`: some execution faults, for example on a null pointer
+(see [Stacks](#stacks)).
 
 ### Concurrency Kit
 
@@ -1056,6 +1068,58 @@ stores. With `-DNO_KERNEL_RELEASE`, a `WRITE_ONCE` of the tail rather
 than `smp_store_release`, `t0` may read the slot before the kernel's
 writes to it. That is ARM-only (0.7 s, 1.5 s at `-O0`).
 
+### readerwriterqueue
+
+`c/readerwriterqueue` holds `readerwriterqueue.h` and `atomicops.h` from
+moodycamel's ReaderWriterQueue, unchanged from commit `6867b564`
+(September 2026; Simplified BSD, see `c/readerwriterqueue/LICENSE.md`).
+It is C++, and `c/readerwriterqueue/stub` holds freestanding stand-ins
+for the standard headers it includes (`<atomic>` is built on clang's
+`__atomic` builtins), compiled with `-nostdlibinc`. `c/rwq.h` gives the
+queue a bump allocator over zeroed memory, and its setup function (see
+[Starting from an ELF file's memory](#starting-from-an-elf-files-memory))
+constructs a `ReaderWriterQueue<int>` with one block, room for one element, and
+enqueues 1. In both tests `t0` enqueues 2, which allocates a second
+block, initializes it, links it after the first (`tailBlock->next`) and
+makes it the tail block (`tailBlock`).
+
+Pull request #172 (merged September 2026) has two commits. The first,
+`0a5aee4`, fixes issue #171: the release fence sat between the two
+stores, so `size_approx`, which walks the `next` chain, could reach the
+new block before its fields. It moved the fence before both stores. That
+left nothing between them, and the second commit, `ba8c662`, adds a
+second fence there, replacing the comment that said none was needed.
+`-DOLD` undoes both commits (`c/readerwriterqueue/old`), and `-DMID`
+only the second (`c/readerwriterqueue/mid`):
+
+| Variant | `rwq_size` | `rwq_dequeue` | TSO |
+|---|---|---|---|
+| current | no | not found | no |
+| after `0a5aee4` only | no | **yes** | no |
+| before `0a5aee4` | **fault** | not found | no |
+
+`rwq_size.cpp` calls `size_approx` in `t1`. With the old code, on ARM, it
+can read the new block's `next` before `t0` writes it, as the zero the
+allocator's memory holds, and dereferences it: armem reports the null
+pointer dereference. The current and intermediate versions are right.
+Each run takes 12 s at `-O2` and `-O1`, except the old code's, which
+takes 120 s.
+
+`rwq_dequeue.cpp` calls `try_dequeue` twice in `t1`, and the condition is
+that it gets a value other than the next one enqueued. With only the
+first commit, `t1` can see the new `tailBlock` while the first block's
+`next` still points to itself; it then "advances" to the first block
+again, which it has emptied, and dequeues a stale slot. Ten sampled paths
+find it at `-O2` and `-O1`. The bug was ARM-only, and was never in a
+release, since the PR was merged with both commits. An exhaustive search
+of this test does not finish in 15 minutes, with or without
+`--dynamic-por`, so the "not found" entries come from 5,000 sampled
+paths each. clang compiles `atomic_thread_fence(memory_order_release)` to
+`DMB ISH`, a full barrier, so the reduction treats every read as
+ordered before every later access, and the new block's initializing
+stores, which the consumer can reach only through the pointers stored
+after the fence, come in every order.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1120,7 +1184,9 @@ An execution *faults* when a thread:
   guard slot, or another thread's stack, for example through a pointer
   it was given), or
 * accesses its stack with an exclusive, atomic, acquire or release
-  instruction.
+  instruction, or
+* accesses memory below `0x1000` (`core::NULL_PAGE`), as a null pointer
+  dereference does. No location is placed there.
 
 A faulting execution has no final state. The report lists each fault,
 with the thread (`FAULT: P1: 8-byte access at 0x7f00001ffff8 is outside
@@ -1566,7 +1632,9 @@ lets a lone `LDXP` be torn.
    June 2026 fix does not prevent on ARM (see [libuv](#libuv)), and in
    liburing the lost SQPOLL wakeup liburing fixed in March 2022, and that
    its June 2026 change to the CQ head load is safe (see
-   [liburing](#liburing)). In the Chase–Lev
+   [liburing](#liburing)), and in moodycamel's ReaderWriterQueue both
+   ARM-only bugs that its pull request #172 fixed, one of them added by
+   the PR's own first commit (see [readerwriterqueue](#readerwriterqueue)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

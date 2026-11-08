@@ -1,0 +1,1 @@
+// Stand-in for <stdexcept> (readerwriterqueue.h uses nothing from it).

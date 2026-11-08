@@ -1,0 +1,19 @@
+// Stand-in for <memory>: a unique_ptr for BlockingReaderWriterQueue,
+// which the tests do not use.
+#ifndef STUB_MEMORY
+#define STUB_MEMORY
+#include <utility>
+namespace std {
+template<typename T> class unique_ptr {
+	T* p;
+public:
+	explicit unique_ptr(T* q = nullptr) noexcept : p(q) {}
+	unique_ptr(unique_ptr&& o) noexcept : p(o.p) { o.p = nullptr; }
+	unique_ptr& operator=(unique_ptr&& o) noexcept { swap(p, o.p); return *this; }
+	~unique_ptr() { delete p; }
+	T* get() const noexcept { return p; }
+	T* operator->() const noexcept { return p; }
+	T& operator*() const noexcept { return *p; }
+};
+}
+#endif

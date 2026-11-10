@@ -1,0 +1,13 @@
+// Stand-in for <algorithm>: what Boost.Lockfree uses.
+#ifndef STUB_ALGORITHM
+#define STUB_ALGORITHM
+#include <iterator>
+namespace std {
+template<typename T> constexpr const T& min(const T& a, const T& b) { return b < a ? b : a; }
+template<typename I, typename O> O copy(I first, I last, O out) {
+	for (; first != last; ++first, ++out)
+		*out = *first;
+	return out;
+}
+}
+#endif

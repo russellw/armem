@@ -1,0 +1,5 @@
+AArch64 boost_spsc_queue
+"The consumer pops the values the producer pushed, in order"
+{ setup(); int bad; int got; int pushed; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

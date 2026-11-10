@@ -394,3 +394,40 @@ rwq_dequeue -O1 no no -DOLD
 rwq_dequeue -O0 no no fuel=3000
 rwq_dequeue -O0 yes no -DMID fuel=3000
 rwq_dequeue -O0 no no -DOLD fuel=3000
+
+# Boost.Lockfree's spsc_value<int>, a triple buffer: t0 writes 1 to 4, and
+# t1 reads twice. OLD is the code before fa6cbdf (August 2026): the
+# reader's exchange is acquire only, so its load of the buffer it hands
+# back can come after the exchange's store, and the writer can re-use the
+# buffer before the load. The old code takes 281 s to search exhaustively
+# at -O2. At -O0 the search does not finish in 30 minutes; there clang
+# performs every exchange of the one-byte index as LDAXRB/STLXRB, so the
+# old code behaves as the current code does.
+boost_spsc_value -O2 no no
+boost_spsc_value -O2 yes no -DOLD sample=100
+boost_spsc_value -O1 no no
+boost_spsc_value -O1 yes no -DOLD sample=100
+boost_spsc_value -Os no no
+boost_spsc_value -Os yes no -DOLD sample=100
+boost_spsc_value -O2 no no -march=armv8.1-a
+boost_spsc_value -O2 yes no -DOLD -march=armv8.1-a sample=100
+
+# Boost.Lockfree's spsc_queue<int, capacity<CAP>>: single-element push and
+# pop (CAP 1 by default, so two slots and the index wraps with a mask; with
+# CAP 2, three slots, and it wraps by a subtraction loop), and range push
+# and pop (two elements, three slots).
+boost_spsc_queue -O2 no no
+boost_spsc_queue -O2 no no -DCAP=2
+boost_spsc_queue -O2 no no -DCAP=3
+boost_spsc_queue -O2 no no -march=armv8.3-a
+boost_spsc_queue -O1 no no
+boost_spsc_queue -O1 no no -DCAP=2
+boost_spsc_queue -Os no no
+boost_spsc_queue -Os no no -DCAP=2
+boost_spsc_queue -O0 no no fuel=3000
+boost_spsc_queue -O0 no no -DCAP=2 fuel=3000
+boost_spsc_range -O2 no no
+boost_spsc_range -O2 no no -march=armv8.3-a
+boost_spsc_range -O1 no no
+boost_spsc_range -Os no no
+boost_spsc_range -O0 no no fuel=3000

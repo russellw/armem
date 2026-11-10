@@ -1,0 +1,38 @@
+// Stand-in for <atomic>: what Boost.Lockfree uses, on clang's __atomic
+// builtins. As in libstdc++, the generic builtins handle any trivially
+// copyable T (spsc_value's tagged_index is a one-byte struct).
+#ifndef STUB_ATOMIC
+#define STUB_ATOMIC
+namespace std {
+enum memory_order {
+	memory_order_relaxed = __ATOMIC_RELAXED,
+	memory_order_consume = __ATOMIC_CONSUME,
+	memory_order_acquire = __ATOMIC_ACQUIRE,
+	memory_order_release = __ATOMIC_RELEASE,
+	memory_order_acq_rel = __ATOMIC_ACQ_REL,
+	memory_order_seq_cst = __ATOMIC_SEQ_CST,
+};
+template<typename T> struct atomic {
+	alignas(sizeof(T)) T v;
+	atomic() noexcept = default;
+	constexpr atomic(T x) noexcept : v(x) {}
+	atomic(const atomic&) = delete;
+	atomic& operator=(const atomic&) = delete;
+	T load(memory_order m = memory_order_seq_cst) const noexcept {
+		alignas(T) unsigned char r[sizeof(T)];
+		__atomic_load(&v, reinterpret_cast<T*>(r), m);
+		return *reinterpret_cast<T*>(r);
+	}
+	bool is_lock_free() const noexcept { return __atomic_is_lock_free(sizeof(T), &v); }
+	void store(T x, memory_order m = memory_order_seq_cst) noexcept { __atomic_store(&v, &x, m); }
+	T exchange(T x, memory_order m = memory_order_seq_cst) noexcept {
+		alignas(T) unsigned char r[sizeof(T)];
+		__atomic_exchange(&v, &x, reinterpret_cast<T*>(r), m);
+		return *reinterpret_cast<T*>(r);
+	}
+	bool compare_exchange_strong(T& e, T x, memory_order m = memory_order_seq_cst) noexcept {
+		return __atomic_compare_exchange(&v, &e, &x, false, m, m == memory_order_acq_rel ? memory_order_acquire : m == memory_order_release ? memory_order_relaxed : m);
+	}
+};
+}
+#endif

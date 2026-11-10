@@ -1,0 +1,13 @@
+// Stand-in for <memory>: uninitialized_copy.
+#ifndef STUB_MEMORY
+#define STUB_MEMORY
+#include <iterator>
+#include <new>
+namespace std {
+template<typename I, typename T> T* uninitialized_copy(I first, I last, T* out) {
+	for (; first != last; ++first, ++out)
+		::new (static_cast<void*>(out)) T(*first);
+	return out;
+}
+}
+#endif

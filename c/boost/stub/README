@@ -1,0 +1,6 @@
+Freestanding stand-ins for the C++ standard headers and the Boost headers
+outside Boost.Lockfree that spsc_queue.hpp and spsc_value.hpp include:
+only what they use. <atomic> is built on clang's __atomic builtins, as
+libstdc++'s is. boost/config.hpp configures C++17 without <optional>
+(which the tests do not use), and boost/predef.h configures clang on
+aarch64 Linux.

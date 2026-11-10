@@ -1,0 +1,5 @@
+AArch64 boost_spsc_value
+"The values the reader of an spsc_value reads only increase"
+{ setup(); int bad; int first; int second; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

@@ -1,0 +1,15 @@
+// Stand-in for <array>.
+#ifndef STUB_ARRAY
+#define STUB_ARRAY
+#include <cstddef>
+#include <utility>
+namespace std {
+template<typename T, size_t N> struct array {
+	T elems[N];
+	T* data() noexcept { return elems; }
+	const T* data() const noexcept { return elems; }
+	T& operator[](size_t i) noexcept { return elems[i]; }
+	const T& operator[](size_t i) const noexcept { return elems[i]; }
+};
+}
+#endif

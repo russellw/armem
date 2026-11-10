@@ -1129,6 +1129,80 @@ stores, which the consumer reaches only through the pointers stored
 after the fence, to be observable in every order, and the search did not
 finish in 15 minutes.
 
+### Boost.Lockfree
+
+`c/boost/include` holds Boost.Lockfree's `spsc_queue.hpp` and
+`spsc_value.hpp`, and the headers of Boost.Lockfree's own that they
+include, unchanged from Boost.Lockfree commit `d0172a2` (October 2026;
+Boost Software License, see `c/boost/LICENSE`). `c/boost/stub` holds
+freestanding stand-ins for the standard headers and the rest of Boost
+that they include (`<atomic>` on clang's `__atomic` builtins, and a
+Boost.Parameter that finds an option by its tag), and `c/boost_lockfree.h`
+says what each test shares. Each test constructs its object in its setup
+function.
+
+`spsc_value` is a triple buffer. The writer writes into a buffer of its
+own and exchanges that buffer's index with the shared one, tagged as new.
+The reader, if the tag is set, exchanges its own index for it and reads
+the buffer it gets, and the buffer it gave up becomes the writer's at the
+writer's next exchange. In `boost_spsc_value.cpp`, `t0` writes 1 to 4 and
+`t1` reads twice. The condition is a second read that returns less than
+the first.
+
+Commit `fa6cbdf` (August 2026, "spsc_value: strengthen memory barriers")
+made both exchanges `acq_rel`, from `release` in the writer and `acquire`
+in the reader. `-DOLD` uses the file from before it
+(`c/boost/old/boost/lockfree/spsc_value.hpp`), and then the condition is
+reachable on ARM only. The reader's exchange is `LDAXRB`/`STXRB` (or
+`SWPAB`), and nothing orders the first read's load of its buffer before
+the store of the second read's exchange, which gives that buffer back.
+The writer gets it at its third exchange, and its fourth write stores 4
+in it, which the first read then returns; the second returned 2. x86's
+exchange is a full barrier. In C++ the writer's half of the fix is needed
+too, since without it nothing makes the reader's load happen before the
+writer's store, but on ARM that store has an address dependency on the
+writer's exchange. With only the reader's exchange made `acquire` again
+(a copy of the header, not in `c/`), the condition is reachable on ARM;
+with only the writer's made `release`, the exhaustive search shows it
+unreachable (751,807 memories in 11 minutes at `-O2`).
+
+The current code is right at `-O1`, `-O2` and `-Os`, and with LSE. That
+takes 5.7 s at `-O2`, 14 s at `-O1` and `-Os`, and 65 s with LSE. The old
+code's bug takes 281 s to find exhaustively at `-O2`, and 2 to 4 s with
+100 sampled paths. At `-O0` the search does not finish in 30 minutes, but
+there the old code behaves as the current code does. `tagged_index` is a
+one-byte struct, so `<atomic>` (here, as in libstdc++) exchanges it with
+the generic `__atomic_exchange`, and at `-O0` that is a call to
+`atomic::exchange` with the memory order as an argument, which clang
+compiles to a switch on the order whose cases are all the same
+compare-and-swap loop of `LDAXRB` and `STLXRB`.
+
+`spsc_queue` is a ring buffer. The producer stores an element, then
+releases the write index; the consumer acquires the write index, reads
+the element, then releases the read index; and each acquires the other's
+index to see how much room there is. In `boost_spsc_queue.cpp`, `t0`
+tries three times to push the next of 1, 2, 3, and `t1` tries to pop
+three times. The queue holds one element, so it has two slots, its
+indices wrap with a mask, and the third push re-uses the first slot.
+`-DCAP=2` gives it three slots, and the indices wrap by the subtraction
+loop that `d0172a2` keeps from being turned into a division; `-DCAP=3`,
+four. `boost_spsc_range.cpp` pushes and pops ranges, which wrap around
+the end of the buffer, and the producer's second push re-uses a slot.
+Both are right at `-O0` (with 3,000 instructions of fuel) to `-O2` and
+`-Os`, and with `LDAPR`, each in under 0.5 s.
+
+To check that the tests would notice, each acquire and release in
+`spsc_queue.hpp`'s single-element and range functions was made relaxed in
+a copy of it, one at a time. The producer's release of the write index,
+the consumer's acquire of it and the consumer's release of the read index
+are each needed, in both kinds of function: without one, the condition is
+reachable on ARM only. The producer's acquire of the read index is not
+needed on ARM, since its stores to the slot are control-dependent on that
+load (as with `spsc -DROOM`). The consumer checks the values only after
+its last pop. A first version branched on each value as it popped it, and
+that branch ordered its read of the slot before its later store of the
+read index, so the test could not tell when the release was missing.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1727,7 +1801,10 @@ lets a lone `LDXP` be torn.
    its June 2026 change to the CQ head load is safe (see
    [liburing](#liburing)), and in moodycamel's ReaderWriterQueue both
    ARM-only bugs that its pull request #172 fixed, one of them added by
-   the PR's own first commit (see [readerwriterqueue](#readerwriterqueue)). In the Chase–Lev
+   the PR's own first commit (see [readerwriterqueue](#readerwriterqueue)),
+   and in Boost.Lockfree's `spsc_value` the ARM-only bug that its commit
+   `fa6cbdf` fixed in August 2026, and that its `spsc_queue` is right (see
+   [Boost.Lockfree](#boostlockfree)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

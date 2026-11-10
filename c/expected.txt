@@ -368,11 +368,26 @@ liburing_cq -O0 yes no -DNO_KERNEL_RELEASE
 # pointer. MID is the code after 0a5aee4 and before ba8c662: try_dequeue
 # can see the new tail block and follow the old block's stale next
 # pointer back to it, dequeuing an element that was never enqueued. The
-# two commits were merged together in PR #172. (rwq_size -O1 gives the same
-# verdicts, in up to 133 s; rwq_dequeue's search without sampling did not
-# finish in 15 minutes, so its "no" verdicts are not checked.)
+# two commits were merged together in PR #172. (At -Os, rwq_size -DOLD
+# gives the same verdict in 330 s, and rwq_dequeue the same verdicts for
+# the current and MID code in over 200 s each.)
 rwq_size -O2 no no
 rwq_size -O2 no no -DMID
 rwq_size -O2 fault no -DOLD
-rwq_dequeue -O2 yes no -DMID sample=10
-rwq_dequeue -O1 yes no -DMID sample=10
+rwq_size -O1 no no
+rwq_size -O1 no no -DMID
+rwq_size -O1 fault no -DOLD
+rwq_size -Os no no
+rwq_size -Os no no -DMID
+rwq_size -O0 no no
+rwq_size -O0 no no -DMID
+rwq_size -O0 fault no -DOLD
+rwq_dequeue -O2 no no
+rwq_dequeue -O2 yes no -DMID
+rwq_dequeue -O2 no no -DOLD
+rwq_dequeue -O1 no no
+rwq_dequeue -O1 yes no -DMID
+rwq_dequeue -O1 no no -DOLD
+rwq_dequeue -O0 no no fuel=3000
+rwq_dequeue -O0 yes no -DMID fuel=3000
+rwq_dequeue -O0 no no -DOLD fuel=3000

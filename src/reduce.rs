@@ -40,6 +40,14 @@
 //!   a later read (by a full barrier, `x` being a release or atomic write
 //!   followed by an acquire, ...) and read the location of `y`.
 //!
+//! Two refinements use where accesses lie in program order. If B = A,
+//! local order follows program order, so `x` must come before `y` with an
+//! ordering point between them (`Reduction::orders_writes`, from the
+//! epochs of `Epoch`). And a from-read edge into `y` needs a read of `y`'s
+//! location that returns a write coherence-before `y`, which a thread
+//! cannot make if it reaches that location only through a pointer that
+//! A publishes after `y` (see `Publication`).
+//!
 //! What threads may read, and how they may order accesses, is
 //! over-approximated before exploring. [`analyze`] runs each thread alone,
 //! letting every load return any value that some write (or initial memory)
@@ -133,10 +141,39 @@ pub struct Reduction {
     acquire: Vec<bool>,
     /// The thread has DMB ST.
     dmb_st: Vec<bool>,
+    /// For each thread, the epochs (`Epoch::may`) of its writes to each
+    /// footprint, or None if they were too costly to find.
+    write_epochs: Vec<Option<BTreeMap<(u64, u64), BTreeSet<u8>>>>,
+    /// For each thread, the writes it publishes (see `Publication`).
+    publications: Vec<Vec<Publication>>,
     /// What memory may hold, for `future_values`.
     vals: Known,
     /// The threads that may write each byte.
     writers: HashMap<u64, BTreeSet<usize>>,
+}
+
+/// Writes of thread A that other threads reach only through a pointer
+/// that A publishes after them. A reads-from edge from A's write `p` of
+/// the value `v` to location `P`, which A writes after a barrier that
+/// follows each write `y` in `protected` (or which is a release), orders
+/// `y` before `p`. If a read `q` by thread C returns `v` from `P`, the
+/// value no other write gives it, then a read `r` that C orders after `q`
+/// (by a dependency, by `q` being an acquire, or by a `DMB LD` or full
+/// barrier between them) cannot read `y`'s location from a write
+/// coherence-before `y`: `r fr y ob p rf q ob r` would be a cycle. So if
+/// every read by C of `y`'s footprint is ordered after such a `q`, C cannot
+/// give `y` a from-read edge. (Only orderings that certainly hold count
+/// here: unlike `dep_rr`, this must not over-approximate them.)
+#[derive(Debug, Clone)]
+struct Publication {
+    /// The footprints of A's writes that every publication orders before
+    /// itself, and of its other writes. (A message may be part of a write,
+    /// as each half of a 16-byte store is.)
+    protected: Footprints,
+    unprotected: Footprints,
+    /// For each thread C, the footprints of its reads that are not ordered
+    /// after a read of a published value (None if not found).
+    unordered: Vec<Option<Footprints>>,
 }
 
 /// The values a later write by another thread may give a read (see
@@ -162,6 +199,35 @@ pub struct Observed {
 }
 
 impl Reduction {
+    /// Do the reads of thread `c` of `y`'s footprint all read `y` or a
+    /// later write? (See `Publication`.)
+    fn fresh(&self, c: usize, y: &Msg) -> bool {
+        self.publications.get(y.tid).is_some_and(|ps| {
+            ps.iter().any(|p| {
+                hits(&p.protected, y) && !hits(&p.unprotected, y) && p.unordered[c].as_ref().is_some_and(|u| !hits(u, y))
+            })
+        })
+    }
+
+    /// May thread `a` order its write `x` before its later write `y` (in
+    /// program order)? Only with an ordering point between them: a full or
+    /// store barrier, an acquire read (after a release `x`), or `y` being a
+    /// release. Any path from `x` to `y` that leaves the thread must
+    /// return to it by a from-read edge into `y`, which `prunable` considers
+    /// separately; within the thread, local order follows program order.
+    fn orders_writes(&self, a: usize, x: &Msg, y: &Msg) -> bool {
+        let old = self.write_read(a, x) || self.dmb_st[a] || hits(&self.release_writes[a], y);
+        let Some(Some(ep)) = self.write_epochs.get(a) else { return old };
+        let epochs = |m: &Msg| {
+            ep.iter().filter(|(f, _)| f.0 < m.addr + m.size.bytes() && m.addr < f.0 + f.1).flat_map(|(_, e)| e.iter().copied()).collect::<BTreeSet<u8>>()
+        };
+        let (ex, ey) = (epochs(x), epochs(y));
+        if ex.is_empty() || ey.is_empty() {
+            return old;
+        }
+        old && ex.iter().any(|&i| ey.iter().any(|&j| i < j || i == SATURATED && j == SATURATED))
+    }
+
     /// May thread `a` order its write `x` before a later read?
     fn write_read(&self, a: usize, x: &Msg) -> bool {
         self.full[a] || self.acquire[a] && (hits(&self.release_writes[a], x) || hits(&self.atomic_writes[a], x))
@@ -179,6 +245,7 @@ impl Reduction {
                 && hits(&self.reads[c], x)
                 && (c == b
                     || hits(&self.reads[c], y)
+                        && !self.fresh(c, y)
                         && (self.orders_rr[c]
                             || hits(&self.acquire_reads[c], x)
                             || self.dep_rr[c].iter().any(|(s, a)| hits(s, x) && hits(a, y))
@@ -188,9 +255,9 @@ impl Reduction {
                             })))
         });
         let internal = if a == b {
-            self.write_read(a, x) || self.dmb_st[a] || hits(&self.release_writes[a], y)
+            self.orders_writes(a, x, y)
         } else {
-            self.write_read(a, x) && hits(&self.reads[a], y)
+            self.write_read(a, x) && hits(&self.reads[a], y) && !self.fresh(a, y)
         };
         !via_reader && !internal
     }
@@ -382,10 +449,48 @@ fn orderings(code: &Code) -> (bool, bool, bool, bool) {
 }
 
 /// One thread's run in the analysis: a core, its exclusive monitor, its
-/// own latest writes to the bytes that only it writes, and (when finding
+/// own latest writes to the bytes that only it writes, (when finding
 /// dependencies, see `Dep`) whether it has passed an acquire read ordered
-/// after the source.
-type HState = (Core, Option<(u64, Size)>, Own, bool);
+/// after the source, its epoch (when finding ordering points), and (when
+/// finding the readers of publications) whether it has read a published
+/// value.
+type HState = (Core, Option<(u64, Size)>, Own, bool, Epoch, bool);
+
+/// Where a run is between the thread's ordering points (when finding
+/// them, see `Events`; otherwise always the default). Each count stops at
+/// `SATURATED`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Epoch {
+    /// Points that may order an earlier write before a later one: full
+    /// and store barriers, and acquire and release accesses.
+    may: u8,
+    /// Full and store barriers, which order every earlier write before
+    /// every later one.
+    barriers: u8,
+    /// Release writes since the last such barrier: a release write orders
+    /// every earlier write (in program order) before itself.
+    releases: u8,
+}
+
+/// The count at which an `Epoch` count stops: two writes at it may have
+/// any number of ordering points between them.
+const SATURATED: u8 = 7;
+
+fn bump(n: u8) -> u8 {
+    (n + 1).min(SATURATED)
+}
+
+/// A write found when finding ordering points: its footprint, its value
+/// (None: unknown), the epoch it was made in, and whether it is a release.
+type Event = ((u64, u64), Option<u128>, Epoch, bool);
+
+/// The writes of one thread with the epochs they were made in (see
+/// `Epoch`), from a run of the analysis that follows ordering points
+/// in program order.
+#[derive(Default)]
+struct Events {
+    events: BTreeSet<Event>,
+}
 
 /// A thread's latest write to each byte that no other thread writes (None:
 /// an unknown value), and (when finding dependencies) whether the write
@@ -401,8 +506,13 @@ type Own = BTreeMap<u64, (Option<u8>, bool)>;
 /// ordered. Only the source's reads, and reads ordered after them, give
 /// tainted values, so the taint follows these orders transitively.
 struct Dep {
-    /// The source instruction.
+    /// The source instruction (`usize::MAX` for none).
     source: usize,
+    /// Reads that are sources too: a read of exactly one of these
+    /// footprints that returns its value (see `Publication`).
+    published: BTreeSet<((u64, u64), u128)>,
+    /// Footprints of the reads that are not ordered after a source.
+    unordered: Footprints,
     /// Bytes that writes depending on the source may have written, as found
     /// by the previous run (a read of one may read such a write back).
     tainted: BTreeSet<u64>,
@@ -588,6 +698,12 @@ struct Havoc<'a> {
     pc: usize,
     after: bool,
     ordered: bool,
+    /// Set when finding ordering points (see `Epoch`).
+    events: Option<Events>,
+    /// The epoch of the memory instruction being performed, and whether it
+    /// is a release.
+    epoch: Epoch,
+    release: bool,
     /// Live registers at each instruction (see `crate::live`), with none
     /// live at the end, as the analysis ignores final registers.
     live: Option<&'a crate::live::Liveness>,
@@ -630,6 +746,9 @@ impl<'a> Havoc<'a> {
             pc: 0,
             after: false,
             ordered: false,
+            events: None,
+            epoch: Epoch::default(),
+            release: false,
             live,
         }
     }
@@ -643,6 +762,21 @@ impl<'a> Havoc<'a> {
     /// taint; or one stand-in value tainted `UNKNOWN`, if some byte may hold
     /// any value or there are too many combinations.
     fn read(&mut self, own: &Own, addr: RV, n: u64, acquire: bool) -> Vec<(u128, View)> {
+        let mut vals = self.read_values(own, addr, n, acquire);
+        if let Some(d) = &self.dep
+            && !d.published.is_empty()
+        {
+            for (v, t) in &mut vals {
+                if *t < LOADED && d.published.contains(&((addr.val, n), *v)) {
+                    *t = LOADED;
+                }
+            }
+        }
+        vals
+    }
+
+    /// `read`, without the taint of published values.
+    fn read_values(&mut self, own: &Own, addr: RV, n: u64, acquire: bool) -> Vec<(u128, View)> {
         let a = addr.val;
         self.reads.insert((a, n));
         if acquire {
@@ -715,11 +849,17 @@ impl<'a> Havoc<'a> {
         self.addr_dep |= taint(addr) != 0;
         let after = self.after;
         let Some(d) = &mut self.dep else { return LOADED };
-        let ordered = after
-            || taint(addr) >= LOADED
-            || (a..a + n).any(|b| d.tainted.contains(&b) || own.get(&b).is_some_and(|e| e.1));
+        // A byte in `tainted` may hold a write that depends on the source,
+        // or another one: that over-approximates the reads ordered after
+        // the source, as `dep_rr` needs, but publications need the reads
+        // that are certainly ordered after one (see `Publication`). A byte
+        // only this thread writes holds its own latest write.
+        let maybe = d.published.is_empty() && (a..a + n).any(|b| d.tainted.contains(&b));
+        let ordered = after || taint(addr) >= LOADED || maybe || (a..a + n).any(|b| own.get(&b).is_some_and(|e| e.1));
         if ordered {
             d.after.insert((a, n));
+        } else {
+            d.unordered.insert((a, n));
         }
         if self.pc == d.source {
             d.sources.insert((a, n));
@@ -762,6 +902,10 @@ impl<'a> Havoc<'a> {
             (t < UNKNOWN).then_some((v >> (8 * (i % h))) as u8)
         };
         self.write_fps.insert((a, n));
+        if let Some(e) = &mut self.events {
+            let whole = parts.iter().enumerate().fold(0u128, |w, (j, p)| w | p.0 << (8 * h * j as u64));
+            e.events.insert(((a, n), (data < UNKNOWN).then_some(whole), self.epoch, self.release));
+        }
         if taint(addr) != 0 || data != 0 {
             self.dep_writes.insert((a, n));
         }
@@ -812,7 +956,7 @@ impl<'a> Havoc<'a> {
     fn run(&mut self, start: Core) -> Option<()> {
         let mut visited: FxHashMap<HState, u32> = FxHashMap::default();
         let mut queue = StepQueue::new();
-        queue.push(start.steps, (start, None, Own::new(), false));
+        queue.push(start.steps, (start, None, Own::new(), false, Epoch::default(), false));
         while let Some(st) = queue.pop() {
             let mut key = st.clone();
             key.0.steps = 0;
@@ -840,7 +984,7 @@ impl<'a> Havoc<'a> {
     /// The states after the next memory operation, or the next branch on an
     /// unknown value. Other local steps have one successor, so they are
     /// taken at once rather than each being a state of the search.
-    fn successors(&mut self, (mut core, mon, mut own, after): HState) -> Option<Vec<HState>> {
+    fn successors(&mut self, (mut core, mon, mut own, after, epoch, seen): HState) -> Option<Vec<HState>> {
         let prog = self.prog;
         let reg = |v: u64, t: View| RV { val: v, view: t, pick: t };
         let status = |v: u64| RV::imm(v);
@@ -876,7 +1020,7 @@ impl<'a> Havoc<'a> {
                                     let nz = ((v & sign != 0) as u64) << 3 | ((v == 0) as u64) << 2;
                                     c.flags = reg(nz, LOADED);
                                 }
-                                (c, mon, own.clone(), after)
+                                (c, mon, own.clone(), after, epoch, seen)
                             })
                             .collect(),
                     );
@@ -891,24 +1035,54 @@ impl<'a> Havoc<'a> {
                     };
                     let mut alt = core.clone();
                     alt.pc = other;
-                    return Some(vec![(core, mon, own.clone(), after), (alt, mon, own, after)]);
+                    return Some(vec![(core, mon, own.clone(), after, epoch, seen), (alt, mon, own, after, epoch, seen)]);
                 }
-                Step::Local { .. } if core.steps >= self.fuel => return Some(vec![(core, mon, own, after)]),
+                Step::Local { .. } if core.steps >= self.fuel => return Some(vec![(core, mon, own, after, epoch, seen)]),
                 Step::Local { .. } => {}
                 Step::Mem(op) => break op,
             }
         };
-        let mut out = Vec::new();
-        let mut push = |mut c: Core, m: Option<(u64, Size)>, o: Own| {
-            c.retire(prog);
-            out.push((c, m, o, after));
-        };
-        (self.pc, self.after, self.ordered) = (core.pc, after, false);
         let acquire = match op {
             MemOp::Load { kind, .. } => kind != LoadKind::Plain,
             MemOp::LoadExclPair { acquire, .. } | MemOp::Rmw { acquire, .. } => acquire,
             _ => false,
         };
+        let release = match op {
+            MemOp::Store { release, .. }
+            | MemOp::StoreExcl { release, .. }
+            | MemOp::StoreExclPair { release, .. }
+            | MemOp::Rmw { release, .. } => release,
+            _ => false,
+        };
+        // The epoch of this access's writes, and of the run after it. (An
+        // acquire or release access counts as an ordering point both before
+        // and after itself, which may only order more: the write of an
+        // acquire-release atomic is ordered before later writes.)
+        let (mut now, mut next) = (epoch, epoch);
+        if self.events.is_some() {
+            let barrier = matches!(op, MemOp::Barrier(Barrier::Full | Barrier::St));
+            if barrier || acquire || release {
+                now.may = bump(now.may);
+            }
+            if barrier {
+                now.barriers = bump(now.barriers);
+                now.releases = 0;
+            }
+            next = now;
+            if acquire || release {
+                next.may = bump(now.may);
+            }
+            if release {
+                next.releases = bump(now.releases);
+            }
+        }
+        (self.epoch, self.release) = (now, release);
+        let mut out = Vec::new();
+        let mut push = |mut c: Core, m: Option<(u64, Size)>, o: Own| {
+            c.retire(prog);
+            out.push((c, m, o, after, next, seen));
+        };
+        (self.pc, self.after, self.ordered) = (core.pc, after, false);
         match op {
             MemOp::Load { addr, rt, size, signed, excl, kind } => {
                 for (v, t) in self.read(&own, addr, size.bytes(), kind != LoadKind::Plain) {
@@ -1069,6 +1243,27 @@ impl<'a> Havoc<'a> {
                 s.3 = true;
             }
         }
+        // A read of a published value (see `Publication`) is ordered before
+        // every later read if it is an acquire, or once the run passes a
+        // barrier that orders reads.
+        if let (Some(d), MemOp::Load { addr, rt, size, signed, .. }) = (&self.dep, op)
+            && !d.published.is_empty()
+            && rt.idx != crate::isa::ZR
+        {
+            for s in &mut out {
+                let got = s.0.get(rt).val;
+                let published = d.published.iter().any(|&(f, v)| f == (addr.val, size.bytes()) && size.extend(v as u64, signed) == got);
+                if published {
+                    s.5 = true;
+                    s.3 |= acquire;
+                }
+            }
+        }
+        if seen && matches!(op, MemOp::Barrier(Barrier::Full | Barrier::Ld)) {
+            for s in &mut out {
+                s.3 = true;
+            }
+        }
         Some(out)
     }
 }
@@ -1091,7 +1286,15 @@ fn dep_orders(
     'pcs: for &source in pcs {
         let mut tainted = BTreeSet::new();
         for _ in 0..MAX_ROUNDS {
-            let dep = Dep { source, tainted: tainted.clone(), new_tainted: BTreeSet::new(), sources: Footprints::new(), after: Footprints::new() };
+            let dep = Dep {
+                source,
+                published: BTreeSet::new(),
+                unordered: Footprints::new(),
+                tainted: tainted.clone(),
+                new_tainted: BTreeSet::new(),
+                sources: Footprints::new(),
+                after: Footprints::new(),
+            };
             let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep), live);
             h.run(h.start())?;
             if !h.missed.is_empty() {
@@ -1107,6 +1310,102 @@ fn dep_orders(
         return None;
     }
     Some(out)
+}
+
+/// The writes of thread `tid` with their epochs (see `Epoch`), or None if
+/// that is too costly to find.
+#[allow(clippy::too_many_arguments)]
+fn write_events(
+    test: &Test,
+    tid: usize,
+    fuel: u32,
+    vals: &Known,
+    writers: &HashMap<u64, BTreeSet<usize>>,
+    read_bytes: &HashSet<u64>,
+    live: Option<&crate::live::Liveness>,
+) -> Option<BTreeSet<Event>> {
+    let mut budget = MAX_STATES;
+    let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, None, live);
+    h.events = Some(Events::default());
+    h.run(h.start())?;
+    h.missed.is_empty().then(|| h.events.take().unwrap().events)
+}
+
+/// Is the write `y` ordered before the write `p` (by the same thread) in
+/// every run in which both are made? Epochs only grow along a run, so a
+/// lower count means earlier in program order.
+fn must_precede(y: &Event, p: &Event) -> bool {
+    let (ey, (ep, release)) = (y.2, (p.2, p.3));
+    ey.barriers < ep.barriers
+        || release && ey.barriers == ep.barriers && ep.barriers < SATURATED && ep.releases < SATURATED && ey.releases <= ep.releases
+}
+
+/// The publications of writer `a` (see `Publication`), without the
+/// readers' side: groups of (location, value) pairs, each with the
+/// footprints it protects.
+fn publications(test: &Test, a: usize, events: &BTreeSet<Event>, writers: &HashMap<u64, BTreeSet<usize>>) -> Vec<(BTreeSet<((u64, u64), u128)>, Footprints)> {
+    let overlap = |f: (u64, u64), g: (u64, u64)| f.0 < g.0 + g.1 && g.0 < f.0 + f.1;
+    let fps: BTreeSet<(u64, u64)> = events.iter().map(|e| e.0).collect();
+    // For each footprint it may protect, the (location, value) pairs that do.
+    let mut by: BTreeMap<(u64, u64), BTreeSet<((u64, u64), u128)>> = BTreeMap::new();
+    for &p in &fps {
+        let (pa, pn) = p;
+        let only_a = (pa..pa + pn).all(|b| writers.get(&b).is_some_and(|w| w.len() == 1 && w.contains(&a)));
+        let same_fp = events.iter().filter(|e| overlap(e.0, p)).all(|e| e.0 == p && e.1.is_some());
+        if !matches!(pn, 1 | 2 | 4 | 8) || pa % pn != 0 || !only_a || !same_fp {
+            continue;
+        }
+        let init = (pa..pa + pn).rev().fold(0u128, |v, b| (v << 8) | test.init_byte(b) as u128);
+        let values: BTreeSet<u128> = events.iter().filter(|e| e.0 == p).filter_map(|e| e.1).filter(|&v| v != init).collect();
+        for v in values {
+            let ps: Vec<&Event> = events.iter().filter(|e| e.0 == p && e.1 == Some(v)).collect();
+            for &y in &fps {
+                if y != p && events.iter().filter(|e| e.0 == y).all(|e| ps.iter().all(|q| must_precede(e, q))) {
+                    by.entry(y).or_default().insert((p, v));
+                }
+            }
+        }
+    }
+    let mut groups: BTreeMap<BTreeSet<((u64, u64), u128)>, Footprints> = BTreeMap::new();
+    for (y, k) in by {
+        groups.entry(k).or_default().insert(y);
+    }
+    groups.into_iter().take(MAX_PUBLICATIONS).collect()
+}
+
+/// Most publication groups found for each writer.
+const MAX_PUBLICATIONS: usize = 8;
+
+/// The footprints of the reads of thread `tid` that are not ordered (by
+/// dependencies or an acquire, see `Dep`) after a read of one of the
+/// `published` (location, value) pairs, or None if that is too costly to
+/// find.
+#[allow(clippy::too_many_arguments)]
+fn unpublished_reads(
+    test: &Test,
+    tid: usize,
+    fuel: u32,
+    vals: &Known,
+    writers: &HashMap<u64, BTreeSet<usize>>,
+    read_bytes: &HashSet<u64>,
+    published: &BTreeSet<((u64, u64), u128)>,
+    live: Option<&crate::live::Liveness>,
+) -> Option<Footprints> {
+    // One run: the bytes that writes depending on a source may hold
+    // (`Dep::tainted`) are not used here.
+    let mut budget = MAX_STATES;
+    let dep = Dep {
+        source: usize::MAX,
+        published: published.clone(),
+        unordered: Footprints::new(),
+        tainted: BTreeSet::new(),
+        new_tainted: BTreeSet::new(),
+        sources: Footprints::new(),
+        after: Footprints::new(),
+    };
+    let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep), live);
+    h.run(h.start())?;
+    h.missed.is_empty().then(|| h.dep.take().unwrap().unordered)
 }
 
 /// Compute what the reduction needs for `test`, or None if the analysis
@@ -1243,6 +1542,30 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
                 red.full.push(full);
                 red.acquire.push(acquire);
                 red.dmb_st.push(st);
+            }
+            // Ordering points in program order, and publications.
+            for a in 0..n {
+                let events = write_events(test, a, fuel, &vals, &writers, &read_bytes[a], lives[a].as_ref());
+                red.write_epochs.push(events.as_ref().map(|es| {
+                    let mut m: BTreeMap<(u64, u64), BTreeSet<u8>> = BTreeMap::new();
+                    for e in es {
+                        m.entry(e.0).or_default().insert(e.2.may);
+                    }
+                    m
+                }));
+                let mut pubs = Vec::new();
+                let es_fps: Footprints = events.iter().flatten().map(|e| e.0).collect();
+                for (published, protected) in events.map(|es| publications(test, a, &es, &writers)).unwrap_or_default() {
+                    let unordered = (0..n)
+                        .map(|c| {
+                            let reads = c != a && protected.iter().any(|&f| red.reads[c].iter().any(|&(p, m)| p < f.0 + f.1 && f.0 < p + m));
+                            reads.then(|| unpublished_reads(test, c, fuel, &vals, &writers, &read_bytes[c], &published, lives[c].as_ref())).flatten()
+                        })
+                        .collect();
+                    let unprotected = es_fps.difference(&protected).copied().collect();
+                    pubs.push(Publication { protected, unprotected, unordered });
+                }
+                red.publications.push(pubs);
             }
             red.vals = vals;
             red.writers = writers;

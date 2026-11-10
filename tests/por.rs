@@ -294,6 +294,84 @@ fn reduction_prunes() {
     }
 }
 
+/// The ways `publication_test` publishes its data.
+#[derive(Clone, Copy, Debug)]
+enum Publish {
+    /// `DMB SY`, then a plain store of the pointer.
+    Fence,
+    /// A release store of the pointer.
+    Release,
+    /// As `Fence`, but the pointer is also stored before the data, so a
+    /// reader may see it early.
+    Early,
+    /// As `Fence`, but the last data location is written after the
+    /// pointer too.
+    Late,
+}
+
+/// A writer stores to `k` data locations, then publishes a pointer to the
+/// first, and a reader that sees the pointer reads every data location,
+/// with `DMB LD` between the reads, and with addresses that depend on the
+/// pointer (if `dep`) or after a `DMB LD`. The barriers let the reader
+/// order any read before any later one, so only the publication shows
+/// that the order of the writer's stores is not observable (see
+/// `Publication` in `src/reduce.rs`).
+fn publication_test(k: usize, how: Publish, dep: bool) -> String {
+    let mut init = vec!["0:X9=p".to_string(), "1:X9=p".to_string(), "uint64_t p".to_string()];
+    init.extend((0..k).flat_map(|i| [format!("0:X{0}=d{0}", i + 1), format!("1:X{0}=d{0}", i + 1)]));
+    let mut p0 = vec!["MOV W0,#1".to_string()];
+    if matches!(how, Publish::Early) {
+        p0.push("STR X1,[X9]".into());
+    }
+    p0.extend((0..k).map(|i| format!("STR W0,[X{}]", i + 1)));
+    match how {
+        Publish::Release => p0.push("STLR X1,[X9]".into()),
+        _ => {
+            p0.push("DMB SY".into());
+            p0.push("STR X1,[X9]".into());
+        }
+    }
+    if matches!(how, Publish::Late) {
+        p0.push("MOV W0,#2".into());
+        p0.push(format!("STR W0,[X{}]", k));
+    }
+    let mut p1 = vec!["LDR X10,[X9]".to_string(), "CBZ X10,end".to_string()];
+    p1.push(if dep { "EOR X8,X10,X10" } else { "MOV X8,#0" }.into());
+    for i in 0..k {
+        if i > 0 || !dep {
+            p1.push("DMB LD".into());
+        }
+        p1.push(format!("LDR W{},[X{},X8]", 11 + i, i + 1));
+    }
+    p1.push("end:".into());
+    let mut src = format!("AArch64 publication{}-{:?}-{}\n{{ {}; }}\n P0 | P1 ;\n", k, how, if dep { "dep" } else { "dmb" }, init.join("; "));
+    for i in 0..p0.len().max(p1.len()) {
+        src.push_str(&format!(" {} | {} ;\n", p0.get(i).map_or("", String::as_str), p1.get(i).map_or("", String::as_str)));
+    }
+    let regs: Vec<String> = (0..k).map(|i| format!("1:X{}", 11 + i)).collect();
+    src.push_str(&format!("locations [1:X10; {}]\n", regs.join("; ")));
+    src
+}
+
+/// Writes published through a pointer: the reduction must give the same
+/// final states, and where the reader cannot see the data before the
+/// pointer, explore one order of the data stores rather than all of them.
+#[test]
+fn publication() {
+    for dep in [true, false] {
+        for (how, at_most) in [(Publish::Fence, Some(20)), (Publish::Release, Some(20)), (Publish::Early, None), (Publish::Late, None)] {
+            let src = publication_test(4, how, dep);
+            let t = litmus::parse(&src).unwrap();
+            let (full, reduced) = check(&t, &src, false);
+            check(&t, &src, true);
+            eprintln!("{:?} dep={}: {} memories, {} with the reduction", how, dep, full, reduced);
+            if let Some(n) = at_most {
+                assert!(reduced <= n, "{} memories with the reduction:\n{}", reduced, src);
+            }
+        }
+    }
+}
+
 /// Sampling only finds final states the full exploration finds, and a few
 /// walks find the ARM-only outcome of message passing with six data
 /// locations.

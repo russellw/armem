@@ -1094,31 +1094,31 @@ only the second (`c/readerwriterqueue/mid`):
 
 | Variant | `rwq_size` | `rwq_dequeue` | TSO |
 |---|---|---|---|
-| current | no | not found | no |
+| current | no | no | no |
 | after `0a5aee4` only | no | **yes** | no |
-| before `0a5aee4` | **fault** | not found | no |
+| before `0a5aee4` | **fault** | no | no |
 
 `rwq_size.cpp` calls `size_approx` in `t1`. With the old code, on ARM, it
 can read the new block's `next` before `t0` writes it, as the zero the
 allocator's memory holds, and dereferences it: armem reports the null
 pointer dereference. The current and intermediate versions are right.
-Each run takes 12 s at `-O2` and `-O1`, except the old code's, which
-takes 120 s.
+Each run takes under 0.5 s at `-O0` to `-O2` and `-Os`, except the old
+code's, which takes 5 to 12 s (330 s at `-Os`).
 
 `rwq_dequeue.cpp` calls `try_dequeue` twice in `t1`, and the condition is
 that it gets a value other than the next one enqueued. With only the
 first commit, `t1` can see the new `tailBlock` while the first block's
 `next` still points to itself; it then "advances" to the first block
-again, which it has emptied, and dequeues a stale slot. Ten sampled paths
-find it at `-O2` and `-O1`. The bug was ARM-only, and was never in a
-release, since the PR was merged with both commits. An exhaustive search
-of this test does not finish in 15 minutes, with or without
-`--dynamic-por`, so the "not found" entries come from 5,000 sampled
-paths each. clang compiles `atomic_thread_fence(memory_order_release)` to
-`DMB ISH`, a full barrier, so the reduction treats every read as
-ordered before every later access, and the new block's initializing
-stores, which the consumer can reach only through the pointers stored
-after the fence, come in every order.
+again, which it has emptied, and dequeues a stale slot. The bug was
+ARM-only, and was never in a release, since the PR was merged with both
+commits. Each run takes 6 to 11 s at `-O2` and `-O1`, 1.5 to 3 minutes
+at `-O0` (with 3,000 instructions of fuel), and over 3 minutes at `-Os`.
+clang compiles `atomic_thread_fence(memory_order_release)` to `DMB ISH`,
+a full barrier, so before the reduction used program order (see
+[How it works](#how-it-works)) it took the new block's initializing
+stores, which the consumer reaches only through the pointers stored
+after the fence, to be observable in every order, and the search did not
+finish in 15 minutes.
 
 ### Calls
 
@@ -1375,6 +1375,34 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   to point to one more of three nodes in each of three rounds, as values
   spread between the threads, is not a counter. Before these rules, the
   pre-pass gave up on `ck_fifo_mpmc` and nothing was pruned.
+  Two more rules use where accesses lie in program order, which a
+  thread-wide flag such as "has a full barrier" loses. First, the
+  pre-pass runs each thread once more counting the ordering points it
+  passes (full and store barriers, and acquire and release accesses), and
+  two writes of one thread can be ordered only if some run makes the first
+  with fewer behind it than the second. The writes that initialize a
+  block before the one `DMB ISH` that publishes it are then unordered.
+  Second, a reader that finds those writes only through the pointer that
+  publishes them cannot observe their order. Suppose only thread A writes
+  location `P`, every write of value `v` to `P` follows a full or store
+  barrier after A's writes to some footprints (or is a release after
+  them), and `P` does not initially hold `v`. If every read by thread C
+  of such a footprint is ordered after a read that returns `v` from `P`
+  (by a dependency, by that read being an acquire, or by a `DMB LD` or
+  full barrier after it), then none of those reads can return a write
+  older than A's. So C cannot reveal the order of A's writes there.
+  The pre-pass finds such reads by running C again with the reads of
+  published values as sources, counting only orderings that hold in that
+  run. It does not count the dependency rule's over-approximation of
+  writes that may be read back, which is safe for ordering reads but
+  not here. Together these rules took moodycamel's
+  [ReaderWriterQueue](#readerwriterqueue) dequeue test from over 15
+  minutes to 5.6 s, and in `tests/por.rs` a writer that stores four
+  locations and publishes a pointer to a reader with `DMB LD` between its
+  reads, from 89 memories to 17. (An acquire or release access counts on
+  both sides of itself for the first rule. Counting it only before itself
+  lost final states in a random test, where the write of a `SWPAL` must
+  come before the thread's later store.)
 * **Register liveness** (on by default; `--no-live` turns it off,
   `src/live.rs`). Compiled code leaves values in registers it no longer
   needs: the comparison results of a retry loop, a value loaded only to be

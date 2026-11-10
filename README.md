@@ -1493,11 +1493,38 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   this.
 * **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
   exhaustively, armem follows `N` random paths through the promise
-  memories instead of all of them. Each path adds random certified
-  promises until none is left, and backtracks from dead ends. Every final
-  state reported is reachable, but others may be missed, so a condition
+  memories instead of all of them. Each path adds certified promises
+  until none is left, and backtracks from dead ends. Every final state
+  reported is reachable, but others may be missed, so a condition
   reported `Never` only means the walks did not find it. The report says
-  the results are sampled.
+  the results are sampled. The paths are chosen as in PCT (Burckhardt et
+  al., ASPLOS 2010): each path gives the threads random priorities, and
+  adds a promise of the highest-priority thread that has one. At
+  `--pct-depth` random depths (default 1), the thread that would go next
+  drops below all the others. So one thread runs ahead of the others for
+  long stretches, as ARM-only behaviors usually need: a write promised
+  early, then the other threads' writes that a late read of that thread
+  reads. `c/bench/` holds tests too big (or nearly) for the exhaustive
+  search, and `tests/sample_bench.rs` measures how many paths sampling
+  takes to find each one's bug. Over 10 seeds, the median number was:
+
+  | test | exhaustive | uniform | PCT |
+  |---|---|---|---|
+  | `ck_spmc_n`, 2 items per consumer | 48 s | 40 (1 seed missed in 100) | 32 |
+  | `ck_spmc_n`, 3 items per consumer | over 10 min | 15 | 14 |
+  | `ck_epoch_poll3`, 3 sections, 2 polls each | over 10 min | 28 (1 missed) | 11 |
+  | `ck_spmc` | 0.1 s | 64 (2 missed) | 31 (1 missed) |
+  | `ck_epoch` | 0.7 s | 26 | 6 |
+  | `dpdk_ring3`, generic | 4 s | 19 | 3 |
+
+  "Uniform" chose among all the promises at random, as armem did before.
+  That favors whichever thread has the most promises at each step. PCT's
+  paths are also cheaper: on the two larger tests, the same number took
+  a half to a third of the time. A guide towards promises that TSO could not make
+  (a thread's writes out of program order, or after a read of an
+  overwritten value) did no better than uniform choice: in these bugs
+  the promise itself is one TSO could make, and the ARM-only step is a
+  later read.
 * **Mixed sizes**: memory is byte-addressed. Each write message has a
   footprint (address and size), and coherence and forwarding are tracked
   per byte. An aligned access is single-copy atomic: an aligned read
@@ -1719,8 +1746,8 @@ lets a lone `LDXP` be torn.
    which that test needed (`ck_fifo_mpmc` with `-DFENCE_DEQ` from not
    finishing in 20 minutes to 35 s, and the C programs from 320 s to
    91 s; see [docs/dynamic-reduction.md](docs/dynamic-reduction.md));
-   next comes guiding the sampling towards reads that disagree with
-   what TSO would return.
+   and sampling that lets one thread run ahead at a time, as PCT does
+   (see Sampling in [How it works](#how-it-works)).
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

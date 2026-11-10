@@ -2034,24 +2034,58 @@ impl<'a> Explorer<'a> {
     /// empty memory until no promise can be added. A path that ends without
     /// a final state backtracks: such dead ends are common with the
     /// reduction, whose pruning can leave a memory with no way to complete.
+    ///
+    /// The paths are chosen as in PCT (Burckhardt et al., "A Randomized
+    /// Scheduler with Probabilistic Guarantees of Finding Bugs", ASPLOS
+    /// 2010): each walk gives the threads random priorities, and each step
+    /// adds a promise of the highest-priority thread that has one (any of
+    /// them, at random). At `pct_depth` random depths, the thread that would
+    /// go next drops below all the others. So a thread runs ahead of the
+    /// others for long stretches, as the promises that ARM-only behaviors
+    /// need usually do (a write promised early, and the other threads' writes
+    /// that a late read of the promising thread then reads). Choosing among
+    /// all the promises at random instead favors whichever thread has the
+    /// most of them at each step, and found the bugs in `c/bench` in up to
+    /// ten times as many walks.
     fn sample(&mut self, walks: u64, seed: u64) {
         self.results.sampled = true;
         let mut rng = seed;
+        let n = self.test.threads.len();
         // Memories already finished, and whether they had final states.
         let mut finished: FxHashMap<Vec<Msg>, bool> = FxHashMap::default();
         // The children of each memory that are not known to be dead ends.
         let mut children: FxHashMap<Vec<Msg>, Vec<Vec<Msg>>> = FxHashMap::default();
-        'walks: for _ in 0..walks {
+        // The longest memory so far, from which the depths of the changes
+        // are drawn.
+        let mut longest = 1u64;
+        'walks: for walk in 1..=walks {
+            self.results.stats.walks = walk;
+            if self.results.stats.first_hit.is_none() && self.results.observed(self.test) == Some(true) {
+                self.results.stats.first_hit = Some(walk - 1);
+            }
+            // Priorities, highest first; a dropped thread gets one below all
+            // the initial ones and those dropped before.
+            let mut prio: Vec<u64> = (0..n).map(|_| splitmix64(&mut rng) | 1 << 63).collect();
+            let changes: Vec<usize> = (0..self.cfg.pct_depth).map(|_| (1 + splitmix64(&mut rng) % longest) as usize).collect();
+            let mut low = 1u64 << 62;
             let mut path: Vec<Vec<Msg>> = vec![Vec::new()];
             while let Some(mem) = path.last().cloned() {
+                longest = longest.max(mem.len() as u64);
                 if !finished.contains_key(&mem) {
                     let (found, c) = self.visit(&mem, &|_| false);
                     finished.insert(mem.clone(), found);
                     children.insert(mem.clone(), c);
                 }
                 let c = &children[&mem];
-                if !c.is_empty() {
-                    path.push(c[(splitmix64(&mut rng) % c.len() as u64) as usize].clone());
+                let first = |prio: &[u64]| c.iter().map(|m| m.last().unwrap().tid).max_by_key(|&t| prio[t]);
+                if let Some(mut t) = first(&prio) {
+                    if changes.contains(&mem.len()) {
+                        prio[t] = low;
+                        low -= 1;
+                        t = first(&prio).unwrap();
+                    }
+                    let mine: Vec<&Vec<Msg>> = c.iter().filter(|m| m.last().unwrap().tid == t).collect();
+                    path.push(mine[(splitmix64(&mut rng) % mine.len() as u64) as usize].clone());
                     continue;
                 }
                 if finished[&mem] {
@@ -2065,6 +2099,9 @@ impl<'a> Explorer<'a> {
                     None => break 'walks,
                 }
             }
+        }
+        if self.results.stats.first_hit.is_none() && self.results.observed(self.test) == Some(true) {
+            self.results.stats.first_hit = Some(self.results.stats.walks);
         }
     }
 }

@@ -1,0 +1,13 @@
+# Benchmarks for sampling: tests too big (or nearly) to explore
+# exhaustively, each with an ARM-only bug. Columns: source (in c/),
+# litmus file (in c/), fuel, clang flags.
+bench/ck_spmc_n.c bench/ck_spmc_2.litmus 2000 -O2 -DOLD_FENCE -DTAKES=2
+bench/ck_spmc_n.c bench/ck_spmc_3.litmus 2000 -O2 -DOLD_FENCE -DTAKES=3
+ck_epoch_poll3.c bench/ck_epoch_poll3_3.litmus 2000 -O2 -DOLD_POLL -DSECTIONS=3 -DPOLLS=2 -DHELPER_POLLS=2
+# Small: exhaustive search takes seconds, but uniform sampling sometimes
+# misses the bug in 50 walks.
+ck_spmc.c ck_spmc.litmus 1000 -O2 -DOLD_FENCE
+ck_epoch.c ck_epoch.litmus 1000 -O2 -DOLD_BEGIN
+dpdk_ring.c dpdk_ring.litmus 1000 -O2 -DRTE_GENERIC_RING -DOLD_GENERIC
+dpdk_ring3.c dpdk_ring3.litmus 1000 -O2 -DRTE_GENERIC_RING -DOLD_GENERIC
+dpdk_ring3.c dpdk_ring3.litmus 1000 -O2 -DHTS -DOLD_HTS

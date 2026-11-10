@@ -81,6 +81,10 @@ pub struct Stats {
     pub observe_failed: u64,
     /// Interleaving models: number of distinct global states explored.
     pub states: u64,
+    /// Sampling: the walks taken, and the first (counted from 1) after
+    /// which some final state satisfied the test's condition.
+    pub walks: u64,
+    pub first_hit: Option<u64>,
 }
 
 /// The set of final states found by an exploration.

@@ -78,6 +78,9 @@ pub struct Options {
     pub sample: Option<u64>,
     /// Seed for `sample`.
     pub seed: u64,
+    /// For `sample`: how many times in each walk the thread whose promises
+    /// come first changes for another (see `promising.rs`).
+    pub pct_depth: u64,
     /// Stop the ARM model's exhaustive search after this many memories,
     /// setting `Outcomes::over_budget` (for tests that compare against a
     /// search that may be too big).
@@ -86,7 +89,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, pct_depth: 1, max_memories: None }
     }
 }
 

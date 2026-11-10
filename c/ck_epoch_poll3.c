@@ -23,9 +23,15 @@
 #endif
 
 #define FREED 0xdead
+#ifndef SECTIONS
 #define SECTIONS 2
+#endif
+#ifndef POLLS
 #define POLLS 1
+#endif
+#ifndef HELPER_POLLS
 #define HELPER_POLLS 1
+#endif
 
 struct object {
   unsigned int value;

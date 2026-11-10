@@ -19,6 +19,8 @@ options:
                      executions instead of exploring them all (for tests
                      too big to explore exhaustively; may miss outcomes)
       --seed N       random seed for --sample (default: 0)
+      --pct-depth N  in each path, how many times --sample switches the
+                     thread whose writes come first (default: 1)
       --max-memories N
                      stop the ARM search after N promise memories (the
                      report warns that other final states may be possible)
@@ -69,9 +71,10 @@ fn main() -> ExitCode {
             "--no-live" => opts.live = false,
             "--no-filter" => opts.filter = false,
             "--check-filter" => opts.check_filter = true,
-            "--sample" | "--seed" | "--max-memories" => match args.next().and_then(|v| v.parse().ok()) {
+            "--sample" | "--seed" | "--pct-depth" | "--max-memories" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) if a == "--sample" => opts.sample = Some(n),
                 Some(n) if a == "--max-memories" => opts.max_memories = Some(n),
+                Some(n) if a == "--pct-depth" => opts.pct_depth = n,
                 Some(n) => opts.seed = n,
                 None => {
                     eprintln!("{} needs a number", a);

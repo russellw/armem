@@ -487,9 +487,39 @@ small and the 1,200 large) give the same final states as the full search.
   first version.)
 - The `vpre ≥ ts(x)` characterization of ob covers the rules added to
   Arm's model since the Promising paper (pick dependencies, NoRet
-  atomics, acquire+release atomics). armem follows those rules through
-  views, but this needs checking case by case, and `tests/por.rs` should
-  have litmus tests for each.
+  atomics, acquire+release atomics). (Done; see below.) armem follows
+  those rules through views, and the observing runs use the same code.
+  So what could go wrong is an observing run that orders an access less
+  than the model does, or not at all, missing a record. To check that
+  the tests would notice, each rule was broken in the observing runs
+  alone, one at a time (November 2026):
+
+  | rule broken in the observing runs | caught by |
+  |---|---|
+  | a pick dependency orders a later write | `LB+csel-datas` |
+  | an ISB orders later reads after a pick (or control) dependency | `POR-pick-isb` |
+  | the write of an acquire+release atomic orders later accesses | `POR-swpal` |
+  | an acquire read of the thread's own atomic write is ordered after the atomic's read | `POR-swp-ldar` |
+  | a successful `CAS`'s result may depend on the memory read rather than on the expected value | `POR-cas-dep` |
+
+  Before the four `POR-` tests were added, `tests/por.rs` (its litmus
+  suite and its random tests) caught only the first. Each `POR-` test
+  has an outcome that needs `x` before `y` in memory, where `y`'s
+  writer has the lower thread number (so `.., x, y` is the memory the
+  reduction might prune), and the rule is the only thing that orders an
+  access after `x`. Without the rule, the outcome is lost. All four
+  match herd7.
+
+  Two rules have no test, because breaking them cannot lose an outcome.
+  A NoRet atomic's read is ordered by `DMB SY` (not by `DMB LD`), but
+  one that writes has its write ordered by the barrier too, and that
+  write comes after the read. A NoRet `CAS` that fails writes nothing,
+  and nothing shows which write it read: an execution in which it read
+  an older one has the same outcome. And when a `CAS` gives its result
+  both dependencies (on the read, or on the expected value), dropping
+  either is unsafe only where it is the weaker one. That is what
+  `POR-cas-dep` tests: there the expected value comes from a later
+  write.
 - Spin loops on future values: the pre-pass widens counters to
   unknown, and the observing exploration should do the same, or give up.
   (Done for the cut, which poisons them; the rounds give up after 3.)

@@ -95,3 +95,7 @@ LDR-Q-halves           no   no
 MP+dmb.sy+fmov-addr    no   no
 LB+simd-datas          no   no
 MP+dmb.sy+addr-qspill  no   no
+POR-pick-isb           yes  yes
+POR-swpal              yes  yes
+POR-swp-ldar           yes  yes
+POR-cas-dep            yes  no

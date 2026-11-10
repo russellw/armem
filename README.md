@@ -1579,6 +1579,7 @@ cargo build --release
 scripts/compare_herd.py -q litmus/*.litmus   # -q: only show disagreements
 scripts/gen_diy.sh /tmp/diy 2 6              # generate tests with diy7
 scripts/gen_diy.sh /tmp/diyat 2 5 atomics    # ... with atomics and CSEL
+scripts/gen_diy.sh /tmp/diyat3 3 6 atomics   # ... and with 3 threads
 scripts/compare_herd.py -q /tmp/diy/*.litmus
 ```
 
@@ -1588,7 +1589,8 @@ Tests with byte/halfword or pair accesses run in herd7 with
 (a loop test where armem finds extra states because herd7 unrolls loops
 only a bounded number of times).
 
-Current results (herdtools7 7.58):
+Current results (herdtools7 7.58; the diy7 sets and `litmus/` rerun in
+November 2026 with the dynamic reduction, the default since then):
 
 | Test set | Tests | Result |
 |---|---|---|
@@ -1596,8 +1598,8 @@ Current results (herdtools7 7.58):
 | diy7, basic edges, 2 threads | 2949 | all match |
 | diy7, basic edges, 3 threads | 5428 | all match |
 | diy7, atomics/exclusives/CSEL, 2 threads | 1145 | all match |
-| diy7, atomics/exclusives/CSEL, 3 threads | 5813 | all match |
-| `litmus/` | 87 | 67 match, 1 known difference; herd7 times out or rejects 19 |
+| diy7, atomics/exclusives/CSEL, 3 threads | 13507 | 13461 match; herd7 times out (120 s) on 46 |
+| `litmus/` | 91 | 71 match, 1 known difference; herd7 times out or rejects 19 |
 
 The known difference is `LDXP-torn`. herd7 treats an X-register `LDXP` as
 a 128-bit single-copy-atomic read. The Arm ARM guarantees this only when

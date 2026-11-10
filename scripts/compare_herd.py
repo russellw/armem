@@ -37,7 +37,8 @@ KNOWN_DIFFERENCES = {
         "val<len-1:0> : Zeros(shift), from bit len+shift-1, as armem does. "
         "herd7 also sign-extends to 64 bits in a W-register operation, and "
         "does not truncate the result: ADD W10,W1,W0,SXTH gives a negative "
-        "X10, where a W-register write clears the upper 32 bits."
+        "X10, where a W-register write clears the upper 32 bits. "
+        "Reported as https://github.com/herd/herdtools7/issues/2107."
     ),
 }
 

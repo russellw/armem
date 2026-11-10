@@ -118,7 +118,8 @@ every extend (`UXTB`, `UXTH`, `UXTW`, `UXTX`, `SXTB`, `SXTH`, `SXTW`,
 `SXTX`, with a shift of up to 4). The extend comes before the shift, as
 in Arm's `ExtendReg`. herd7 shifts first, and does not truncate a
 sign-extended operand in a W-register operation, so `ALU-extend-shift`
-is a known difference from it.
+is a known difference from it. This was reported as
+[herd/herdtools7#2107](https://github.com/herd/herdtools7/issues/2107).
 
 herd7 (7.58) does not accept the bitfield moves, `UDIV`/`SDIV`, `SMULH`/
 `UMULH`, `CCMP`/`CCMN`, `CNEG`, `CLZ`/`CLS`, add/subtract with carry or

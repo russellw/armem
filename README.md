@@ -694,10 +694,10 @@ read of the value, and the producer then refills the node first. The
 values are sent as the pointers themselves. Had the consumer read an
 item through each pointer, the read's address dependency would order the
 read of the node before the next update of the head, and `-DWEAK_DEQ`
-would be harmless. The tests take under 0.3 s, except the exhaustive
-search with `-DWEAK_ENQ`: the producer's writes are then unordered, and
-the consumer sees them in many orders, so it takes 2 minutes, and
-`expected.txt` samples 10 paths instead (0.1 to 0.4 s).
+would be harmless. The tests take under 0.3 s, except those with
+`-DWEAK_ENQ`: the producer's writes are then unordered, and the consumer
+sees them in many orders, so they take 1.6 s at `-O2` and 4.9 s at `-O0`
+(2 minutes before the dynamic reduction).
 
 `ck_fifo_mpmc.c` runs ck's multi-producer, multi-consumer FIFO, a
 Michael-Scott queue whose head, tail and links are (pointer, generation)
@@ -724,11 +724,12 @@ before its write of the head. x86 cannot do this, since its
 compare-and-swap is a full barrier. `-DFENCE_DEQ` adds
 `ck_pr_fence_load_store()` (`DMB SY`) between the read and the
 compare-and-swap, and then the exhaustive search shows the condition
-unreachable (4,894 memories in 35 s at `-O2`, with the dynamic reduction
-of [docs/dynamic-reduction.md](docs/dynamic-reduction.md); without it,
-the search did not finish in 20 minutes). As written, the exhaustive
-search finds the bug in 6,752 memories and 58 s. `ck_fifo_mpmc_trydequeue` reads the
-value the same way. The bug needs a node to be re-used while another
+unreachable (4,894 memories in 35 s at `-O2`, and the same at `-O1` and
+`-Os`, with the dynamic reduction of
+[docs/dynamic-reduction.md](docs/dynamic-reduction.md); without it, the
+search did not finish in 20 minutes). As written, the exhaustive search
+finds the bug in 6,752 memories and 58 s. `ck_fifo_mpmc_trydequeue`
+reads the value the same way. The bug needs a node to be re-used while another
 thread may still read it, which ck's own test does on purpose. It is
 reported as
 [concurrencykit/ck#297](https://github.com/concurrencykit/ck/issues/297).

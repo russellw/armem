@@ -158,18 +158,19 @@ ck_epoch_poll3 -O2 yes no -DOLD_POLL
 # ck's single-producer, single-consumer FIFO, recycling its two nodes.
 # WEAK_ENQ/WEAK_DEQ drop the store fence in enqueue/dequeue.
 ck_fifo_spsc -O2 no no
-ck_fifo_spsc -O2 yes no -DWEAK_ENQ sample=10
+ck_fifo_spsc -O2 yes no -DWEAK_ENQ
 ck_fifo_spsc -O2 yes no -DWEAK_DEQ
 ck_fifo_spsc -O0 no no fuel=2000
-ck_fifo_spsc -O0 yes no -DWEAK_ENQ sample=10 fuel=2000
+ck_fifo_spsc -O0 yes no -DWEAK_ENQ fuel=2000
 ck_fifo_spsc -O0 yes no -DWEAK_DEQ fuel=2000
 
 # ck's multi-producer FIFO, each thread dequeuing and at once re-enqueuing
 # in the node it gets back. As written, a dequeue's read of the value is not
 # ordered before the compare-and-swap that claims its node, and the other
 # thread can refill the node in between. -DFENCE_DEQ fences them, and the
-# exhaustive search shows the fix holds (about 35 s; as written, it takes
-# about 60 s to find the bug, so those lines sample).
+# exhaustive search shows the fix holds (about 35 s, and the same at -O1
+# and -Os). As written, it takes about 60 s to find the bug, which a few
+# sampled paths find at once.
 ck_fifo_mpmc -O2 yes no sample=3
 ck_fifo_mpmc -O1 yes no sample=3
 ck_fifo_mpmc -O2 no no -DFENCE_DEQ

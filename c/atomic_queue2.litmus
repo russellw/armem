@@ -1,0 +1,5 @@
+AArch64 atomic_queue2
+"A pop from atomic_queue's AtomicQueue2 returns the value pushed"
+{ setup(); int bad; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

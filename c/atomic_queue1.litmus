@@ -1,0 +1,5 @@
+AArch64 atomic_queue1
+"A pop from atomic_queue's AtomicQueue sees what was stored before the push"
+{ setup(); int bad; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

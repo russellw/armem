@@ -1,0 +1,15 @@
+// Stand-in for <memory>: the names the allocator-based queues use. They
+// are never instantiated, so only allocator, allocator_traits'
+// rebind_alloc, and uninitialized_fill_n need to exist.
+#ifndef STUB_MEMORY
+#define STUB_MEMORY
+#include <cstddef>
+namespace std {
+template<typename T> struct allocator { typedef T value_type; };
+template<typename A> struct allocator_traits;
+template<typename T> struct allocator_traits<allocator<T>> {
+	template<typename U> using rebind_alloc = allocator<U>;
+};
+template<typename P, typename S, typename T> P uninitialized_fill_n(P p, S n, const T& x);
+}
+#endif

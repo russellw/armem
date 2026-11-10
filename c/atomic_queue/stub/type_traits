@@ -1,0 +1,10 @@
+// Stand-in for <type_traits>: remove_reference, for <utility>. The old
+// headers include <type_traits> but use nothing else from it.
+#ifndef STUB_TYPE_TRAITS
+#define STUB_TYPE_TRAITS
+namespace std {
+template<typename T> struct remove_reference { typedef T type; };
+template<typename T> struct remove_reference<T&> { typedef T type; };
+template<typename T> struct remove_reference<T&&> { typedef T type; };
+}
+#endif

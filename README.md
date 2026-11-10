@@ -1204,6 +1204,90 @@ its last pop. A first version branched on each value as it popped it, and
 that branch ordered its read of the slot before its later store of the
 read index, so the test could not tell when the release was missing.
 
+### atomic_queue
+
+`c/atomic_queue/include` holds `atomic_queue.h` and `defs.h` from
+atomic_queue, unchanged from its commit `b7f1bef` (October 2026; MIT
+License, see `c/atomic_queue/LICENSE`), and `c/atomic_queue/old_2020` and
+`c/atomic_queue/old_2023` hold them from before two of its fixes.
+`c/atomic_queue/stub` holds freestanding stand-ins for the standard
+headers they include, and `c/atomic_queue.h` picks the version and says
+what each test shares. The old headers write `Base::template f(...)`
+without template arguments, which clang 19 and later reject by default,
+so that one diagnostic is turned off around them.
+
+`AtomicQueue` holds atomic elements, with a reserved value (`NIL`) for an
+empty slot. In the single-producer, single-consumer queue, a push waits
+for its slot to hold `NIL` and releases the element into it, and a pop
+waits (acquire) for an element and releases `NIL` into the slot. In the
+multi-producer, multi-consumer queue, a push is an `acq_rel`
+compare-and-swap from `NIL` and a pop an `acq_rel` exchange with `NIL`.
+In `atomic_queue1.cpp` the queue has one slot (`-DMULTI` for the
+multi-producer one). `t0` stores 42 in `data` and pushes 1; `t1` pops and
+loads `data`, and the condition is that it gets the element but not 42.
+With `-DPTR` the element is `&data` and `t1` loads through it.
+
+Commit `2bc627d` (April 2023, "Fix missing acquire memory order on pop for
+atomic elements") made the single-consumer pop's load of the element
+acquire. Before it (`-DOLD_2023`), the condition is reachable on ARM only,
+at `-O0` to `-O2` and `-Os`: `t1`'s load of `data` depends on the element
+only by control, which does not order a later load. With `-DPTR` it is
+unreachable, since that load has an address dependency on the element.
+In C++ both are data races.
+
+`AtomicQueue2` holds elements of any type, with a state for each slot. A
+push takes the state from `EMPTY` to `STORING` with a compare-and-swap,
+stores the element and releases `STORED`; a pop takes it from `STORED` to
+`LOADING`, loads the element and releases `EMPTY`. (In the
+single-producer, single-consumer queue, `-DSINGLE`, each waits for the
+state with an acquire load instead.) In `atomic_queue2.cpp` the queue
+has one slot. `t0` pushes 1 and 2, and `t1` tries to pop twice; the
+condition is a pop that returns a value other than the one pushed.
+
+Commit `95bbd40` (November 2020, "Bugfix. Use acquire semantics when
+loading states of non-atomic elements.") made both compare-and-swaps
+acquire. Before it (`-DOLD_2020`), the pop's is `LDXRB`/`STXRB` (or
+`CASB`), so its load of the element can come before it and read the slot
+before the push stores into it. That is reachable on ARM only, at `-O1`,
+`-O2` and `-Os`, and with LSE. x86's `cmpxchg` is a full barrier. Only
+the pop's half of the fix matters on ARM. With only the pop's
+compare-and-swap made acquire (a copy of the old header, not in `c/`),
+the condition is unreachable at `-O1`, `-O2`, `-Os` and with LSE, since
+the push's store into the slot is control-dependent on its
+compare-and-swap's load. At `-O0` clang performs every compare-and-swap
+as `LDAXRB`/`STLXRB` whatever order it is given (as with
+[Boost.Lockfree](#boostlockfree)'s exchange), so there the old code
+behaves as the current code does.
+
+The current code is right in all of these, and with `LDAPR`. Each test
+takes under 2.5 s. To check that the tests would notice, each ordering in
+the current header's push and pop functions was weakened in a copy of it,
+one at a time. `-DREUSE` checks the release in `AtomicQueue`'s pop: `t0`
+tries to push three times, then stores 0 in `data`, while `t1` pops,
+loads `data` and pops again. The third push waits for the second pop to
+empty the slot, so that release orders `t1`'s load of `data` before
+`t0`'s store of 0. Without the release, `t1` can load 0 (on ARM only).
+
+| ordering weakened | needed on ARM? |
+|---|---|
+| `AtomicQueue` push's release (both queues) | yes |
+| `AtomicQueue` single-consumer pop's acquire | yes, unless the consumer's loads have an address dependency on the element (`-DPTR`) |
+| `AtomicQueue` multi-consumer pop's exchange, to release only | the same |
+| `AtomicQueue` pop's release (`NIL` store; exchange to acquire only) | yes (`-DREUSE`) |
+| `AtomicQueue` push's acquire (load of `NIL`; compare-and-swap to release only) | no: the store into the slot is control-dependent on it |
+| `AtomicQueue2` pop's acquire of `STORED` (both queues) | yes, and on x86 too (see below) |
+| `AtomicQueue2` pop's release of `EMPTY` | yes |
+| `AtomicQueue2` push's release of `STORED` | yes |
+| `AtomicQueue2` push's acquire of `EMPTY` | no: the store into the slot is control-dependent on it |
+
+Without the acquire of `STORED`, nothing between the two pops tells clang
+that the element may have changed. When the second pop's
+compare-and-swap succeeds at its first try, the code clang emits reuses
+the first pop's load of the element instead of loading it again, so the
+condition is reachable under TSO too. The 2020 code, whose relaxed
+compare-and-swap is a strong one in a differently shaped loop, does not
+get that optimization at the levels tested.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1805,7 +1889,10 @@ lets a lone `LDXP` be torn.
    the PR's own first commit (see [readerwriterqueue](#readerwriterqueue)),
    and in Boost.Lockfree's `spsc_value` the ARM-only bug that its commit
    `fa6cbdf` fixed in August 2026, and that its `spsc_queue` is right (see
-   [Boost.Lockfree](#boostlockfree)). In the Chase–Lev
+   [Boost.Lockfree](#boostlockfree)), and in atomic_queue the ARM-only
+   bugs that its commits `95bbd40` (2020) and `2bc627d` (2023) fixed, the
+   second only where the consumer's later loads do not depend on the
+   element by address (see [atomic_queue](#atomic_queue)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

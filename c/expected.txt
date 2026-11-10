@@ -431,3 +431,54 @@ boost_spsc_range -O2 no no -march=armv8.3-a
 boost_spsc_range -O1 no no
 boost_spsc_range -Os no no
 boost_spsc_range -O0 no no fuel=3000
+
+# atomic_queue's AtomicQueue (atomic elements; one slot): single-producer,
+# single-consumer by default, MULTI for multi-producer, multi-consumer. The
+# consumer's load of data depends on the element by control, or with PTR
+# by address. OLD_2023 is the code before 2bc627d (April 2023): the
+# single-consumer pop loads the element relaxed, which ARM gets away with
+# only when the consumer's later loads depend on it by address. REUSE
+# checks the release in pop, which orders the consumer's load of data
+# before the producer's third push.
+atomic_queue1 -O2 no no
+atomic_queue1 -O2 no no -DPTR
+atomic_queue1 -O2 yes no -DOLD_2023
+atomic_queue1 -O2 no no -DOLD_2023 -DPTR
+atomic_queue1 -O2 no no -DREUSE
+atomic_queue1 -O2 no no -march=armv8.3-a
+atomic_queue1 -O2 no no -DMULTI
+atomic_queue1 -O2 no no -DMULTI -DREUSE
+atomic_queue1 -O2 no no -DMULTI -march=armv8.1-a
+atomic_queue1 -O2 no no -DMULTI -DREUSE -march=armv8.1-a
+atomic_queue1 -O1 no no
+atomic_queue1 -O1 yes no -DOLD_2023
+atomic_queue1 -O1 no no -DREUSE
+atomic_queue1 -Os no no
+atomic_queue1 -Os yes no -DOLD_2023
+atomic_queue1 -Os no no -DREUSE
+atomic_queue1 -O0 no no fuel=3000
+atomic_queue1 -O0 yes no -DOLD_2023 fuel=3000
+atomic_queue1 -O0 no no -DREUSE fuel=3000
+atomic_queue1 -O0 no no -DMULTI -DREUSE fuel=3000
+
+# atomic_queue's AtomicQueue2<int, 1> (elements guarded by a state per
+# slot): multi-producer, multi-consumer by default, SINGLE for single-
+# producer, single-consumer. t0 pushes 1 and 2 into the one slot. OLD_2020
+# is the code before 95bbd40 (November 2020): the pop's compare-and-swap
+# of the state is relaxed, so its load of the element can come before it.
+# At -O0 clang performs every compare-and-swap with LDAXRB/STLXRB, so
+# there the old code behaves as the current code does.
+atomic_queue2 -O2 no no
+atomic_queue2 -O2 yes no -DOLD_2020
+atomic_queue2 -O2 no no -DSINGLE
+atomic_queue2 -O2 no no -DSINGLE -march=armv8.3-a
+atomic_queue2 -O2 no no -march=armv8.1-a
+atomic_queue2 -O2 yes no -DOLD_2020 -march=armv8.1-a
+atomic_queue2 -O1 no no
+atomic_queue2 -O1 yes no -DOLD_2020
+atomic_queue2 -Os no no
+atomic_queue2 -Os yes no -DOLD_2020
+atomic_queue2 -Os no no -DSINGLE
+atomic_queue2 -O0 no no fuel=3000
+atomic_queue2 -O0 no no -DOLD_2020 fuel=3000
+atomic_queue2 -O0 no no -DSINGLE fuel=3000

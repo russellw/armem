@@ -1,0 +1,5 @@
+Freestanding stand-ins for the C++ standard headers that atomic_queue.h
+and defs.h include: only what they use. <atomic> is built on clang's
+__atomic builtins, as libstdc++'s is. The allocator-based queues
+(AtomicQueueB, AtomicQueueB2) are declared but never instantiated, so
+<memory> declares only what their definitions name.

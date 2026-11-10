@@ -1,0 +1,7 @@
+// Stand-in for <new>: placement new.
+#ifndef STUB_NEW
+#define STUB_NEW
+#include <cstddef>
+inline void* operator new(std::size_t, void* p) noexcept { return p; }
+inline void operator delete(void*, void*) noexcept {}
+#endif

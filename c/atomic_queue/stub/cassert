@@ -1,0 +1,5 @@
+// Stand-in for <cassert>: the tests build with -DNDEBUG.
+#ifndef STUB_CASSERT
+#define STUB_CASSERT
+#define assert(e) ((void)0)
+#endif

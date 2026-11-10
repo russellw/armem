@@ -47,6 +47,8 @@ MP-spin-acq            no   no
 ALU                    yes  yes
 ALU-bitfield           yes  yes
 ALU-arith              yes  yes
+ALU-extend             yes  yes
+ALU-extend-shift       yes  yes
 ALU-mul-logic          yes  yes
 ALU-rev-carry          yes  yes
 ALU-simd               yes  yes

@@ -103,6 +103,7 @@ fn parse_op2(ops: &[String], mnem: &str, ror: bool) -> Result<Operand> {
             Extend::Lsl(s) | Extend::Lsr(s) | Extend::Asr(s) => (s as u64) < 8 * Size::of(r).bytes(),
             Extend::Ror(s) => ror && (s as u64) < 8 * Size::of(r).bytes(),
             Extend::Uxtw(_) | Extend::Sxtw(_) => true,
+            Extend::Uxtb(s) | Extend::Uxth(s) | Extend::Sxtb(s) | Extend::Sxth(s) => s <= 4,
         };
         if !ok {
             return Err(format!("{}: bad shift '{}'", mnem, ops[1].trim()));
@@ -144,6 +145,10 @@ fn parse_extend(s: &str) -> Result<Extend> {
         "LSL" | "UXTX" | "SXTX" => Extend::Lsl(amt),
         "UXTW" => Extend::Uxtw(amt),
         "SXTW" => Extend::Sxtw(amt),
+        "UXTB" => Extend::Uxtb(amt),
+        "UXTH" => Extend::Uxth(amt),
+        "SXTB" => Extend::Sxtb(amt),
+        "SXTH" => Extend::Sxth(amt),
         "LSR" => Extend::Lsr(amt),
         "ASR" => Extend::Asr(amt),
         "ROR" => Extend::Ror(amt),
@@ -174,7 +179,13 @@ fn parse_addr(s: &str) -> Result<Addr> {
         2 if parts[1].starts_with('#') => Offset::Imm(parse_imm(parts[1])? as i64),
         2 => Offset::Reg(parse_reg(parts[1])?, Extend::Lsl(0)),
         3 => match parse_extend(parts[2])? {
-            Extend::Lsr(_) | Extend::Asr(_) | Extend::Ror(_) => return Err(format!("bad address '{}'", s)),
+            Extend::Lsr(_)
+            | Extend::Asr(_)
+            | Extend::Ror(_)
+            | Extend::Uxtb(_)
+            | Extend::Uxth(_)
+            | Extend::Sxtb(_)
+            | Extend::Sxth(_) => return Err(format!("bad address '{}'", s)),
             e => Offset::Reg(parse_reg(parts[1])?, e),
         },
         _ => return Err(format!("bad address '{}'", s)),

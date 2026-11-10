@@ -90,6 +90,11 @@ pub enum Extend {
     Lsl(u8),
     Uxtw(u8),
     Sxtw(u8),
+    /// Extends of an extended register operand of ADD/SUB only.
+    Uxtb(u8),
+    Uxth(u8),
+    Sxtb(u8),
+    Sxth(u8),
     /// Shifts of a shifted register operand only (ROR only for logical
     /// operations), within the operation's size.
     Lsr(u8),

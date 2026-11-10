@@ -1,0 +1,10 @@
+AArch64 ALU-extend-shift
+"Single-threaded check of add and subtract with shifted byte and halfword extended register operands (the value is extended, then shifted), and of a negative sign-extended operand in a W-register operation"
+{ 0:X0=0x8000000000f0a5c3; 0:X1=0x1000; }
+ P0                     ;
+ SUB X4,X1,W0,UXTH #2   ;
+ ADD W5,W1,W0,SXTH #1   ;
+ ADDS X7,X1,W0,SXTB #4  ;
+ ADD W10,W1,W0,SXTH     ;
+ CSET W8,PL             ;
+forall (0:X4=0xfffffffffffd78f4 /\ 0:X5=0xffff5b86 /\ 0:X7=0xc30 /\ 0:X8=1 /\ 0:X10=0xffffb5c3)

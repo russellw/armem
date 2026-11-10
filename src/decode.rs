@@ -523,10 +523,13 @@ fn data_reg(w: u32) -> Result<Instr> {
         let option = bits(w, 15, 13);
         let rm = zr(rm, wide && option & 3 == 3);
         let ext = match option {
+            0b000 => Extend::Uxtb(amt as u8),
+            0b001 => Extend::Uxth(amt as u8),
             0b010 => Extend::Uxtw(amt as u8),
+            0b100 => Extend::Sxtb(amt as u8),
+            0b101 => Extend::Sxth(amt as u8),
             0b110 => Extend::Sxtw(amt as u8),
-            0b011 | 0b111 => Extend::Lsl(amt as u8),
-            _ => return unsupported(),
+            _ => Extend::Lsl(amt as u8),
         };
         let rd = if flags { zr(rd, wide) } else { sp(rd, wide) };
         return Ok(Instr::Alu { op, rd, rn: sp(rn, wide), op2: Operand::RegExt(rm, ext), flags });

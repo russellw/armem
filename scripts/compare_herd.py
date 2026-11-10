@@ -30,6 +30,15 @@ KNOWN_DIFFERENCES = {
         "The Arm ARM only guarantees that when a matching STXP succeeds "
         "(GCC and LLVM rely on this), so armem lets a lone LDXP be torn."
     ),
+    "ALU-extend-shift": (
+        "herd7 shifts a UXTB/UXTH/SXTB/SXTH extended register operand before "
+        "extending it (ext_sext in herd/AArch64Sem.ml), so it extends from "
+        "bit len-1 of the shifted value. The Arm ARM's ExtendReg extends "
+        "val<len-1:0> : Zeros(shift), from bit len+shift-1, as armem does. "
+        "herd7 also sign-extends to 64 bits in a W-register operation, and "
+        "does not truncate the result: ADD W10,W1,W0,SXTH gives a negative "
+        "X10, where a W-register write clears the upper 32 bits."
+    ),
 }
 
 LOOP = re.compile(r"^\s*(B|B\.\w+|CBN?Z|TBN?Z)\b", re.I | re.M)

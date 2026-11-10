@@ -113,7 +113,12 @@ pointers), and:
 
 ALU instructions also accept a shifted or extended register operand, as
 in `ADD X7,X6,W4,SXTW` or `CMP X0,X1,LSR #2` (`LSL`, `LSR`, `ASR`, and for
-logical instructions `ROR`), and `ADD`/`SUB` accept `#imm,LSL #12`.
+logical instructions `ROR`), and `ADD`/`SUB` accept `#imm,LSL #12` and
+every extend (`UXTB`, `UXTH`, `UXTW`, `UXTX`, `SXTB`, `SXTH`, `SXTW`,
+`SXTX`, with a shift of up to 4). The extend comes before the shift, as
+in Arm's `ExtendReg`. herd7 shifts first, and does not truncate a
+sign-extended operand in a W-register operation, so `ALU-extend-shift`
+is a known difference from it.
 
 herd7 (7.58) does not accept the bitfield moves, `UDIV`/`SDIV`, `SMULH`/
 `UMULH`, `CCMP`/`CCMN`, `CNEG`, `CLZ`/`CLS`, add/subtract with carry or

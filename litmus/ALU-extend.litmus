@@ -1,0 +1,13 @@
+AArch64 ALU-extend
+"Single-threaded check of add and subtract with byte and halfword extended register operands"
+{ 0:X0=0x8000000000f0a5c3; 0:X1=0x1000; }
+ P0                     ;
+ ADD X2,X1,W0,UXTB      ;
+ ADD X3,X1,W0,SXTB      ;
+ SUB X4,X1,W0,UXTH      ;
+ CMP W0,W1,UXTB         ;
+ CSET W6,HI             ;
+ ADDS X7,X1,W0,SXTB     ;
+ CSET W8,PL             ;
+ SUB W9,W1,W0,SXTB      ;
+forall (0:X2=0x10c3 /\ 0:X3=0xfc3 /\ 0:X4=0xffffffffffff6a3d /\ 0:X6=1 /\ 0:X7=0xfc3 /\ 0:X8=1 /\ 0:X9=0x103d)

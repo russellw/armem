@@ -31,10 +31,24 @@ use crate::isa::{BrKind, Code, Instr};
 pub type Mask = u32;
 
 pub const ALL: Mask = u32::MAX;
-const FLAGS: Mask = 1 << 31;
+pub const FLAGS: Mask = 1 << 31;
 
 fn bits(regs: &[u8]) -> Mask {
     regs.iter().filter(|&&r| r < 31).fold(0, |m, &r| m | 1 << r)
+}
+
+/// The registers (and flags) that `i` reads: every one for `BR` and `BLR`,
+/// which may go anywhere.
+pub fn uses(i: &Instr) -> Mask {
+    match i {
+        Instr::BrReg { kind: BrKind::Br | BrKind::Blr, .. } => ALL,
+        _ => bits(&i.reads()) | if i.reads_flags() { FLAGS } else { 0 },
+    }
+}
+
+/// The registers (and flags) that `i` writes.
+pub fn defs(i: &Instr) -> Mask {
+    bits(&i.writes()) | if i.writes_flags() { FLAGS } else { 0 }
 }
 
 /// The registers live on entry to each instruction of a thread's code.
@@ -58,16 +72,8 @@ impl Liveness {
             .collect();
         returns.sort();
         returns.dedup();
-        let uses: Vec<Mask> = code
-            .instrs
-            .iter()
-            .map(|i| match i {
-                Instr::BrReg { kind: BrKind::Br | BrKind::Blr, .. } => ALL,
-                _ => bits(&i.reads()) | if i.reads_flags() { FLAGS } else { 0 },
-            })
-            .collect();
-        let defs: Vec<Mask> =
-            code.instrs.iter().map(|i| bits(&i.writes()) | if i.writes_flags() { FLAGS } else { 0 }).collect();
+        let uses: Vec<Mask> = code.instrs.iter().map(uses).collect();
+        let defs: Vec<Mask> = code.instrs.iter().map(defs).collect();
         let succs = |pc: usize| -> &[usize] {
             match code.instrs[pc] {
                 Instr::BrReg { kind: BrKind::Ret, .. } => &returns,

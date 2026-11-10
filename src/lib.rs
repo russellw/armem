@@ -63,7 +63,7 @@ pub struct Options {
     pub live: bool,
     /// Also prune memories by what the threads may do after each one
     /// (`reduce::Reduction::prunable_after`), where the partial-order
-    /// reduction alone does not.
+    /// reduction alone does not (with `por` only).
     pub dynamic_por: bool,
     /// In the ARM model, certify only the candidate promises that the
     /// thread's exploration shows can certify (see `Solo::promising` in
@@ -86,7 +86,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, dynamic_por: false, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, max_memories: None }
     }
 }
 

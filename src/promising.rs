@@ -34,7 +34,7 @@
 use crate::bytemap::ByteMap;
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, View, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::{FxHashMap, FxHashSet};
-use crate::isa::{Barrier, Code, LoadKind, RmwOp, Size};
+use crate::isa::{Barrier, Code, Instr, LoadKind, RmwOp, Size};
 use crate::litmus::{Obs, Test};
 use crate::Options;
 use crate::outcome::{Outcomes, Projection};
@@ -77,6 +77,8 @@ struct Fwd {
     /// `FUTURE`).
     addr: u64,
     val: u128,
+    /// For a cut observation: the value is poisoned (see `TState::poison`).
+    poison: bool,
 }
 
 /// Exclusive monitor set by a load-exclusive.
@@ -125,6 +127,12 @@ struct TState {
     /// `Solo::cas_fails_later`): the run may certify promises, but does not
     /// complete an execution.
     speculative: bool,
+    /// For a cut observation (see `Explorer::observe_cut`): the registers
+    /// (`live::Mask` bits) holding a value the run does not know, read from
+    /// a later write that the analysis does not know (or computed from
+    /// one). Instructions that read them are executed abstractly
+    /// (`Abstract`).
+    poison: crate::live::Mask,
 }
 
 impl TState {
@@ -145,6 +153,14 @@ impl TState {
             xcl: None,
             promises: BTreeSet::new(),
             speculative: false,
+            poison: 0,
+        }
+    }
+
+    /// Mark register `r` as poisoned (see `poison`) if `on`.
+    fn poison_reg(&mut self, r: crate::isa::RegOp, on: bool) {
+        if on && r.idx < 31 {
+            self.poison |= 1 << r.idx;
         }
     }
 
@@ -202,6 +218,12 @@ const OBSERVE_STATES_PER_COLLECT: u64 = 10;
 const MIN_OBSERVE_STATES: u64 = 1_000;
 const MAX_OBSERVE_STATES: u64 = 200_000;
 
+/// Fewest states `Explorer::observe_cut` may visit for one memory. On the
+/// shallow memories of `ck_fifo_mpmc`, the cut takes up to about 7,000
+/// states, many times its `Collect` runs; elsewhere, an observation that
+/// needs more seldom prunes enough to pay for itself.
+const MIN_CUT_STATES: u64 = 20_000;
+
 /// Most values a read of later writes may return in `Mode::Observe`, where
 /// the analysis does not know them, before it gives up.
 const MAX_UNKNOWN_VALUES: usize = 4096;
@@ -248,6 +270,9 @@ struct ReadResult {
     srcs: Vec<View>,
     /// Dependency views of the value read.
     dep: RV,
+    /// For a cut observation: bit `i` is set if byte `i` of the value is
+    /// unknown (read from a later write that the analysis does not know).
+    poison: u16,
 }
 
 /// A candidate write to promise: (address, size, value).
@@ -283,6 +308,17 @@ struct Solo<'a> {
     used_unknown: std::cell::Cell<bool>,
     written: Written,
     gave_up: std::cell::Cell<bool>,
+    /// For `Mode::Observe`: whether to cut off the states past `x`, with
+    /// unknown values of later writes poisoned instead of taken from
+    /// `unknown` (see `Explorer::observe_cut`); and whether a run needed a
+    /// poisoned value before it got past `x` (`Abstract::Fallback`), which
+    /// voids the results.
+    cut: bool,
+    poison_used: std::cell::Cell<bool>,
+    /// Whether a run was cut off, and its reads of `x` recorded.
+    cut_reads: bool,
+    /// Whether the store being performed writes a poisoned value.
+    write_poison: bool,
     /// For `Mode::Observe`: most states before it gives up.
     max_states: u64,
     states: u64,
@@ -325,6 +361,81 @@ fn pieces(a: u64, n: u64, granule: u64, lse2: bool) -> Vec<(u64, u64)> {
 /// A successor state, with any messages newly appended to memory.
 type Succ = (TState, Vec<Msg>);
 
+/// How a cut observation executes an instruction that reads a poisoned
+/// register (see `TState::poison`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Abstract {
+    /// It reads none.
+    Clean,
+    /// An integer operation: whatever it writes is poisoned.
+    Data,
+    /// Its outcome depends on the flags alone, which are poisoned: try
+    /// each value (`Solo::forked_step`).
+    Flags,
+    /// A branch on a poisoned register: try both ways.
+    Reg(u8),
+    /// A store of a poisoned value (its address is clean): the write is
+    /// poisoned (`Solo::write_poison`).
+    Store,
+    /// Anything else: the observation needs the values (see `Cut::Poisoned`).
+    Fallback,
+}
+
+/// How to execute `i`, which reads the poisoned registers `p`.
+fn abstract_step(i: &Instr, p: crate::live::Mask) -> Abstract {
+    let flags_only = p & !crate::live::FLAGS == 0;
+    let addr_clean = |a: &crate::isa::Addr| {
+        let mut m = if a.base.idx < 31 { 1 << a.base.idx } else { 0 };
+        if let crate::isa::Offset::Reg(r, _) = a.offset {
+            if r.idx < 31 {
+                m |= 1 << r.idx;
+            }
+        }
+        m & p == 0
+    };
+    match *i {
+        Instr::Cbz { rt, .. } | Instr::Tbz { rt, .. } => Abstract::Reg(rt.idx),
+        Instr::BCond { .. } => Abstract::Flags,
+        Instr::Csel { .. } | Instr::Adc { .. } | Instr::Ccmp { .. } if flags_only => Abstract::Flags,
+        Instr::MovImm { .. }
+        | Instr::Movk { .. }
+        | Instr::MovReg { .. }
+        | Instr::Alu { .. }
+        | Instr::Csel { .. }
+        | Instr::Bitfield { .. }
+        | Instr::Madd { .. }
+        | Instr::Unary { .. }
+        | Instr::Extr { .. }
+        | Instr::Adc { .. }
+        | Instr::Mulh { .. }
+        | Instr::Ccmp { .. }
+            if !i.writes().contains(&crate::isa::SP) =>
+        {
+            Abstract::Data
+        }
+        Instr::Store { addr, .. }
+        | Instr::StorePair { addr, .. }
+        | Instr::StoreExcl { addr, .. }
+        | Instr::StoreExclPair { addr, .. }
+            if addr_clean(&addr) =>
+        {
+            Abstract::Store
+        }
+        _ => Abstract::Fallback,
+    }
+}
+
+/// The address of a store.
+fn store_addr(op: MemOp) -> u64 {
+    match op {
+        MemOp::Store { addr, .. }
+        | MemOp::StorePair { addr, .. }
+        | MemOp::StoreExcl { addr, .. }
+        | MemOp::StoreExclPair { addr, .. } => addr.val,
+        _ => 0,
+    }
+}
+
 /// The dependency views of a register value read from memory.
 fn dep(view: View, pick: View) -> RV {
     RV { val: 0, view, pick: pick.max(view) }
@@ -359,6 +470,10 @@ impl<'a> Solo<'a> {
             used_unknown: Default::default(),
             written: Default::default(),
             gave_up: Default::default(),
+            cut: false,
+            poison_used: Default::default(),
+            cut_reads: false,
+            write_poison: false,
             max_states: MAX_OBSERVE_STATES,
             states: 0,
             placeable: FxHashSet::default(),
@@ -514,10 +629,16 @@ impl<'a> Solo<'a> {
             let mut val = 0u128;
             let mut rview = 0;
             let mut rpick = 0;
+            let mut poison = 0u16;
             for (i, &t) in srcs.iter().enumerate().rev() {
                 let b = a + i as u64;
                 let byte = match st.fwd.get(b) {
-                    Some(f) if t == FUTURE => (f.val >> (8 * (b - f.addr))) as u8,
+                    Some(f) if t == FUTURE => {
+                        if f.poison {
+                            poison |= 1 << i;
+                        }
+                        (f.val >> (8 * (b - f.addr))) as u8
+                    }
                     _ => self.byte_value(ext, b, t),
                 };
                 val = (val << 8) | byte as u128;
@@ -548,7 +669,7 @@ impl<'a> Solo<'a> {
                 s.v_wnew = s.v_wnew.max(ppost);
             }
             s.v_cap = s.v_cap.max(addr.pick);
-            out.push(ReadResult { state: s, val, srcs, dep: dep(vpost, ppost) });
+            out.push(ReadResult { state: s, val, srcs, dep: dep(vpost, ppost), poison });
         }
         if self.mode == Mode::Observe {
             let ps = pieces(a, n, granule, self.lse2);
@@ -572,19 +693,26 @@ impl<'a> Solo<'a> {
             record |= (vpre == l || r.srcs.contains(&l)) && r.srcs.iter().any(|&t| t <= l);
         }
         let Some(red) = &self.reduction else { return };
-        let vals = match red.future_values(self.tid, a, n, &|b| self.test.init_byte(b)) {
+        let vals: Vec<(u128, u16)> = match red.future_values(self.tid, a, n, &|b| self.test.init_byte(b)) {
             crate::reduce::Future::None => Vec::new(),
+            crate::reduce::Future::Unknown if self.cut => match self.poisoned_read_values(a, ps, out, red) {
+                Some(v) => v,
+                None => {
+                    self.gave_up.set(true);
+                    return;
+                }
+            },
             crate::reduce::Future::Unknown => {
                 self.used_unknown.set(true);
                 match self.unknown_read_values(a, ps, out, red) {
-                    Some(v) => v,
+                    Some(v) => v.into_iter().map(|v| (v, 0)).collect(),
                     None => {
                         self.gave_up.set(true);
                         return;
                     }
                 }
             }
-            crate::reduce::Future::Values(v) => v,
+            crate::reduce::Future::Values(v) => v.into_iter().map(|v| (v, 0)).collect(),
         };
         // A read taking some bytes from later writes and some from the
         // memory is represented by a read of later writes only (its views
@@ -598,7 +726,7 @@ impl<'a> Solo<'a> {
             self.observed_reads.borrow_mut().insert((a, n));
         }
         let acquire = kind.load != LoadKind::Plain;
-        for val in vals {
+        for (val, poison) in vals {
             let (vpost, ppost) = (FUTURE, FUTURE);
             let mut s = st.clone();
             s.coh.update(a, a + n, |v| Some(v.unwrap_or(0).max(vpost)));
@@ -614,7 +742,7 @@ impl<'a> Solo<'a> {
                 s.v_wnew = ppost;
             }
             s.v_cap = s.v_cap.max(addr.pick);
-            out.push(ReadResult { state: s, val, srcs: vec![FUTURE; n as usize], dep: dep(vpost, ppost) });
+            out.push(ReadResult { state: s, val, srcs: vec![FUTURE; n as usize], dep: dep(vpost, ppost), poison });
         }
     }
 
@@ -640,6 +768,37 @@ impl<'a> Solo<'a> {
                 return None;
             }
             combos = combos.iter().flat_map(|&c| vals.iter().map(move |&v| c | v << (8 * (p - a)))).collect();
+        }
+        Some(combos)
+    }
+
+    /// For a cut observation: the values a read at `a` in single-copy-atomic
+    /// pieces `ps` may return when some piece reads a later write by
+    /// another thread, where the analysis does not know what those may
+    /// store, each with the bytes it leaves unknown (`ReadResult::poison`),
+    /// or None if there are too many.
+    /// A piece whose later writes the analysis does not know is unknown
+    /// (which covers its values in the memory too); any other is read from
+    /// the memory (one of `concrete`'s values) or from a later write.
+    fn poisoned_read_values(&self, a: u64, ps: &[(u64, u64)], concrete: &[ReadResult], red: &crate::reduce::Reduction) -> Option<Vec<(u128, u16)>> {
+        let mut combos = vec![(0u128, 0u16)];
+        for &(p, len) in ps {
+            let mask = if len >= 16 { u128::MAX } else { (1u128 << (8 * len)) - 1 };
+            let shift = 8 * (p - a);
+            let mut vals: BTreeSet<u128> = concrete.iter().map(|r| (r.val >> shift) & mask).collect();
+            match red.future_values(self.tid, p, len, &|b| self.test.init_byte(b)) {
+                crate::reduce::Future::None => {}
+                crate::reduce::Future::Values(v) => vals.extend(v),
+                crate::reduce::Future::Unknown => {
+                    let bytes = (((1u32 << len) - 1) << (p - a)) as u16;
+                    combos.iter_mut().for_each(|c| c.1 |= bytes);
+                    continue;
+                }
+            }
+            if combos.len() * vals.len() > MAX_UNKNOWN_VALUES {
+                return None;
+            }
+            combos = combos.iter().flat_map(|&(c, m)| vals.iter().map(move |&v| (c | v << shift, m))).collect();
         }
         Some(combos)
     }
@@ -712,6 +871,7 @@ impl<'a> Solo<'a> {
                 xview: kind.xview,
                 addr: a,
                 val,
+                poison: self.write_poison,
             };
             s.coh.set(a, a + n, t);
             s.fwd.set(a, a + n, fwd);
@@ -733,9 +893,11 @@ impl<'a> Solo<'a> {
         };
         let coh_ok = |t: View| st.coh_max(a, n) < t;
         let mut out = Vec::new();
-        // Fulfill an outstanding promise.
+        // Fulfill an outstanding promise (with any value, if the value
+        // written is poisoned).
+        let same = |m: &Msg| if self.write_poison { m.addr == a && m.size == size && m.tid == self.tid } else { *m == new_msg };
         for &t in &st.promises {
-            if *self.msg(ext, t) == new_msg && vpre < t && coh_ok(t) && ok_atomic(t) {
+            if same(self.msg(ext, t)) && vpre < t && coh_ok(t) && ok_atomic(t) {
                 out.push((apply(t), ext.to_vec()));
             }
         }
@@ -811,6 +973,57 @@ impl<'a> Solo<'a> {
                 self.live_failed = true;
                 return vec![];
             }
+            let mut abs = Abstract::Clean;
+            if s.poison != 0 {
+                if let Some(i) = self.prog.instrs.get(s.core.pc) {
+                    let p = crate::live::uses(i) & s.poison;
+                    abs = if p == 0 { Abstract::Clean } else { abstract_step(i, p) };
+                    match abs {
+                        Abstract::Fallback => {
+                            self.poison_used.set(true);
+                            return vec![];
+                        }
+                        Abstract::Data => {}
+                        _ => s.poison &= !crate::live::defs(i),
+                    }
+                    if let Abstract::Flags | Abstract::Reg(_) = abs {
+                        return self.forked_step(&s, ext, abs);
+                    }
+                    if abs == Abstract::Data {
+                        let defs = crate::live::defs(i);
+                        match s.core.step(self.prog) {
+                            Step::Local { ctrl, write: None } => {
+                                if let Some(v) = ctrl {
+                                    s.v_cap = s.v_cap.max(v);
+                                }
+                                s.poison |= defs;
+                                if s.core.steps >= self.fuel {
+                                    return vec![(s, ext.to_vec())];
+                                }
+                                continue;
+                            }
+                            _ => {
+                                self.poison_used.set(true);
+                                return vec![];
+                            }
+                        }
+                    }
+                }
+            }
+            if abs == Abstract::Store {
+                return match s.core.step(self.prog) {
+                    Step::Mem(op) if !s.core.stack.is_private(store_addr(op), 1) => {
+                        self.write_poison = true;
+                        let out = self.mem_successors(s, ext, op);
+                        self.write_poison = false;
+                        out
+                    }
+                    _ => {
+                        self.poison_used.set(true);
+                        vec![]
+                    }
+                };
+            }
             match s.core.step(self.prog) {
                 Step::Local { ctrl, write } => {
                     if let Some(w) = write {
@@ -830,6 +1043,43 @@ impl<'a> Solo<'a> {
                 step => return self.nonlocal_successors(s, ext, step),
             }
         }
+    }
+
+    /// For a cut observation: the states after `s`'s next instruction, a
+    /// local one whose outcome depends on a poisoned value (`abs`): one for
+    /// each value of the flags, or each of two values of the register (zero,
+    /// and all ones), which between them take every way it may go.
+    fn forked_step(&mut self, s: &TState, ext: &[Msg], abs: Abstract) -> Vec<Succ> {
+        let subst: Vec<Box<dyn Fn(&mut Core)>> = match abs {
+            Abstract::Flags => (0..16).map(|f| Box::new(move |c: &mut Core| c.flags.val = f) as Box<dyn Fn(&mut Core)>).collect(),
+            Abstract::Reg(r) => [0, u64::MAX]
+                .into_iter()
+                .map(|v| Box::new(move |c: &mut Core| c.regs[r as usize].val = v) as Box<dyn Fn(&mut Core)>)
+                .collect(),
+            _ => unreachable!(),
+        };
+        let mut out: Vec<Succ> = Vec::new();
+        for f in subst {
+            let mut t = s.clone();
+            f(&mut t.core);
+            match t.core.step(self.prog) {
+                Step::Local { ctrl, write: None } => {
+                    if let Some(v) = ctrl {
+                        t.v_cap = t.v_cap.max(v);
+                    }
+                    // With clean operands, the flags or register written
+                    // are clean; a branch keeps its register poisoned.
+                    if !out.iter().any(|(u, _)| *u == t) {
+                        out.push((t, ext.to_vec()));
+                    }
+                }
+                _ => {
+                    self.poison_used.set(true);
+                    return vec![];
+                }
+            }
+        }
+        out
     }
 
     /// Whether a run that ends in `s` completes an execution with the memory
@@ -1007,6 +1257,7 @@ impl<'a> Solo<'a> {
                 for r in self.do_read(&st, ext, addr, ReadKind::of(kind), size, size.bytes()) {
                     let mut s = r.state;
                     s.core.set(rt, RV { val: size.extend(r.val as u64, signed), ..r.dep });
+                    s.poison_reg(rt, r.poison != 0);
                     if excl {
                         s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs, view: r.dep.view });
                     }
@@ -1026,6 +1277,9 @@ impl<'a> Solo<'a> {
                     let (lo, hi) = split_pair(r.val, size);
                     s.core.set(rt, RV { val: lo, ..r.dep });
                     s.core.set(rt2, RV { val: hi, ..r.dep });
+                    let half = (1u16 << size.bytes()) - 1;
+                    s.poison_reg(rt, r.poison & half != 0);
+                    s.poison_reg(rt2, r.poison & !half != 0);
                     s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs, view: r.dep.view });
                     s.core.retire(prog);
                     out.push((s, ext.to_vec()));
@@ -1062,6 +1316,9 @@ impl<'a> Solo<'a> {
                         let (lo, hi) = split_pair(r.val, size);
                         s.core.set(rt, RV { val: size.extend(lo, signed), ..r.dep });
                         s.core.set(rt2, RV { val: size.extend(hi, signed), ..r.dep });
+                        let half = (1u16 << size.bytes()) - 1;
+                        s.poison_reg(rt, r.poison & half != 0);
+                        s.poison_reg(rt2, r.poison & !half != 0);
                         s.core.retire(prog);
                         out.push((s, ext.to_vec()));
                     }
@@ -1073,6 +1330,8 @@ impl<'a> Solo<'a> {
                             let mut s = r2.state;
                             s.core.set(rt, RV { val: size.extend(r1.val as u64, signed), ..r1.dep });
                             s.core.set(rt2, RV { val: size.extend(r2.val as u64, signed), ..r2.dep });
+                            s.poison_reg(rt, r1.poison != 0);
+                            s.poison_reg(rt2, r2.poison != 0);
                             s.core.retire(prog);
                             out.push((s, ext.to_vec()));
                         }
@@ -1089,6 +1348,11 @@ impl<'a> Solo<'a> {
                     let mut next = Vec::new();
                     for s in &states {
                         for r in self.do_read(s, ext, a, ReadKind::plain(), size, n.min(8)) {
+                            // SIMD&FP registers are not tracked.
+                            if r.poison != 0 {
+                                self.poison_used.set(true);
+                                return vec![];
+                            }
                             let mut s = r.state;
                             s.core.vset(v, VR::with(r.val, r.dep));
                             next.push(s);
@@ -1174,6 +1438,12 @@ impl<'a> Solo<'a> {
                     }
                 }
                 for r in self.do_read(&st, ext, addr, ReadKind { load, noret }, size, size.bytes()) {
+                    // The write's value (or whether it writes) may depend
+                    // on the unknown value.
+                    if r.poison != 0 {
+                        self.poison_used.set(true);
+                        return vec![];
+                    }
                     let old = r.val as u64;
                     let reg = RV { val: old, ..r.dep };
                     match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
@@ -1305,8 +1575,8 @@ impl<'a> Solo<'a> {
 
     /// For `Mode::Observe`: if `st` is past `x` (the last message of
     /// `base`), erase its views, so that states that differ only in views
-    /// are explored once. (In `ck_fifo_mpmc`, nearly all the states of an
-    /// observing exploration are past `x`.)
+    /// are explored once, and return true. (In `ck_fifo_mpmc`, nearly all
+    /// the states of an observing exploration are past `x`.)
     ///
     /// Views only grow, and in this mode each is at most `ts(x)` or
     /// `FUTURE`. A read's pre-view is at least `v_rnew`, and a write's at
@@ -1319,10 +1589,10 @@ impl<'a> Solo<'a> {
     /// (see `observe_read`), which depends on the memory and the pieces of
     /// the read, not on views. So the run goes on as it would have, reading
     /// and writing the same values, and records the same accesses.
-    fn past(&self, st: &mut TState) {
+    fn past(&self, st: &mut TState) -> bool {
         let l = self.base.len() as View;
         if st.v_rnew <= l || st.v_wnew <= l && st.v_cap <= l {
-            return;
+            return false;
         }
         debug_assert!(st.promises.is_empty());
         st.core.erase_views();
@@ -1348,6 +1618,7 @@ impl<'a> Solo<'a> {
         if let Some(m) = &mut st.xcl {
             m.view = 0;
         }
+        true
     }
 
     fn run(&mut self, start: TState) {
@@ -1360,6 +1631,9 @@ impl<'a> Solo<'a> {
                     self.gave_up.set(true);
                     return;
                 }
+                if self.poison_used.get() {
+                    return;
+                }
             }
             if self.mode == Mode::Certify && st.promises.is_empty() {
                 self.certified = true;
@@ -1370,8 +1644,15 @@ impl<'a> Solo<'a> {
             if self.doomed(&st, &ext) {
                 continue;
             }
-            if self.mode == Mode::Observe {
-                self.past(&mut st);
+            if self.mode == Mode::Observe && self.past(&mut st) && self.cut {
+                // What the run would record from here on: reads that take
+                // bytes from `x` (see `past`).
+                if !std::mem::replace(&mut self.cut_reads, true) {
+                    let x = self.base.last().expect("an observed memory is not empty");
+                    let red = self.reduction.as_ref().expect("observing needs the analysis");
+                    self.observed_reads.get_mut().extend(red.reads_overlapping(self.tid, x));
+                }
+                continue;
             }
             // A state already reached with no more steps used has nothing new
             // to offer; this collapses spin loops.
@@ -1461,6 +1742,14 @@ pub fn explore(test: &Test, cfg: &Options) -> Outcomes {
     ex.results
 }
 
+/// The outcome of `Explorer::observe_cut`.
+enum Cut {
+    Done(crate::reduce::Observed),
+    GaveUp,
+    /// A run used a poisoned value before it got past `x`.
+    Poisoned,
+}
+
 /// The promise-first search over memories.
 struct Explorer<'a> {
     test: &'a Test,
@@ -1483,16 +1772,17 @@ struct Explorer<'a> {
 impl<'a> Explorer<'a> {
     /// Run thread `tid` alone against `mem`.
     fn solo(&mut self, tid: usize, mem: &[Msg], mode: Mode) -> Solo<'a> {
-        self.solo_with(tid, mem, mode, Arc::default(), MAX_OBSERVE_STATES)
+        self.solo_with(tid, mem, mode, Arc::default(), MAX_OBSERVE_STATES, false)
     }
 
-    /// The same, with `Solo::unknown` and `Solo::max_states` for
+    /// The same, with `Solo::unknown`, `Solo::max_states` and `Solo::cut` for
     /// `Mode::Observe`.
-    fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>, max_states: u64) -> Solo<'a> {
+    fn solo_with(&mut self, tid: usize, mem: &[Msg], mode: Mode, unknown: Arc<Written>, max_states: u64, cut: bool) -> Solo<'a> {
         loop {
             let mut s = Solo::new(self.test, self.cfg, self.proj, tid, mem.to_vec(), mode, self.live[tid].clone());
             s.reduction = self.reduction.clone();
             s.max_states = max_states;
+            s.cut = cut;
             if mode == Mode::Observe {
                 s.unknown = unknown.clone();
             }
@@ -1507,7 +1797,9 @@ impl<'a> Explorer<'a> {
     /// What each thread may do after `mem` (`Mode::Observe`), or None if
     /// that is not known, within `budget` states.
     ///
-    /// Where the analysis does not know what a later write may store (a
+    /// It first tries `observe_cut`, which runs each thread once. Only if a
+    /// run there needs a value the analysis does not know does it fall back
+    /// to the rounds below. Where the analysis does not know what a later write may store (a
     /// counter, which it widens to any value), the values come from the
     /// explorations themselves, in rounds: in each, a read of those bytes
     /// returns the values the other threads wrote in the rounds before.
@@ -1527,6 +1819,18 @@ impl<'a> Explorer<'a> {
     /// trying them all costs more than they prune.
     fn observe(&mut self, mem: &[Msg], mut budget: u64) -> Option<crate::reduce::Observed> {
         let n = self.test.threads.len();
+        let mut cut_budget = budget.max(MIN_CUT_STATES);
+        match self.observe_cut(mem, &mut cut_budget) {
+            Cut::Done(obs) => {
+                self.results.stats.observed += 1;
+                return Some(obs);
+            }
+            Cut::GaveUp => {
+                self.results.stats.observe_failed += 1;
+                return None;
+            }
+            Cut::Poisoned => {}
+        }
         let parent = &mem[..mem.len() - 1];
         if self.failed.contains(parent) {
             self.failed.insert(mem.to_vec());
@@ -1551,7 +1855,7 @@ impl<'a> Explorer<'a> {
                         }
                     }
                 }
-                let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::new(unknown), budget);
+                let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::new(unknown), budget, false);
                 budget = budget.saturating_sub(o.states);
                 if o.gave_up.get() {
                     self.failed.insert(mem.to_vec());
@@ -1578,6 +1882,39 @@ impl<'a> Explorer<'a> {
         self.failed.insert(mem.to_vec());
         self.results.stats.observe_failed += 1;
         None
+    }
+
+    /// What each thread may do after `mem`, found with the states past `x`
+    /// (the last message of `mem`) cut off (`Solo::cut`).
+    ///
+    /// A state past `x` makes no more accesses ordered after `x`, and needs
+    /// no more than its reads of `x` recorded (see `Solo::past`). Only its
+    /// writes would matter: their values are those that later writes give
+    /// the other threads' reads, which the rounds of `observe` find. Instead,
+    /// where the analysis does not know them, the value read is poisoned.
+    /// A run that gets past `x` before it uses one needs no value at all;
+    /// until then, the run computes with it, branches on it and stores it
+    /// abstractly (`Abstract`). One that needs it for anything else, such
+    /// as an address (`Cut::Poisoned`), needs the rounds.
+    /// In `ck_fifo_mpmc`, whose loads are each followed by a fence, a read of
+    /// a later write puts the run past `x` at once.
+    fn observe_cut(&mut self, mem: &[Msg], budget: &mut u64) -> Cut {
+        let mut obs = crate::reduce::Observed::default();
+        for tid in 0..self.test.threads.len() {
+            let mut o = self.solo_with(tid, mem, Mode::Observe, Arc::default(), *budget, true);
+            *budget = budget.saturating_sub(o.states);
+            if o.poison_used.get() {
+                return Cut::Poisoned;
+            }
+            // Past the budget, or a read with too many values: the rounds,
+            // which explore what the cut cuts off, would mostly give up too.
+            if o.gave_up.get() {
+                return Cut::GaveUp;
+            }
+            obs.reads.push(o.observed_reads.take());
+            obs.writes.push(std::mem::take(&mut o.observed_writes));
+        }
+        Cut::Done(obs)
     }
 
     fn start(&self, tid: usize, mem: &[Msg]) -> TState {

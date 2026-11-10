@@ -1,11 +1,13 @@
 # Design: a dynamic partial-order reduction
 
-Status: implemented as `--dynamic-por` (off by default), November 2026.
-See [Results](#results): it helps several tests, but on `ck_fifo_mpmc`,
-the test it was designed for, it gives up, because of a counter (see
-[Counters](#counters)). Across the C programs it now costs about 5% more
-time than the static reduction alone (see [Cheaper
-observing](#cheaper-observing)).
+Status: implemented, and the default since November 2026
+(`--no-dynamic-por` turns it off). With the states past `x` cut off and
+unknown values poisoned (see [The cut](#the-cut)), `ck_fifo_mpmc`, the
+test it was designed for, finishes: with `-DFENCE_DEQ`, in 4,894
+memories and 35 s, which shows the fix holds. Across the C programs it
+takes 91 s, against 320 s for the static reduction alone. The sections
+from [Counters](#counters) to [Cheaper observing](#cheaper-observing)
+describe the earlier versions, which gave up on `ck_fifo_mpmc`.
 
 ## The problem
 
@@ -379,6 +381,79 @@ and with them every deeper one.
 So the dynamic reduction no longer costs much where it does not help,
 but across the suite it does not pay either, and it stays an option.
 
+### The cut
+
+[Where the shallow memories' states go](#where-the-shallow-memories-states-go)
+found that 97 to 99% of an observing exploration's states on
+`ck_fifo_mpmc` are past `x`, and that they matter only for the values of
+their later writes, which feed the rounds. An unsound experiment showed
+what cutting them off is worth: with the states past `x` dropped, and reads
+of later writes with unknown values left out, `ck_fifo_mpmc` reached the
+ceiling of step 0 (3,811 memories in 27 s, and 2,821 in 17 s with
+`-DFENCE_DEQ`).
+
+`Explorer::observe_cut` makes that sound. Each thread is run once, not in
+rounds, and:
+
+- **Unknown values are poisoned.** A read of a later write whose values
+  the analysis does not know (a widened counter) returns a poisoned value
+  (`TState::poison`, one bit per register). For a read in pieces, such as
+  the 16-byte read of a (pointer, generation) pair, only the registers
+  that get bytes of unknown pieces are poisoned; the other pieces take the
+  analysis's values as before.
+- **States past `x` are cut off.** They can no longer make an access with
+  pre-view `ts(x)` (see `Solo::past`), so what they would record is only
+  their reads that take bytes from `x`. On the first cut, every read
+  footprint the analysis found for the thread that overlaps `x` is
+  recorded instead. Their writes need no values, as no round follows.
+- **Poison is tracked until then.** Before a run gets past `x`, an
+  instruction that reads a poisoned register is executed abstractly: an
+  integer operation poisons what it writes; a conditional branch, select
+  or compare on poisoned flags is run with each of the 16 flag values, and
+  `CBZ` or `TBZ` on a poisoned register with zero and with all ones,
+  which between them take every way it can go; a store of a poisoned
+  value to shared memory makes a poisoned write. A later read of that write
+  is poisoned, and the write may fulfill any promise with its footprint
+  (whatever the promise's value). Anything else (a poisoned address,
+  an atomic, a SIMD&FP register, a store to private memory) voids the
+  cut, and the memory falls back to the rounds.
+
+This allows at least every run the rounds would (each poisoned value
+stands for any value), so it is sound in the same way. In `ck_fifo_mpmc`
+a read of a later write is mostly followed by a load fence, which puts
+the run past `x` at once; elsewhere, the poisoned generation is compared
+by a compare-and-swap, or stored into a node by an enqueue. No cut on
+that test falls back to the rounds (4 of its 6,435 give up at the
+budget), and with `-DFENCE_DEQ -DOLD_ENQ` (the enqueue from before ck
+`ed6bace`) the search shows the condition unreachable too, in 4,934
+memories and 76 s.
+
+Each cut gets the budget of the observation it replaces, but at least
+20,000 states. On the shallow memories of `ck_fifo_mpmc` it takes up to
+about 7,000 states, more than ten times their `Collect` runs; with a
+floor of 10,000, 50 memories of that test gave up and it took twice as
+long, while with no limit (200,000) ck's `LOCK=7` spinlock tests took 3
+to 5 s more, their cuts giving up only at the limit.
+
+Results (clang 21, November 2026), with the static reduction alone and
+with the dynamic one:
+
+| test | static reduction | dynamic reduction |
+|---|---|---|
+| `ck_fifo_mpmc -O2` | does not finish in 20 minutes | 6,752 memories, 58 s |
+| `ck_fifo_mpmc -O2 -DFENCE_DEQ` | does not finish in 20 minutes | 4,894, 35 s |
+| the 268 exhaustive lines of `c/expected.txt` | 422,677, 320 s | 119,710, 91 s |
+
+Across the C programs, run one at a time, every line reached the same
+final states. The largest gains are in moodycamel's ReaderWriterQueue
+(`rwq_dequeue -O0 -DOLD`, from 56,820 memories in 99 s to 1,737 in 6.5 s,
+and `rwq_size -DOLD` from 31,050 in 12 s to 288 in 0.2 s); the largest
+losses are `ck_epoch_poll3 -O2` (2.2 s to 4.6 s, and 3.2 s to 5.8 s with
+`-DOLD_POLL`). 22 lines are faster by more than 0.2 s and 5 slower.
+`tests/por.rs` has a test of a generation counter that takes every
+abstract path above (`generation_counter`), and the random tests (20,000
+small and the 1,200 large) give the same final states as the full search.
+
 ## Plan
 
 0. **Measure the ceiling first.** As a throwaway experiment, use the
@@ -398,8 +473,8 @@ but across the suite it does not pay either, and it stays an option.
 4. Measure `ck_fifo_mpmc` (exhaustive, and with `-DFENCE_DEQ`, whose fix
    the sampled tests only suggest), the relaxed Treiber stack and the
    `ck_fifo_spsc -DWEAK_ENQ` test. If it is a win, make it the default
-   and document it in the README's "How it works". (Measured across
-   the C programs, it is not yet; see "Across the C programs" above.)
+   and document it in the README's "How it works". (Done, with the cut:
+   see [The cut](#the-cut).)
 
 ## Open questions
 
@@ -417,6 +492,10 @@ but across the suite it does not pay either, and it stays an option.
   have litmus tests for each.
 - Spin loops on future values: the pre-pass widens counters to
   unknown, and the observing exploration should do the same, or give up.
+  (Done for the cut, which poisons them; the rounds give up after 3.)
+- Private memory cannot hold a poisoned value, so a cut whose thread
+  stores one there (a local spilled at `-O0`, say) falls back to the
+  rounds. Poisoned bytes in `Stack` would cover it.
 
 ## Alternatives considered
 

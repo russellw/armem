@@ -316,6 +316,11 @@ impl Reduction {
         })
     }
 
+    /// The footprints of thread `tid`'s reads that overlap `x`.
+    pub fn reads_overlapping(&self, tid: usize, x: &Msg) -> Footprints {
+        self.reads[tid].iter().filter(|&&(a, n)| a < x.addr + x.size.bytes() && x.addr < a + n).copied().collect()
+    }
+
     /// Whether `prunable_after` might prune `.., x, y` where `prunable`
     /// does not (so whether `Observed` is worth finding).
     pub fn may_prune_after(&self, x: &Msg, y: &Msg) -> bool {

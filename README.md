@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
 ./target/release/armem --no-live FILE              # without register liveness
-./target/release/armem --dynamic-por FILE          # also prune per memory (experimental)
+./target/release/armem --no-dynamic-por FILE       # without pruning per memory
 ./target/release/armem --no-filter FILE            # certify every candidate promise
 ./target/release/armem --check-filter FILE         # ... and check the filter's verdicts
 cargo test --release                               # check the litmus suite
@@ -723,9 +723,11 @@ dependency), but nothing orders the first thread's read of the value
 before its write of the head. x86 cannot do this, since its
 compare-and-swap is a full barrier. `-DFENCE_DEQ` adds
 `ck_pr_fence_load_store()` (`DMB SY`) between the read and the
-compare-and-swap, and then 20 sampled paths no longer reach the
-condition; exhaustive search did not finish in 20 minutes, so that is
-evidence for the fix, not proof. `ck_fifo_mpmc_trydequeue` reads the
+compare-and-swap, and then the exhaustive search shows the condition
+unreachable (4,894 memories in 35 s at `-O2`, with the dynamic reduction
+of [docs/dynamic-reduction.md](docs/dynamic-reduction.md); without it,
+the search did not finish in 20 minutes). As written, the exhaustive
+search finds the bug in 6,752 memories and 58 s. `ck_fifo_mpmc_trydequeue` reads the
 value the same way. The bug needs a node to be re-used while another
 thread may still read it, which ck's own test does on purpose. It is
 reported as
@@ -739,7 +741,8 @@ receives nothing even under SC: that bug is not about the memory
 model. `-DOLD_ENQ` uses the enqueue from before `ed6bace` (September
 2026), which started a node's generation at 0 and had no load fence
 before re-checking the tail's generation; with `-DFENCE_DEQ -DOLD_ENQ`,
-20 sampled paths did not reach the condition. The sampled tests take
+the exhaustive search shows the condition unreachable too (4,934
+memories in 76 s at `-O2`). The sampled tests take
 5 to 7 s at `-O1` to `-O2` (and the same verdict at `-Os`), and TSO
 about 2 s; at `-O0`, 20 sampled paths take over 10 minutes.
 
@@ -1403,6 +1406,33 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   both sides of itself for the first rule. Counting it only before itself
   lost final states in a random test, where the write of a `SWPAL` must
   come before the thread's later store.)
+* **Dynamic reduction** (on by default; `--no-dynamic-por` turns it off;
+  see [docs/dynamic-reduction.md](docs/dynamic-reduction.md)). Where the
+  pre-pass cannot rule out that some thread orders the last two writes
+  of a memory, armem asks the memory itself. For a memory ending in
+  write `x`, it runs each thread alone against it. A read may return a
+  later write by another thread, with any value the pre-pass allows and a
+  timestamp above every message. Runs with a promise they can no longer
+  fulfill are dropped. In Promising-ARM an access ordered after `x` has a
+  pre-view of at least `ts(x)`, and one that could order `x` before the
+  next write `y` has exactly `ts(x)`, so the runs record the reads and
+  writes they make with that pre-view. If no thread reads `y`'s location
+  that way, and `y`'s writer does not write it so, `x` is ordered before
+  `y` in no execution that extends the memory, and the memory with them
+  out of priority order is skipped. Deep in the search each thread's
+  promises pin down which path it took, so this prunes far more than
+  the thread-wide footprints. A run is cut off once it is past `x` (every
+  later access has a larger pre-view); until then, a value read from a
+  later write that the pre-pass does not know (a counter it widened) is
+  poisoned: computing with it poisons the result, a branch on it goes
+  both ways, and storing it makes a poisoned write. A run that needs a
+  poisoned value for anything else (an address, say) makes the memory
+  fall back to running the threads in rounds, in which reads of later
+  writes return the values the other threads wrote in the round before,
+  until no round adds one. A memory whose runs grow too large is pruned
+  by the static reduction alone. `tests/por.rs` checks this reduction
+  too. It took `ck_fifo_mpmc` with `-DFENCE_DEQ` from not finishing in 20
+  minutes to 35 s, and the C programs from 320 s to 91 s.
 * **Register liveness** (on by default; `--no-live` turns it off,
   `src/live.rs`). Compiled code leaves values in registers it no longer
   needs: the comparison results of a retry loop, a value loaded only to be
@@ -1611,16 +1641,16 @@ lets a lone `LDXP` be torn.
   which orders some execution observes needs a reduction that knows
   which writes the threads read, not only where they may read; see
   [docs/dynamic-reduction.md](docs/dynamic-reduction.md). That reduction
-  is implemented as `--dynamic-por`; it takes the relaxed Treiber stack
-  from 7,824 memories to 677 and `ck_fifo_spsc -DWEAK_ENQ` from 63,314
-  to 1,297, but on this test it still does not finish: on memories with
-  few messages, a thread's run against the memory exceeds its state
-  limit, and those memories fall back to the static reduction. It is
-  not the default: across the C programs it reaches the same final
-  states with 13% fewer memories, but takes 90 s rather than 86 s, since
-  running the threads against each memory can cost more than the
-  memories it prunes. (It gives up on a memory, and on the memories that
-  extend it, when those runs grow too large, as in ck's spinlocks.)
+  is the default (`--no-dynamic-por` turns it off). It runs each thread
+  against each memory, with later writes by other threads read as any
+  value the pre-pass allows, and records which accesses some run orders
+  after the memory's last write. Runs that get past that write are cut
+  off, and a widened counter's value is tracked as unknown until then. It
+  takes this test to 6,752 memories (58 s), and with `-DFENCE_DEQ` to
+  4,894 (35 s); across the C programs, from 422,677 memories in 320 s to
+  119,710 in 91 s, with the same final states. Where its runs grow too
+  large (as in ck's spinlocks) it gives up on the memory, which is then
+  pruned by the static reduction alone.
 * The TSO reference cannot tell a seq_cst store from a release store,
   since both compile to `STLR` on ARM, so it runs every `STLR` as an
   ordinary x86 store. x86 compilers make a seq_cst store an `XCHG`, a
@@ -1682,12 +1712,12 @@ lets a lone `LDXP` be torn.
    multi-producer FIFO from 39,421 memories in 232 s to 1,221 in 4.4 s),
    and certifying only the promises the thread's own exploration shows
    can certify (that FIFO's full test from 30 memories a second to 300);
-   next come a reduction that uses what each execution reads, which that
-   test needs (see [docs/dynamic-reduction.md](docs/dynamic-reduction.md);
-   `--dynamic-por` is a first version, which costs little where it does
-   not help but needs to prune more before it can be the default),
-   and guiding the sampling
-   towards reads that disagree with what TSO would return.
+   and a reduction that uses what the threads may do after each memory,
+   which that test needed (`ck_fifo_mpmc` with `-DFENCE_DEQ` from not
+   finishing in 20 minutes to 35 s, and the C programs from 320 s to
+   91 s; see [docs/dynamic-reduction.md](docs/dynamic-reduction.md));
+   next comes guiding the sampling towards reads that disagree with
+   what TSO would return.
 4. System-level emulation: exception levels, MMU/page tables, timers and
    interrupt controller, basic devices (UART, virtio), with the memory
    model applied to normal memory. Goal: boot Linux on a multi-core

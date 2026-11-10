@@ -294,6 +294,54 @@ fn reduction_prunes() {
     }
 }
 
+/// Two threads each increment a generation counter with a load- and
+/// store-exclusive loop, write their own data, re-read the counter and, if
+/// it is unchanged, read the other's data and store the counter they read.
+/// The analysis widens the counter to any value, so the observing
+/// explorations of the dynamic reduction poison what they read of it from
+/// later writes, then compute with it, branch on it (by `CBZ` and by its
+/// flags) and store it to shared memory (see `Explorer::observe_cut` in
+/// `promising.rs`). `fence` puts `DMB LD` after the re-read, which gets a
+/// read of a later write past `x` at once; `pair` makes the counter a
+/// (pointer, generation) pair, as in ck's FIFO.
+fn generation_test(fence: bool, pair: bool) -> String {
+    let init = "0:X9=g; 1:X9=g; 0:X10=a; 1:X10=b; 0:X11=b; 1:X11=a; 0:X12=s; 1:X12=s; uint64_t g[2]";
+    let (load, store) = if pair {
+        ("LDXP X1,X6,[X9]", "STXP W3,X1,X2,[X9]")
+    } else {
+        ("LDXR X1,[X9]", "STXR W3,X2,[X9]")
+    };
+    let reread = if pair { "LDR X4,[X9,#8]" } else { "LDR X4,[X9]" };
+    let counter = if pair { "X6" } else { "X1" };
+    let mut p = vec!["MOV W0,#1".to_string(), "loop:".into(), load.into(), format!("ADD X2,{},#1", counter), store.into(), "CBNZ W3,loop".into()];
+    p.extend(["STR W0,[X10]".to_string(), reread.into()]);
+    if fence {
+        p.push("DMB LD".into());
+    }
+    p.extend(["CBZ X4,end".to_string(), "CMP X4,X2".into(), "B.NE end".into(), "LDR W5,[X11]".into(), "STR X4,[X12]".into(), "end:".into()]);
+    let mut src = format!("AArch64 generation{}{}\n{{ {}; }}\n P0 | P1 ;\n", if fence { "+dmb.ld" } else { "" }, if pair { "-pair" } else { "" }, init);
+    for i in &p {
+        src.push_str(&format!(" {} | {} ;\n", i, i));
+    }
+    src.push_str("locations [0:X5; 1:X5; s]\n");
+    src
+}
+
+/// The dynamic reduction with a counter it poisons gives the same final
+/// states as the full search.
+#[test]
+fn generation_counter() {
+    for fence in [false, true] {
+        for pair in [false, true] {
+            let src = generation_test(fence, pair);
+            let t = litmus::parse(&src).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+            for lse2 in [false, true] {
+                check(&t, &src, lse2);
+            }
+        }
+    }
+}
+
 /// The ways `publication_test` publishes its data.
 #[derive(Clone, Copy, Debug)]
 enum Publish {

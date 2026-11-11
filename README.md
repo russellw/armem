@@ -1345,6 +1345,58 @@ multiply the memories, so `erts_tse_set` keeps only the barriers of its
 exchange. No thread reads the event word, since the modeled waits return
 at once.
 
+### folly
+
+`c/folly/include` holds folly's `FlatCombining.h` and
+`SaturatingSemaphore.h`, unchanged from folly commit `4a2f75a` (November
+2026; Apache License 2.0, see `c/folly/LICENSE`). `c/folly/old` holds
+`FlatCombining.h` from before commit `6d16b1d`. `c/folly/stub` holds
+freestanding stand-ins for the standard headers and the rest of folly
+that they include, and `-Dthrow=` lets the throws the test never reaches
+compile without exceptions. `std::thread` discards its function, and the
+test runs the dedicated combiner's loop as a thread of its own. A futex
+wait that would sleep, on a folly semaphore or on glibc's mutex, ends
+the thread, as in [QEMU](#qemu).
+
+A flat combiner's dedicated thread sleeps on the semaphore `pending_`
+until a requester posts it. It then resets `pending_` (a relaxed store),
+loads `shutdown_`, takes the lock `m_`, scans the records for valid
+requests and applies them, and waits again. A requester marks its record
+valid and posts `pending_`; a new record is then linked into the list
+and `pending_` posted again. A post that finds `pending_` already set
+writes nothing: it fences, reloads `pending_`, and returns if that is
+still set.
+
+In `folly_fc.cpp`, setup posts `pending_`, as an earlier requester
+would. `t0` runs the combiner, and `t1` makes one asynchronous request
+on a new record. The condition is a lost wakeup: the combiner sleeps, no
+post wakes it, and the request is never applied. With `-DSHUTDOWN`, `t1`
+instead shuts the combiner down, which stores `shutdown_` and posts
+`pending_`; the condition is then that the combiner sleeps for good, so
+that its destructor's `join()` would hang.
+
+Commit `6d16b1d` (October 2026, "fix lost FlatCombining notifications")
+added a `seq_cst` fence after the combiner resets `pending_`. Its message
+says that without it, `FCPriQueue.pushPop` hung in 17 of 200 runs on
+aarch64, and that shutdown could hang on x86 too. With the file from
+before it (`-DOLD`), armem finds both. A requester's second post finds
+`pending_` still set from the first, since the combiner's reset is not
+yet visible, and only fences and reloads it. The combiner's reset is a
+plain `STR`, and the `LDAR` of `shutdown_` and the acquire
+compare-and-swap of `m_` after it don't order it before the `LDAR` of the
+list head, which can still be empty. On x86, the lock's compare-and-swap
+is a full barrier, so the lost request is ARM-only. Nothing like it
+comes between the reset and the load of `shutdown_`, so a lost shutdown
+can happen under TSO too. With the fence, neither condition is
+reachable.
+
+The request test holds at `-O1`, `-O2` and `-Os` with LSE, in 20 to 60 s
+for the current code and 50 to 110 s for the old (`fuel=300`, or 400 at
+`-Os`). With `LDXR`/`STXR` loops the ARM search runs out of fuel, but
+1,000 sampled paths at PCT depth 3 find the old code's bug at `-O2`. The
+shutdown test holds at `-O0` to `-O2` and `-Os`, and with LSE at `-O2`,
+in 2 to 8 s.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1956,7 +2008,10 @@ lets a lone `LDXP` be torn.
    element by address (see [atomic_queue](#atomic_queue)), and in Erlang's
 process locks the ARM-only bug that its commit `46ff98a5d5` fixed in
 February 2026, and an ARM-only stale read in a lock handover that the
-current code still allows (see [Erlang](#erlang)). In the Chase–Lev
+current code still allows (see [Erlang](#erlang)), and in folly's
+FlatCombining the lost wakeups that its commit `6d16b1d` fixed in
+October 2026, the lost request on ARM only (see [folly](#folly)). In the
+Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

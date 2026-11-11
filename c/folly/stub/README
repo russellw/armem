@@ -1,0 +1,27 @@
+Freestanding stand-ins for the C++ standard headers and the folly headers
+outside FlatCombining.h and SaturatingSemaphore.h that those two include:
+only what they use, as an aarch64 Linux build with clang, libstdc++ and
+glibc compiles it.
+
+- <atomic> is built on clang's __atomic builtins, as libstdc++'s is.
+- std::mutex is glibc's normal mutex: locking is an acquire
+  compare-and-swap of 0 to 1, and if that fails, an acquire exchange of 2
+  and a futex wait; unlocking is a release exchange with 0. A futex wait
+  that would sleep records folly_test_mutex_blocked and ends the thread,
+  as a wait on a folly futex does (below). Retrying instead made the
+  combiner spin on the lock while the requester held it, and the search
+  too big to finish.
+- std::thread discards its function: the test runs the dedicated
+  combiner's loop as a thread of its own.
+- folly::IndexedMemPool is a fixed array of records, constructed when
+  first allocated. The tests allocate their records in setup, before the
+  threads start, so the pool's own synchronization plays no part.
+- folly::Function stores the callable inline.
+- The futex (folly/detail/Futex.h, folly/detail/MemoryIdler.h): a wake
+  records folly_test_woken. A wait whose futex still holds the expected
+  value would sleep: it records folly_test_blocked and ends the thread by
+  branching to folly_test_exit, the address the test's thread function
+  returns to. Otherwise it returns at once, as the futex system call does.
+- Spinning (folly/synchronization/detail/Spin.h) tests the condition once.
+- hardware_destructive_interference_size is 128, folly's value on aarch64
+  when the standard library gives none.

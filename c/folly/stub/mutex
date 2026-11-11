@@ -1,0 +1,60 @@
+// Stand-in for <mutex>. std::mutex is glibc's normal pthread mutex
+// (lll_lock and lll_unlock): locking is an acquire compare-and-swap of 0
+// to 1, and if that fails, an acquire exchange of 2 and a futex wait
+// while the old value is not 0; unlocking is a release exchange with 0,
+// and a futex wake if the old value was 2. A futex wait that would sleep
+// records folly_test_mutex_blocked and ends the thread, as a wait on a
+// folly futex does (see folly/detail/MemoryIdler.h); the wake is not
+// modeled.
+#ifndef STUB_MUTEX
+#define STUB_MUTEX
+extern "C" unsigned long folly_test_mutex_blocked;
+extern "C" void* folly_test_exit;
+namespace std {
+struct mutex {
+	int f = 0;
+	constexpr mutex() noexcept = default;
+	mutex(const mutex&) = delete;
+	mutex& operator=(const mutex&) = delete;
+	bool try_lock() noexcept {
+		int e = 0;
+		return __atomic_compare_exchange_n(&f, &e, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+	}
+	void lock() noexcept {
+		if (try_lock())
+			return;
+		while (__atomic_exchange_n(&f, 2, __ATOMIC_ACQUIRE) != 0) {
+			if (__atomic_load_n(&f, __ATOMIC_RELAXED) == 2) {
+				__atomic_store_n(&folly_test_mutex_blocked, 1, __ATOMIC_RELAXED);
+				asm volatile("br %0" :: "r"(folly_test_exit));
+				__builtin_unreachable();
+			}
+		}
+	}
+	void unlock() noexcept { (void) __atomic_exchange_n(&f, 0, __ATOMIC_RELEASE); }
+};
+struct defer_lock_t { explicit defer_lock_t() = default; };
+inline constexpr defer_lock_t defer_lock{};
+template<typename M> struct lock_guard {
+	M& m;
+	explicit lock_guard(M& m) : m(m) { m.lock(); }
+	~lock_guard() { m.unlock(); }
+	lock_guard(const lock_guard&) = delete;
+};
+template<typename M> lock_guard(M&) -> lock_guard<M>;
+template<typename M> struct unique_lock {
+	M* m = nullptr;
+	bool owns = false;
+	unique_lock() noexcept = default;
+	explicit unique_lock(M& m) : m(&m), owns(true) { m.lock(); }
+	unique_lock(M& m, defer_lock_t) noexcept : m(&m) {}
+	~unique_lock() { if (owns) m->unlock(); }
+	unique_lock(const unique_lock&) = delete;
+	bool try_lock() { return owns = m->try_lock(); }
+	void lock() { m->lock(); owns = true; }
+	void unlock() { m->unlock(); owns = false; }
+};
+template<typename M> unique_lock(M&) -> unique_lock<M>;
+template<typename M> unique_lock(M&, defer_lock_t) -> unique_lock<M>;
+}
+#endif

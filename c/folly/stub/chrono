@@ -1,0 +1,20 @@
+// Stand-in for <chrono>: deadlines are only passed along here.
+#ifndef STUB_CHRONO
+#define STUB_CHRONO
+#include <cstdint>
+namespace std::chrono {
+template<typename Rep, typename Period = void> struct duration { Rep r; };
+using nanoseconds = duration<int64_t>;
+using microseconds = duration<int64_t, int>;
+template<typename Clock, typename Duration = typename Clock::duration> struct time_point {
+	Duration d;
+	static constexpr time_point max() noexcept { return {{INT64_MAX}}; }
+	friend constexpr bool operator!=(time_point a, time_point b) noexcept { return a.d.r != b.d.r; }
+};
+struct steady_clock {
+	using duration = nanoseconds;
+	using time_point = std::chrono::time_point<steady_clock>;
+	static time_point now() noexcept { return {{0}}; }
+};
+}
+#endif

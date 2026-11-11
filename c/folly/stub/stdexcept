@@ -1,0 +1,8 @@
+// Stand-in for <stdexcept>. The tests compile with -Dthrow= so that the
+// throws they never reach compile without exceptions.
+#ifndef STUB_STDEXCEPT
+#define STUB_STDEXCEPT
+namespace std {
+struct runtime_error { explicit runtime_error(const char*) noexcept {} };
+}
+#endif

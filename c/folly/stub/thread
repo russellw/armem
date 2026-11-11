@@ -1,0 +1,14 @@
+// Stand-in for <thread>: a thread discards its function, since the test
+// runs the dedicated combiner's loop as one of its own threads.
+#ifndef STUB_THREAD
+#define STUB_THREAD
+namespace std {
+struct thread {
+	thread() noexcept = default;
+	template<typename F> explicit thread(F&&) noexcept {}
+	thread(thread&&) noexcept = default;
+	thread& operator=(thread&&) noexcept { return *this; }
+	void join() {}
+};
+}
+#endif

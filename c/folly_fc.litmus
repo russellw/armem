@@ -1,0 +1,5 @@
+AArch64 folly_fc
+"A dedicated flat combiner does not sleep with work to do and no post to wake it"
+{ setup(); uint64_t folly_test_blocked; uint64_t folly_test_woken; int applied; }
+ P0 = t0 | P1 = t1 ;
+exists (folly_test_blocked=1 /\ folly_test_woken=0 /\ applied=0)

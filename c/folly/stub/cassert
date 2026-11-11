@@ -1,0 +1,9 @@
+// Stand-in for <cassert>.
+#ifndef STUB_CASSERT
+#define STUB_CASSERT
+#ifdef NDEBUG
+#define assert(e) ((void) 0)
+#else
+#define assert(e) ((e) ? (void) 0 : __builtin_trap())
+#endif
+#endif

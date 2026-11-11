@@ -103,12 +103,15 @@ pub struct Outcomes {
     /// The search stopped at `Options::max_memories`, so the set may be
     /// incomplete.
     pub over_budget: bool,
+    /// Some run would have failed a store-exclusive spuriously more often
+    /// than `Options::spurious` allows, so the set may be incomplete.
+    pub capped: bool,
     pub stats: Stats,
 }
 
 impl Outcomes {
     pub fn new(obs: Vec<Obs>) -> Outcomes {
-        Outcomes { obs, states: BTreeMap::new(), truncated: false, faults: BTreeSet::new(), sampled: false, over_budget: false, stats: Stats::default() }
+        Outcomes { obs, states: BTreeMap::new(), truncated: false, faults: BTreeSet::new(), sampled: false, over_budget: false, capped: false, stats: Stats::default() }
     }
 
     pub fn insert(&mut self, state: Vec<u64>) {

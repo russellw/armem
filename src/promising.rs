@@ -133,6 +133,9 @@ struct TState {
     /// one). Instructions that read them are executed abstractly
     /// (`Abstract`).
     poison: crate::live::Mask,
+    /// Store-exclusives that failed although they could have succeeded
+    /// (counted only with `Options::spurious`).
+    spurious: u32,
 }
 
 impl TState {
@@ -154,6 +157,7 @@ impl TState {
             promises: BTreeSet::new(),
             speculative: false,
             poison: 0,
+            spurious: 0,
         }
     }
 
@@ -286,6 +290,9 @@ struct Solo<'a> {
     base: Vec<Msg>,
     fuel: u32,
     lse2: bool,
+    /// See `Options::spurious`, and whether a run reached that limit.
+    spurious: Option<u32>,
+    capped: std::cell::Cell<bool>,
     mode: Mode,
     /// Visited states (with the step counter zeroed, and dead registers
     /// cleared if `live` is given) -> fewest steps seen.
@@ -464,6 +471,8 @@ impl<'a> Solo<'a> {
             base,
             fuel: cfg.fuel,
             lse2: cfg.lse2,
+            spurious: cfg.spurious,
+            capped: Default::default(),
             mode,
             visited: FxHashMap::default(),
             candidates: BTreeSet::new(),
@@ -1179,8 +1188,11 @@ impl<'a> Solo<'a> {
                 let mut f = base.clone();
                 f.xcl = None;
                 f.core.set(rs, status(false));
-                out.push(f);
-                if st.xcl.as_ref().is_some_and(|m| m.addr == addr.val && m.size == total) {
+                let can_succeed = st.xcl.as_ref().is_some_and(|m| m.addr == addr.val && m.size == total);
+                if let Some(f) = self.store_excl_fails(f, can_succeed) {
+                    out.push(f);
+                }
+                if can_succeed {
                     let mut s = base;
                     let w = s.core.private_store(addr, total, val, data);
                     placed(&mut s, w);
@@ -1296,7 +1308,7 @@ impl<'a> Solo<'a> {
                 f.xcl = None;
                 f.core.set(rs, status(false));
                 f.core.retire(prog);
-                out.push((f, ext.to_vec()));
+                let mut succeeded = Vec::new();
                 if let Some(m) = &st.xcl {
                     if m.addr == addr.val && m.size == total {
                         let srcs = m.srcs.clone();
@@ -1307,10 +1319,14 @@ impl<'a> Solo<'a> {
                             s.xcl = None;
                             s.core.set(rs, status(true));
                             s.core.retire(prog);
-                            out.push((s, e));
+                            succeeded.push((s, e));
                         }
                     }
                 }
+                if let Some(f) = self.store_excl_fails(f, !succeeded.is_empty()) {
+                    out.push((f, ext.to_vec()));
+                }
+                out.extend(succeeded);
             }
             MemOp::LoadPair { addr, rt, rt2, size, signed } => {
                 let total = size.double();
@@ -1418,7 +1434,7 @@ impl<'a> Solo<'a> {
                 f.xcl = None;
                 f.core.set(rs, status(false));
                 f.core.retire(prog);
-                out.push((f, ext.to_vec()));
+                let mut succeeded = Vec::new();
                 if let Some(m) = &st.xcl {
                     if m.addr == addr.val && m.size == size {
                         let srcs = m.srcs.clone();
@@ -1428,10 +1444,14 @@ impl<'a> Solo<'a> {
                             s.xcl = None;
                             s.core.set(rs, status(true));
                             s.core.retire(prog);
-                            out.push((s, e));
+                            succeeded.push((s, e));
                         }
                     }
                 }
+                if let Some(f) = self.store_excl_fails(f, !succeeded.is_empty()) {
+                    out.push((f, ext.to_vec()));
+                }
+                out.extend(succeeded);
             }
             MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release, noret } => {
                 let load = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
@@ -1523,6 +1543,20 @@ impl<'a> Solo<'a> {
     /// (An acquiring one would only lead the run on to no purpose: in a
     /// retry loop, such as `qemu_event_wait` in `c/qemu_event.c`, round
     /// and round until the fuel runs out.)
+    /// The state `f` after a store-exclusive fails, unless the failure is
+    /// spurious (`can_succeed`) and the run has already failed as often as
+    /// `Options::spurious` allows.
+    fn store_excl_fails(&self, mut f: TState, can_succeed: bool) -> Option<TState> {
+        if let (Some(limit), true) = (self.spurious, can_succeed) {
+            if f.spurious >= limit {
+                self.capped.set(true);
+                return None;
+            }
+            f.spurious += 1;
+        }
+        Some(f)
+    }
+
     fn cas_fails_later(&self, st: &TState, addr: RV, size: Size, kind: ReadKind) -> Option<TState> {
         let (a, n) = (addr.val, size.bytes());
         let others = match &self.reduction {
@@ -1954,6 +1988,7 @@ impl<'a> Explorer<'a> {
             let cands = std::mem::take(&mut c.candidates);
             promising.push(cands.iter().map(|x| !self.cfg.filter || c.promising(x)).collect::<Vec<_>>());
             self.results.truncated |= c.truncated;
+            self.results.capped |= c.capped.get();
             faults.push(std::mem::take(&mut c.faults));
             fulfills.push(c.fulfills);
             per_thread.push(std::mem::take(&mut c.finals));
@@ -2024,6 +2059,7 @@ impl<'a> Explorer<'a> {
                     out.push(m2);
                 } else {
                     self.results.truncated |= cert.truncated;
+                    self.results.capped |= cert.capped.get();
                 }
             }
         }

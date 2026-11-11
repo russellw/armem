@@ -8,7 +8,10 @@
 //! `sample=N` among the flags runs the ARM model on N random paths instead
 //! of exhaustively, for variants too big to explore; it may only confirm
 //! that the condition is reachable, as sampling may miss states. A
-//! `fuel=N` gives the threads N instructions each rather than `FUEL`. The test
+//! `fuel=N` gives the threads N instructions each rather than `FUEL`. A
+//! `spurious=N` lets each run of a thread fail a store-exclusive that could
+//! succeed at most N times (`Options::spurious`), so a `no` holds only up
+//! to that bound. The test
 //! is skipped (with a message) when clang is not installed.
 //!
 //! A program is `c/NAME.c`, or `c/NAME.cpp` for C++. One whose first line
@@ -29,6 +32,7 @@ struct Expectation {
     cflags: Vec<String>,
     sample: Option<u64>,
     fuel: u32,
+    spurious: Option<u32>,
     arm: Verdict,
     tso: Verdict,
 }
@@ -62,18 +66,21 @@ fn expectations() -> Vec<Expectation> {
             let mut cflags = vec![f[1].to_string()];
             let mut sample = None;
             let mut fuel = FUEL;
+            let mut spurious = None;
             for s in &f[4..] {
                 if let Some(n) = s.strip_prefix("sample=") {
                     sample = Some(n.parse().unwrap());
                 } else if let Some(n) = s.strip_prefix("fuel=") {
                     fuel = n.parse().unwrap();
+                } else if let Some(n) = s.strip_prefix("spurious=") {
+                    spurious = Some(n.parse().unwrap());
                 } else {
                     cflags.push(s.to_string());
                 }
             }
             let arm = verdict(f[2]);
             assert!(arm != Verdict::No || sample.is_none(), "expected.txt: sampling cannot show that a condition is unreachable: {}", l);
-            Expectation { line: l.to_string(), program: f[0].to_string(), cflags, sample, fuel, arm, tso: verdict(f[3]) }
+            Expectation { line: l.to_string(), program: f[0].to_string(), cflags, sample, fuel, spurious, arm, tso: verdict(f[3]) }
         })
         .collect()
 }
@@ -131,7 +138,7 @@ fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let preload = Image::load(&Elf::parse(&data).unwrap(), &LoadOptions::default()).and_then(|i| i.preload()).unwrap();
     let src = std::fs::read_to_string(dir.join(format!("{}.litmus", e.program))).unwrap();
     let test = litmus::parse_with(&src, &preload).unwrap();
-    let opts = Options { fuel: e.fuel, check_filter: true, ..Default::default() };
+    let opts = Options { fuel: e.fuel, spurious: e.spurious, check_filter: true, ..Default::default() };
     let mut errors = Vec::new();
     for (model, want) in [(Model::Arm, e.arm), (Model::Tso, e.tso)] {
         let sampled = Options { sample: e.sample, ..opts };

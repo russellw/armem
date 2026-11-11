@@ -21,6 +21,10 @@ options:
       --seed N       random seed for --sample (default: 0)
       --pct-depth N  in each path, how many times --sample switches the
                      thread whose writes come first (default: 1)
+      --spurious N   in the ARM model, let each run of a thread fail a
+                     store-exclusive that could succeed at most N times
+                     (default: without limit; may miss outcomes, for a
+                     retry loop that writes on every pass)
       --max-memories N
                      stop the ARM search after N promise memories (the
                      report warns that other final states may be possible)
@@ -71,8 +75,15 @@ fn main() -> ExitCode {
             "--no-live" => opts.live = false,
             "--no-filter" => opts.filter = false,
             "--check-filter" => opts.check_filter = true,
-            "--sample" | "--seed" | "--pct-depth" | "--max-memories" => match args.next().and_then(|v| v.parse().ok()) {
+            "--sample" | "--seed" | "--pct-depth" | "--max-memories" | "--spurious" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) if a == "--sample" => opts.sample = Some(n),
+                Some(n) if a == "--spurious" => match u32::try_from(n) {
+                    Ok(n) => opts.spurious = Some(n),
+                    Err(_) => {
+                        eprintln!("--spurious is too large");
+                        return ExitCode::from(2);
+                    }
+                },
                 Some(n) if a == "--max-memories" => opts.max_memories = Some(n),
                 Some(n) if a == "--pct-depth" => opts.pct_depth = n,
                 Some(n) => opts.seed = n,

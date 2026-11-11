@@ -69,6 +69,9 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
         if o.sampled {
             writeln!(s, "WARNING: only sampled executions were explored; other final states may be possible").unwrap();
         }
+        if o.capped {
+            writeln!(s, "WARNING: some runs reached the limit on spurious store-exclusive failures; other final states may be possible").unwrap();
+        }
         if o.stats.states > 0 {
             writeln!(s, "Explored {} states", o.stats.states).unwrap();
         }
@@ -115,6 +118,9 @@ pub fn summary(test: &Test, results: &[(Model, Outcomes)]) -> String {
         }
         if o.sampled {
             s.push_str("(sampled)");
+        }
+        if o.capped {
+            s.push_str("(capped)");
         }
         if !o.faults.is_empty() {
             s.push_str("(fault)");

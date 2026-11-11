@@ -101,3 +101,41 @@ fn deterministic() {
         assert_eq!(a.states, b.states);
     }
 }
+
+/// P0 writes y on every pass of an LDXR/STXR loop. Since a store-exclusive
+/// may always fail, each failure adds a write, no state repeats, and the
+/// search runs out of fuel. With `Options::spurious`, the runs stop
+/// failing where the store could succeed, the search completes and says it
+/// was capped, and it finds a subset of the final states: those of runs
+/// with at most that many such failures.
+#[test]
+fn spurious_cap() {
+    let t = litmus::parse(
+        "AArch64 LLSC-write-loop
+{ 0:X1=x; 0:X4=y; 1:X4=y; }
+ P0              | P1          ;
+ MOV W3,#1       | LDR W5,[X4] ;
+ L0:             | LDR W6,[X4] ;
+ STR W3,[X4]     |             ;
+ LDXR W0,[X1]    |             ;
+ ADD W0,W0,#1    |             ;
+ STXR W2,W0,[X1] |             ;
+ CBNZ W2,L0      |             ;
+locations [x; 1:X5; 1:X6]
+",
+    )
+    .unwrap();
+    let opts = |spurious| armem::Options { fuel: 60, spurious, check_filter: true, ..Default::default() };
+    let free = run(&t, Model::Arm, &opts(None));
+    assert!(free.truncated && !free.capped);
+    let mut last = None;
+    for n in [0, 1, 2] {
+        let capped = run(&t, Model::Arm, &opts(Some(n)));
+        assert!(!capped.truncated && capped.capped, "spurious={}", n);
+        assert!(capped.states.keys().all(|s| free.states.contains_key(s)), "spurious={}", n);
+        if let Some(prev) = last.replace(capped.states.keys().cloned().collect::<Vec<_>>()) {
+            assert!(prev.iter().all(|s| capped.states.contains_key(s)), "spurious={}", n);
+        }
+    }
+    assert_eq!(run(&t, Model::Tso, &opts(None)).states.len(), 3, "P1 reads y as 0 then 0, 0 then 1, or 1 then 1");
+}

@@ -85,11 +85,17 @@ pub struct Options {
     /// setting `Outcomes::over_budget` (for tests that compare against a
     /// search that may be too big).
     pub max_memories: Option<u64>,
+    /// In the ARM model, let each run of a thread fail a store-exclusive
+    /// that could succeed at most this many times (None: without limit, as
+    /// the architecture allows). A retry loop that also writes on every
+    /// pass otherwise never repeats a state and runs until the fuel runs
+    /// out. Behaviors that need more such failures are missed.
+    pub spurious: Option<u32>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, pct_depth: 1, max_memories: None }
+        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, pct_depth: 1, max_memories: None, spurious: None }
     }
 }
 

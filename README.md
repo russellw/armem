@@ -30,6 +30,7 @@ cargo build --release
 ./target/release/armem --lse2 FILE                 # assume FEAT_LSE2 hardware
 ./target/release/armem --elf data.o FILE           # start from an ELF file's memory
 ./target/release/armem --sample 100 FILE           # 100 random paths, for big tests
+./target/release/armem --spurious 1 FILE           # at most 1 spurious STXR failure per run
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
 ./target/release/armem --no-live FILE              # without register liveness
@@ -541,7 +542,9 @@ tests too big for that, a line of `expected.txt` may give `sample=N`
 (`N` random paths), but only when the condition is expected to be
 reachable, since sampling may miss states. A line may also give
 `fuel=N`, for a program whose threads need more than the default 1,000
-instructions each.
+instructions each, or `spurious=N` (see [Limitations](#limitations-current)).
+A `no` with `spurious=N` holds only for runs with at most `N` spurious
+store-exclusive failures each.
 A program may be C++ (`NAME.cpp`), and a verdict may be `fault` rather
 than `yes` or `no`: some execution faults, for example on a null pointer
 (see [Stacks](#stacks)).
@@ -1395,8 +1398,10 @@ for the current code and 60 to 70 s for the old. With `LDXR`/`STXR`
 loops the ARM search runs out of fuel: the loop that links a new record
 into the list writes the record's next pointer on every pass, and since a
 store-exclusive may always fail, each pass adds a write and no state
-repeats. 1,000 sampled paths at PCT depth 3 still find the old code's bug
-at `-O2`. The
+repeats. With at most one spurious failure per run (`spurious=1`, see
+[Limitations](#limitations-current)) it gives the same verdicts at
+`-O1`, `-O2` and `-Os`, in about 60 s for the current code and 200 to
+230 s for the old; `c/expected.txt` checks `-O2`. The
 shutdown test holds at `-O0` to `-O2` and `-Os`, and with LSE at `-O2`,
 in 2 to 8 s.
 
@@ -1934,6 +1939,16 @@ lets a lone `LDXP` be torn.
   consecutive stores and a `Q` store as one, and ignore `--lse2`.
 * The status register written by `STXR` carries no dependency (as in
   Arm's model).
+* A store-exclusive may fail even where it could succeed, any number of
+  times, as the architecture allows. A retry loop that also writes on
+  every pass (folly's, which links a new record by writing its next
+  pointer and then trying the store-exclusive) then never repeats a
+  state, and its search runs out of fuel. `--spurious N` lets each run of
+  a thread fail such a store-exclusive at most `N` times. That misses
+  the behaviors that need more failures: each one repeats the loop's
+  writes, so with it another thread may read `v`, then a write `w` from a
+  third thread, then `v` again. The report then warns, and the summary
+  says `(capped)`, if some run reached the limit.
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
   atomics (other private memory can, if they neither acquire nor

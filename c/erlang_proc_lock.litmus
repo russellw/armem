@@ -1,0 +1,5 @@
+AArch64 erlang_proc_lock
+"A process lock handed to a waiting thread is released and orders what its holder did"
+{ setup(); int bad; }
+ P0 = t0 | P1 = t1 ;
+exists (bad=1)

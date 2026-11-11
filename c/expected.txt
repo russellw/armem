@@ -482,3 +482,24 @@ atomic_queue2 -Os no no -DSINGLE
 atomic_queue2 -O0 no no fuel=3000
 atomic_queue2 -O0 no no -DOLD_2020 fuel=3000
 atomic_queue2 -O0 no no -DSINGLE fuel=3000
+
+# Erlang's process locks (see "Erlang" in README.md). OLD is from before
+# commit 46ff98a5d5, whose unlock trusted a relaxed load of the lock word
+# when every lock it released had a waiter: a thread handed a lock can see
+# its own stale waiter flag and dequeue from an empty queue. DATA checks
+# that the handover orders the holder's writes before the new holder's
+# reads; in the current code it does not on ARM (no acquire after the
+# waiter's poll of uaflgs).
+erlang_proc_lock -O2 no no
+erlang_proc_lock -O2 fault no -DOLD
+erlang_proc_lock -O2 yes no -DDATA
+erlang_proc_lock -O2 fault no -DOLD -DDATA
+erlang_proc_lock -O2 no no -march=armv8.1-a
+erlang_proc_lock -O2 fault no -DOLD -march=armv8.1-a
+erlang_proc_lock -O2 yes no -DDATA -march=armv8.1-a
+erlang_proc_lock -O1 fault no -DOLD
+erlang_proc_lock -O1 yes no -DDATA
+erlang_proc_lock -Os fault no -DOLD
+erlang_proc_lock -Os yes no -DDATA
+erlang_proc_lock -O0 fault no -DOLD
+erlang_proc_lock -O0 yes no -DDATA

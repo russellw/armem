@@ -1288,6 +1288,61 @@ condition is reachable under TSO too. The 2020 code, whose relaxed
 compare-and-swap is a strong one in a differently shaped loop, does not
 get that optimization at the levels tested.
 
+### Erlang
+
+`c/erlang` holds `erl_process_lock.c` and `erl_process_lock.h`, Erlang/OTP's
+process locks, unchanged from its commit `045d30b` (November 2026; Apache
+License 2.0, see `c/erlang/LICENSE`), and `c/erlang/old` holds the header
+from before commit `46ff98a5d5`. `c/erlang/stub` holds stand-ins for the
+erts headers they include. A process is just its id and lock there, and
+the process table, which the lock functions need only for lookups, is
+empty. The ethread atomics, mutex and events are written out as a 64-bit
+ARM build with gcc 8.3 or later compiles them, so that, for example, a
+compare-and-swap with release order is `DMB SY` and a relaxed
+compare-and-swap. The stand-ins don't block: a waiter polls its flag, a
+spurious wakeup the lock code allows for.
+
+A process has five locks, bits of one word, each with a waiter bit and a
+queue of waiting threads. The queues and waiter bits are protected by a
+mutex, the pix lock. A thread that can't take a lock queues itself, sets
+the waiter bit, and polls the word `uaflgs` in its event until another
+thread clears it. A thread unlocking a lock with waiters hands it over
+instead: under the pix lock it dequeues the next waiter, clears the waiter
+bit if that was the last one, releases the pix lock and clears the
+waiter's `uaflgs`. An unlock first clears every lock it releases that has
+no waiter with one compare-and-swap, based on a relaxed load of the word.
+
+In `erlang_proc_lock.c`, `t0` holds the main lock and unlocks it, and
+`t1` locks and unlocks it. The condition is that the main lock is still
+held after `t1` unlocks it. With `-DDATA`, `t0` also stores 42 in `data`
+before unlocking, and `t1` loads it while holding the lock; the condition
+then also holds if `t1` doesn't load 42.
+
+Commit `46ff98a5d5` (February 2026, "erts: Fix proc unlock memory order")
+makes the unlock's compare-and-swap unconditional. Before it (`-DOLD`),
+an unlock skipped the compare-and-swap when every lock it released had a
+waiter, so nothing checked the relaxed load. The commit says that some
+schedulers got stuck in a lock's wait queue on ARM. armem finds how: `t1`
+can see `t0` clear `uaflgs` and then load the lock word from before `t0`
+cleared the waiter bit, since nothing orders `t1`'s two loads. It sees
+itself as the lock's waiter, skips the compare-and-swap and hands the lock
+to a waiter that isn't there. Here, that dereferences the empty queue's
+null pointer: a fault, on ARM only, at `-O0`, `-O1`, `-O2` and `-Os` and
+with LSE. With the fix, the stale load makes the compare-and-swap fail, and the unlock
+tries again with the lock word it read.
+
+The current code doesn't fault, and the lock is always free at the end.
+But with `-DDATA` the condition is reachable on ARM only: `t1` can load
+`data` before it loads `uaflgs` as clear, and so before `t0` stored 42.
+That needs the handover to happen between `t1` queuing itself and its
+first poll of `uaflgs`, so that `t1` never waits on its event. Making that poll an acquire load (in a copy of
+`erl_process_lock.c`, not in `c/`) makes the condition unreachable with
+`-DDATA`, and with the old header too, since `t1` then sees the waiter bit
+cleared. The tests take 2 to 55 s each. A shared write in each poll would
+multiply the memories, so `erts_tse_set` keeps only the barriers of its
+exchange. No thread reads the event word, since the modeled waits return
+at once.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1896,7 +1951,10 @@ lets a lone `LDXP` be torn.
    [Boost.Lockfree](#boostlockfree)), and in atomic_queue the ARM-only
    bugs that its commits `95bbd40` (2020) and `2bc627d` (2023) fixed, the
    second only where the consumer's later loads do not depend on the
-   element by address (see [atomic_queue](#atomic_queue)). In the Chase–Lev
+   element by address (see [atomic_queue](#atomic_queue)), and in Erlang's
+process locks the ARM-only bug that its commit `46ff98a5d5` fixed in
+February 2026, and an ARM-only stale read in a lock handover that the
+current code still allows (see [Erlang](#erlang)). In the Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other
    libraries.

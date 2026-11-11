@@ -1338,7 +1338,9 @@ That needs the handover to happen between `t1` queuing itself and its
 first poll of `uaflgs`, so that `t1` never waits on its event. Making that poll an acquire load (in a copy of
 `erl_process_lock.c`, not in `c/`) makes the condition unreachable with
 `-DDATA`, and with the old header too, since `t1` then sees the waiter bit
-cleared. The tests take 2 to 55 s each. A shared write in each poll would
+cleared. This was reported as
+[erlang/otp#12178](https://github.com/erlang/otp/issues/12178). The tests
+take 2 to 55 s each. A shared write in each poll would
 multiply the memories, so `erts_tse_set` keeps only the barriers of its
 exchange. No thread reads the event word, since the modeled waits return
 at once.

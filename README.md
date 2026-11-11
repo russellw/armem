@@ -1356,7 +1356,11 @@ An execution *faults* when a thread:
 * accesses memory below `0x1000` (`core::NULL_PAGE`), as a null pointer
   dereference does. No location is placed there.
 
-A faulting execution has no final state. The report lists each fault,
+A faulting execution has no final state. Under the ARM model, a fault
+counts only if every other thread can write all its messages in that
+execution's memory. A promise that could be fulfilled when it was made
+may not be once the faulting thread has written, for example if that
+thread took a lock and never released it (`tests/faults.rs`). The report lists each fault,
 with the thread (`FAULT: P1: 8-byte access at 0x7f00001ffff8 is outside
 its stack ...`), and the one-line summary marks the model with `(fault)`.
 

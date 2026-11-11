@@ -336,6 +336,10 @@ struct Solo<'a> {
     /// Faults reached (in `Collect` mode, with every promise fulfilled and no
     /// new write).
     faults: BTreeSet<String>,
+    /// Whether some state reached (in `Collect` mode) has written every one
+    /// of the thread's messages in the memory and promises nothing more: the
+    /// thread can stop there, so another thread's fault is real.
+    fulfills: bool,
 }
 
 /// Split an access of `n` bytes at `a` into single-copy-atomic pieces of
@@ -484,6 +488,7 @@ impl<'a> Solo<'a> {
             certified: false,
             truncated: false,
             faults: BTreeSet::new(),
+            fulfills: false,
         }
     }
 
@@ -1671,6 +1676,7 @@ impl<'a> Solo<'a> {
             if self.mode == Mode::Collect && st.promises.is_empty() {
                 self.fulfilling.extend(ext.iter().map(|m| (m.addr, m.size, m.val)));
             }
+            self.fulfills |= self.complete(&st, &ext);
             if st.core.steps >= self.fuel && st.core.pc < self.prog.instrs.len() {
                 self.truncated = true;
                 continue;
@@ -1937,7 +1943,8 @@ impl<'a> Explorer<'a> {
         let test = self.test;
         self.results.stats.memories += 1;
         let mut per_thread = Vec::new();
-        let mut faulted = false;
+        let mut faults = Vec::new();
+        let mut fulfills = Vec::new();
         let mut candidates = Vec::new();
         let mut promising = Vec::new();
         let mut collect_states = 0u64;
@@ -1947,13 +1954,23 @@ impl<'a> Explorer<'a> {
             let cands = std::mem::take(&mut c.candidates);
             promising.push(cands.iter().map(|x| !self.cfg.filter || c.promising(x)).collect::<Vec<_>>());
             self.results.truncated |= c.truncated;
-            faulted |= !c.faults.is_empty();
-            self.results.faults.extend(std::mem::take(&mut c.faults));
+            faults.push(std::mem::take(&mut c.faults));
+            fulfills.push(c.fulfills);
             per_thread.push(std::mem::take(&mut c.finals));
             candidates.push(cands);
         }
-        // Phase 2. If some thread cannot complete, neither can the execution.
-        let mut found = faulted;
+        // Phase 2. A thread's fault is real only if every other thread can
+        // write all its messages in the memory (and then stop): otherwise a
+        // promise that was certifiable when made can no longer be fulfilled,
+        // for example because the faulting thread holds a lock forever.
+        let mut found = false;
+        for (tid, f) in faults.into_iter().enumerate() {
+            if !f.is_empty() && fulfills.iter().enumerate().all(|(t, &ok)| ok || t == tid) {
+                self.results.faults.extend(f);
+                found = true;
+            }
+        }
+        // If some thread cannot complete, neither can the execution.
         if per_thread.iter().all(|f| !f.is_empty()) {
             let byte =
                 |b: u64| mem.iter().rev().find(|m| m.covers(b)).map(|m| m.byte(b)).unwrap_or_else(|| test.init_byte(b));

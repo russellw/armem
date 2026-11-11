@@ -478,3 +478,45 @@ exists (y=1)
     }
     check(&t, src, false);
 }
+
+/// P0 loops while it reads a flag that P1 sets, clearing the flag itself,
+/// and on each pass increments one of two counters that only it writes,
+/// chosen by another location P1 writes. Coherence ends the loop after
+/// one pass, but the analysis lets every read return any value written, so
+/// its runs go round until the fuel runs out with every pair of counter
+/// values, more states than its budget. It must then run again with the
+/// counters widened (`WIDENED_OWN_VALUES`) rather than give up, and the
+/// reduction it gives must keep the final states.
+#[test]
+fn widened_counters() {
+    let src = "AArch64 counters
+{ 0:X9=f; 1:X9=f; 0:X6=g; 1:X6=g; 0:X7=a; 0:X8=b; }
+ P0           | P1          ;
+ loop:        | MOV W0,#1   ;
+ LDR W1,[X9]  | STR W0,[X6] ;
+ CBZ W1,end   | STR W0,[X9] ;
+ STR WZR,[X9] |             ;
+ LDR W5,[X6]  |             ;
+ CBZ W5,other |             ;
+ LDR W2,[X7]  |             ;
+ ADD W2,W2,#1 |             ;
+ STR W2,[X7]  |             ;
+ B loop       |             ;
+ other:       |             ;
+ LDR W2,[X8]  |             ;
+ ADD W2,W2,#1 |             ;
+ STR W2,[X8]  |             ;
+ B loop       |             ;
+ end:         |             ;
+locations [a; b; f]
+";
+    let t = litmus::parse(src).unwrap();
+    let fuel = 3000;
+    assert!(armem::reduce::analyze(&t, fuel, true).is_some(), "the analysis gave up");
+    let full = run(&t, Model::Arm, &armem::Options { fuel, live: false, ..options(false, false, false) });
+    let reduced = run(&t, Model::Arm, &armem::Options { fuel, ..options(true, true, false) });
+    assert_eq!(full.states.keys().collect::<Vec<_>>(), reduced.states.keys().collect::<Vec<_>>());
+    assert!(!full.truncated && !reduced.truncated);
+    // P0 reads f=0 and stops, or reads 1, increments a or b, and clears f.
+    assert_eq!(full.states.len(), 3);
+}

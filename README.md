@@ -1390,10 +1390,13 @@ comes between the reset and the load of `shutdown_`, so a lost shutdown
 can happen under TSO too. With the fence, neither condition is
 reachable.
 
-The request test holds at `-O1`, `-O2` and `-Os` with LSE, in 20 to 60 s
-for the current code and 50 to 110 s for the old (`fuel=300`, or 400 at
-`-Os`). With `LDXR`/`STXR` loops the ARM search runs out of fuel, but
-1,000 sampled paths at PCT depth 3 find the old code's bug at `-O2`. The
+The request test holds at `-O1`, `-O2` and `-Os` with LSE, in 30 to 40 s
+for the current code and 60 to 70 s for the old. With `LDXR`/`STXR`
+loops the ARM search runs out of fuel: the loop that links a new record
+into the list writes the record's next pointer on every pass, and since a
+store-exclusive may always fail, each pass adds a write and no state
+repeats. 1,000 sampled paths at PCT depth 3 still find the old code's bug
+at `-O2`. The
 shutdown test holds at `-O0` to `-O2` and `-Os`, and with LSE at `-O2`,
 in 2 to 8 s.
 
@@ -1644,7 +1647,19 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   later reads depend on that one, so a dependency that orders only a ring
   buffer's index reads does not count as ordering its data reads. If the
   pre-pass gets too big, or a thread accesses memory at an address it
-  cannot bound, it gives up and nothing is pruned.
+  cannot bound, it gives up and nothing is pruned. When it gets too big,
+  it first runs again with widening: a byte only one thread writes, or a
+  register at one instruction (other than X29 and X30), that has held two
+  values becomes any value when it would take a third, and the stand-in
+  value of each register and flags it does not know becomes 0. A counter that
+  goes up on every pass of a loop otherwise gives every pass new states,
+  and the pre-pass's runs, which take any value a read could return and so
+  can go round a loop the real thread leaves at once, then grow with the
+  fuel. In folly's flat combiner, which counts its sessions, passes and
+  requests that way, the pre-pass gave up above 450 instructions of fuel,
+  and without its pruning and private memory the search did not finish in
+  half an hour; with widening it finishes at 1,000 in 30 to 70 s
+  (`tests/por.rs` checks a small case).
   Two rules keep the pre-pass precise on `ck_fifo_mpmc`, whose head, tail
   and links are each a pointer and a generation counter written together
   by a 16-byte store-exclusive and read as a pair or as separate 8-byte

@@ -86,6 +86,21 @@ const MAX_BYTE_VALUES: usize = 16;
 const MAX_STATES: usize = 300_000;
 /// Most rounds of the value fixpoint before the analysis gives up.
 const MAX_ROUNDS: usize = 64;
+/// Most values the analysis keeps for a byte that only one thread writes
+/// (see `Own`) when it runs again after giving up, before it treats the
+/// byte as holding any value. A counter that the thread increments on
+/// every pass of a loop (as folly's flat combiner counts its passes) gives
+/// each pass new states otherwise, and the runs then grow with the fuel
+/// until the analysis gives up.
+const WIDENED_OWN_VALUES: usize = 2;
+
+/// How far `Havoc` runs go: the fuel, and the most values kept for a byte
+/// in `Own` (None for no limit).
+#[derive(Clone, Copy)]
+struct Bound {
+    fuel: u32,
+    own_values: Option<usize>,
+}
 /// A byte whose set of values grows in this many rounds of a streak is
 /// taken to hold any value (widening). A counter, such as a sequence
 /// number that each round's writes increase, would otherwise add values
@@ -669,6 +684,12 @@ struct Havoc<'a> {
     prog: &'a Code,
     tid: usize,
     fuel: u32,
+    /// See `Bound`, and the values seen for each byte in `Own`.
+    own_values: Option<usize>,
+    own_seen: HashMap<u64, BTreeSet<u8>>,
+    /// The values seen in each register at each instruction, for the same
+    /// limit.
+    reg_seen: HashMap<(usize, usize), BTreeSet<u64>>,
     vals: &'a Known,
     /// The threads that may write each byte (none if absent).
     writers: &'a HashMap<u64, BTreeSet<usize>>,
@@ -719,7 +740,7 @@ impl<'a> Havoc<'a> {
     fn new(
         test: &'a Test,
         tid: usize,
-        fuel: u32,
+        bound: Bound,
         vals: &'a Known,
         writers: &'a HashMap<u64, BTreeSet<usize>>,
         read_bytes: &'a HashSet<u64>,
@@ -731,7 +752,10 @@ impl<'a> Havoc<'a> {
             test,
             prog: &test.threads[tid].code,
             tid,
-            fuel,
+            fuel: bound.fuel,
+            own_values: bound.own_values,
+            own_seen: HashMap::new(),
+            reg_seen: HashMap::new(),
             vals,
             writers,
             read_bytes,
@@ -923,7 +947,15 @@ impl<'a> Havoc<'a> {
         };
         for i in 0..n {
             if self.own_only(a + i) {
-                let e = if self.read_bytes.contains(&(a + i)) { (byte(i), depends) } else { (None, false) };
+                let mut e = if self.read_bytes.contains(&(a + i)) { (byte(i), depends) } else { (None, false) };
+                if let (Some(limit), Some(v)) = (self.own_values, e.0) {
+                    let seen = self.own_seen.entry(a + i).or_default();
+                    if !seen.contains(&v) && seen.len() >= limit {
+                        e.0 = None;
+                    } else {
+                        seen.insert(v);
+                    }
+                }
                 own.insert(a + i, e);
             }
         }
@@ -957,12 +989,44 @@ impl<'a> Havoc<'a> {
         }
     }
 
+    /// Make unknown each register that has held more than `limit` values
+    /// at this instruction (see `Bound`): a counter kept in a register
+    /// (folly's flat combiner sums the requests of a session) otherwise
+    /// gives each pass of its loop new states. An unknown value stands for
+    /// any value: a branch on it takes both ways, and an access at an
+    /// address computed from it gives up. The frame pointer and the link
+    /// register (X29, X30) are left alone: a function called from several
+    /// places holds several return addresses there, and a return must go
+    /// to one of them. The value of an unknown register is only a stand-in,
+    /// so it is set to 0 (as are unknown flags): otherwise a counter
+    /// computed from one gives new states as before.
+    fn widen(&mut self, core: &mut Core, limit: usize) {
+        if taint(core.flags) >= UNKNOWN {
+            core.flags.val = 0;
+        }
+        for (i, r) in core.regs.iter_mut().enumerate().take(29) {
+            if taint(*r) >= UNKNOWN {
+                r.val = 0;
+                continue;
+            }
+            let seen = self.reg_seen.entry((core.pc, i)).or_default();
+            if !seen.contains(&r.val) && seen.len() >= limit {
+                *r = RV { val: 0, view: UNKNOWN, pick: UNKNOWN };
+            } else {
+                seen.insert(r.val);
+            }
+        }
+    }
+
     /// Explore every run of the thread. None if the analysis gives up.
     fn run(&mut self, start: Core) -> Option<()> {
         let mut visited: FxHashMap<HState, u32> = FxHashMap::default();
         let mut queue = StepQueue::new();
         queue.push(start.steps, (start, None, Own::new(), false, Epoch::default(), false));
-        while let Some(st) = queue.pop() {
+        while let Some(mut st) = queue.pop() {
+            if let Some(limit) = self.own_values {
+                self.widen(&mut st.0, limit);
+            }
             let mut key = st.clone();
             key.0.steps = 0;
             if let Some(l) = self.live {
@@ -1279,7 +1343,7 @@ impl<'a> Havoc<'a> {
 fn dep_orders(
     test: &Test,
     tid: usize,
-    fuel: u32,
+    bound: Bound,
     vals: &Known,
     writers: &HashMap<u64, BTreeSet<usize>>,
     read_bytes: &HashSet<u64>,
@@ -1300,7 +1364,7 @@ fn dep_orders(
                 sources: Footprints::new(),
                 after: Footprints::new(),
             };
-            let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep), live);
+            let mut h = Havoc::new(test, tid, bound, vals, writers, read_bytes, &mut budget, Some(dep), live);
             h.run(h.start())?;
             if !h.missed.is_empty() {
                 return None;
@@ -1323,14 +1387,14 @@ fn dep_orders(
 fn write_events(
     test: &Test,
     tid: usize,
-    fuel: u32,
+    bound: Bound,
     vals: &Known,
     writers: &HashMap<u64, BTreeSet<usize>>,
     read_bytes: &HashSet<u64>,
     live: Option<&crate::live::Liveness>,
 ) -> Option<BTreeSet<Event>> {
     let mut budget = MAX_STATES;
-    let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, None, live);
+    let mut h = Havoc::new(test, tid, bound, vals, writers, read_bytes, &mut budget, None, live);
     h.events = Some(Events::default());
     h.run(h.start())?;
     h.missed.is_empty().then(|| h.events.take().unwrap().events)
@@ -1389,7 +1453,7 @@ const MAX_PUBLICATIONS: usize = 8;
 fn unpublished_reads(
     test: &Test,
     tid: usize,
-    fuel: u32,
+    bound: Bound,
     vals: &Known,
     writers: &HashMap<u64, BTreeSet<usize>>,
     read_bytes: &HashSet<u64>,
@@ -1408,14 +1472,21 @@ fn unpublished_reads(
         sources: Footprints::new(),
         after: Footprints::new(),
     };
-    let mut h = Havoc::new(test, tid, fuel, vals, writers, read_bytes, &mut budget, Some(dep), live);
+    let mut h = Havoc::new(test, tid, bound, vals, writers, read_bytes, &mut budget, Some(dep), live);
     h.run(h.start())?;
     h.missed.is_empty().then(|| h.dep.take().unwrap().unordered)
 }
 
 /// Compute what the reduction needs for `test`, or None if the analysis
-/// gives up (then nothing should be pruned).
+/// gives up (then nothing should be pruned). If it gives up, it runs again
+/// with the values of bytes in `Own` widened (`WIDENED_OWN_VALUES`), which
+/// is less precise but may stay within its budget.
 pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
+    analyze_with(test, Bound { fuel, own_values: None }, live)
+        .or_else(|| analyze_with(test, Bound { fuel, own_values: Some(WIDENED_OWN_VALUES) }, live))
+}
+
+fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
     let n = test.threads.len();
     let lives: Vec<Option<crate::live::Liveness>> =
         test.threads.iter().map(|th| live.then(|| crate::live::Liveness::new(&th.code, 0))).collect();
@@ -1445,7 +1516,7 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
         let mut words_grown = false;
         for tid in 0..n {
             let mut h = loop {
-                let mut h = Havoc::new(test, tid, fuel, &vals, &writers, &read_bytes[tid], &mut budget, None, lives[tid].as_ref());
+                let mut h = Havoc::new(test, tid, bound, &vals, &writers, &read_bytes[tid], &mut budget, None, lives[tid].as_ref());
                 let r = h.run(h.start());
                 if h.missed.is_empty() {
                     r?;
@@ -1538,7 +1609,7 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
                         f.iter().any(|&(a, len)| (a..a + len).any(|b| writers.get(&b).is_some_and(|w| w.iter().any(|&t| t != tid))))
                     };
                     let pcs: BTreeSet<usize> = read_pcs[tid].iter().filter(|(_, f)| others(f)).map(|(&pc, _)| pc).collect();
-                    dep_orders(test, tid, fuel, &vals, &writers, &read_bytes[tid], &pcs, lives[tid].as_ref())
+                    dep_orders(test, tid, bound, &vals, &writers, &read_bytes[tid], &pcs, lives[tid].as_ref())
                 } else {
                     Some(Vec::new())
                 };
@@ -1550,7 +1621,7 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
             }
             // Ordering points in program order, and publications.
             for a in 0..n {
-                let events = write_events(test, a, fuel, &vals, &writers, &read_bytes[a], lives[a].as_ref());
+                let events = write_events(test, a, bound, &vals, &writers, &read_bytes[a], lives[a].as_ref());
                 red.write_epochs.push(events.as_ref().map(|es| {
                     let mut m: BTreeMap<(u64, u64), BTreeSet<u8>> = BTreeMap::new();
                     for e in es {
@@ -1564,7 +1635,7 @@ pub fn analyze(test: &Test, fuel: u32, live: bool) -> Option<Reduction> {
                     let unordered = (0..n)
                         .map(|c| {
                             let reads = c != a && protected.iter().any(|&f| red.reads[c].iter().any(|&(p, m)| p < f.0 + f.1 && f.0 < p + m));
-                            reads.then(|| unpublished_reads(test, c, fuel, &vals, &writers, &read_bytes[c], &published, lives[c].as_ref())).flatten()
+                            reads.then(|| unpublished_reads(test, c, bound, &vals, &writers, &read_bytes[c], &published, lives[c].as_ref())).flatten()
                         })
                         .collect();
                     let unprotected = es_fps.difference(&protected).copied().collect();

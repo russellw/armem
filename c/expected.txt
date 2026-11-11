@@ -513,13 +513,14 @@ erlang_proc_lock -O0 yes no -DDATA
 # lost request is ARM-only; with SHUTDOWN, the lost shutdown is not, as
 # nothing between the reset and the load of shutdown_ is. The main test
 # runs only with LSE: with LDXR/STXR loops its ARM search runs out of
-# fuel.
-folly_fc -O2 no no -march=armv8.1-a fuel=300
-folly_fc -O2 yes no -DOLD -march=armv8.1-a fuel=300
-folly_fc -O1 no no -march=armv8.1-a fuel=300
-folly_fc -O1 yes no -DOLD -march=armv8.1-a fuel=300
-folly_fc -Os no no -march=armv8.1-a fuel=400
-folly_fc -Os yes no -DOLD -march=armv8.1-a fuel=400
+# fuel, since the loop that links a new record writes the record's next
+# pointer on every pass, and a store-exclusive may always fail.
+folly_fc -O2 no no -march=armv8.1-a
+folly_fc -O2 yes no -DOLD -march=armv8.1-a
+folly_fc -O1 no no -march=armv8.1-a
+folly_fc -O1 yes no -DOLD -march=armv8.1-a
+folly_fc -Os no no -march=armv8.1-a
+folly_fc -Os yes no -DOLD -march=armv8.1-a
 folly_fc -O2 no no -DSHUTDOWN
 folly_fc -O2 yes yes -DSHUTDOWN -DOLD
 folly_fc -O2 no no -DSHUTDOWN -march=armv8.1-a

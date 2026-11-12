@@ -1,0 +1,5 @@
+AArch64 cpython_typecache
+"A lookup in CPython's per-type method cache returns the value at the version it reports, and never goes back to an older version"
+{ setup(); int bad; }
+ P0 = writer | P1 = reader ;
+exists (bad=1)

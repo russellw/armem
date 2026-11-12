@@ -1532,8 +1532,37 @@ LSE, doesn't need that half.
 CPython has since replaced the global table with a cache per type
 (commit `daf09e17bf`, July 2026), which synchronizes by a release store
 and acquire load of each entry's name and a check of the type's version,
-and removed `_PySeqLock` (`d2f4649592`, August 2026). That cache is not
-tested here.
+and removed `_PySeqLock` (`d2f4649592`, August 2026).
+`cpython_typecache.c` tests that cache as it is on main at `0ada998ebb`
+(November 2026). `c/cpython/main` holds `Python/typecache.c`,
+`pycore_typecache.h` and the atomics headers unchanged from that commit,
+and `c/cpython/stub_main` stands in for the rest of CPython, as a
+free-threaded build sees it.
+
+Each type points to a hash table of (name, value) entries for one
+version of the type. A lookup (`_PyTypeCache_Lookup`) loads the pointer
+and probes for the name with acquire loads, reads the value, and returns
+it only if the table's version is still the type's. Writers hold the
+type lock: an insertion stores the value and then the name (release),
+first replacing a full table with a bigger copy (release), and modifying
+a type sets its version to 0 and swaps in the shared empty table before
+changing the dict. `setup` caches attribute `n` as `v1` at version 1.
+`writer` sets `n` to `v2`, as `type_setattro` does, then looks it up as a
+miss does: it assigns version 2 and caches `v2` in a new table. `reader`
+looks `n` up twice, without the lock. The condition is that a hit returns
+a value that is not the attribute's value at the version it reports, or
+that the second lookup hits an older version than the first.
+
+It is never met, at `-O0`, `-O1`, `-O2` and `-Os`, with and without LSE,
+each in about 0.2 s: every table is published by a release store and
+read by an acquire load, a table's version never changes, and the
+reader's check of the type's version comes after its acquire loads. To
+show that the test can see a bug, `-DRELAXED_STORES` makes the cache's
+release stores relaxed and `-DRELAXED_LOADS` its acquire loads; each
+makes the condition reachable on ARM only. Clang vectorizes the
+insertion's two counter updates at `-O1` and above into a vector `ADD`,
+which armem does not support, so the program is compiled with
+`-fno-vectorize -fno-slp-vectorize`.
 
 ### Calls
 
@@ -2185,7 +2214,8 @@ of tasklets, before and after the barriers its commit `787dc2095` added,
 and still in its 2.8 and 3.0 branches (see
 [HAProxy MT_LIST](#haproxy-mt_list)), and in CPython's seqlock both halves
 of the ARM-only bug that its commit `1d3cf79a5` fixed, one of them only
-without LSE (see [CPython](#cpython)). In the
+without LSE, while the per-type cache that replaced it holds (see
+[CPython](#cpython)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

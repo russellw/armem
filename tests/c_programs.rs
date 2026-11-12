@@ -17,7 +17,8 @@
 //!
 //! A program is `c/NAME.c`, or `c/NAME.cpp` for C++. One whose first line
 //! is `/* cflags: ... */` is compiled with those flags too, with `-I` paths
-//! relative to `c/`.
+//! relative to `c/`. They come after the line's flags, so that one such as
+//! `-fno-vectorize` is not undone by the line's `-O2`.
 
 use armem::elf::Elf;
 use armem::image::{Image, LoadOptions};
@@ -131,8 +132,8 @@ fn check(clang: &str, i: usize, e: &Expectation) -> Option<String> {
     let out = Command::new(clang)
         .args(["--target=aarch64-linux-gnu", "-fno-pic", "-c", "-o"])
         .arg(&obj)
-        .args(program_cflags(&source, &dir))
         .args(&e.cflags)
+        .args(program_cflags(&source, &dir))
         .arg(&source)
         .output()
         .unwrap();

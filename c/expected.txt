@@ -584,3 +584,15 @@ cpython_seqlock -O0 yes no -DOLD_READ
 cpython_seqlock -O0 yes no -DOLD_READ -march=armv8.1-a
 cpython_seqlock -O0 yes no -DOLD_WRITE
 cpython_seqlock -O0 no no -DOLD_WRITE -march=armv8.1-a
+cpython_typecache -O2 no no
+cpython_typecache -O2 no no -march=armv8.1-a
+cpython_typecache -O2 yes no -DRELAXED_STORES
+cpython_typecache -O2 yes no -DRELAXED_STORES -march=armv8.1-a
+cpython_typecache -O2 yes no -DRELAXED_LOADS
+cpython_typecache -O2 yes no -DRELAXED_LOADS -march=armv8.1-a
+cpython_typecache -O0 no no
+cpython_typecache -O0 no no -march=armv8.1-a
+cpython_typecache -O0 yes no -DRELAXED_STORES
+cpython_typecache -O0 yes no -DRELAXED_STORES -march=armv8.1-a
+cpython_typecache -O0 yes no -DRELAXED_LOADS
+cpython_typecache -O0 yes no -DRELAXED_LOADS -march=armv8.1-a

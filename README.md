@@ -1615,10 +1615,13 @@ test that showed it is `active_call_spec.rb`, which PR
 [#40770](https://github.com/grpc/grpc/pull/40770) proposed skipping on ARM
 (it was closed unmerged).
 
-To find that cause, `scripts/grpc_ruby_hang.sh` runs the spec over and
-over against a given `grpc` gem, and dumps every thread's stack with gdb
-when a run hangs. The `gRPC Ruby hang` workflow runs it by hand on
-GitHub's arm64 runners, against a gem built from source with symbols.
+To find that cause, `scripts/grpc_ruby_hang.sh` runs gRPC's Ruby specs
+over and over against a given `grpc` gem, and dumps every thread's stack
+with gdb when a run hangs. The `gRPC Ruby hang` workflow runs it by hand
+on GitHub's arm64 runners, as gRPC's arm64 CI runs them: dbg and opt
+builds from source, each spec file in its own process, 16 at once, with
+`GRPC_VERBOSITY=DEBUG`. 80,000 runs of `active_call_spec.rb` alone, 16 at
+once, on Neoverse-N2 with an opt build of 1.80.0, didn't hang.
 
 Each turn of the spinlock's exchange that finds the lock held writes back
 the 1 it read, so the tests bound that with `--stutter 1` (see

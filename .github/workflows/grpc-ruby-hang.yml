@@ -2,8 +2,15 @@
 # See scripts/grpc_ruby_hang.sh. Started by hand only (Actions tab, "Run
 # workflow"), so nothing runs on push and nothing runs from pull requests.
 #
+# This runs the specs as gRPC's arm64 Ruby CI does (tools/internal_ci/linux/
+# arm64/grpc_basictests_ruby.cfg and tools/run_tests/run_tests.py): a dbg
+# and an opt build, each spec file in its own process, 16 at once, with
+# GRPC_VERBOSITY=DEBUG. CI's list leaves out end2end/; three of its specs
+# are left out here too, since they need gRPC's lib/ tree or protoc.
+#
 # The grpc gem is built from source, so gdb backtraces have symbols; the
-# build is cached per version, so only the first run of a version pays for it.
+# build is cached per version and config, so only the first run of a
+# version pays for it.
 
 name: gRPC Ruby hang
 
@@ -13,23 +20,43 @@ on:
       version:
         description: grpc gem version (the hang should be in 1.80.0 and earlier)
         default: "1.80.0"
-      runs:
-        description: Spec runs per copy
-        default: "5000"
+      rounds:
+        description: Times each copy runs every spec
+        default: "40"
       copies:
-        description: Copies run in parallel on each of the 4 runners
-        default: "4"
+        description: Copies run in parallel on each runner
+        default: "16"
+      specs:
+        description: Spec files, or "ci" for CI's list
+        default: ci
 
 permissions:
   contents: read
 
 env:
   RUBY_VERSION: "3.3"
+  CI_SPECS: >-
+    spec/client_server_spec.rb spec/errors_spec.rb
+    spec/pb/health/checker_spec.rb spec/pb/duplicate/codegen_spec.rb
+    spec/server_spec.rb spec/error_sanity_spec.rb spec/channel_spec.rb
+    spec/user_agent_spec.rb spec/call_credentials_spec.rb
+    spec/channel_credentials_spec.rb spec/channel_connection_spec.rb
+    spec/compression_options_spec.rb spec/time_consts_spec.rb
+    spec/server_credentials_spec.rb spec/generic/server_interceptors_spec.rb
+    spec/generic/rpc_server_pool_spec.rb spec/generic/client_stub_spec.rb
+    spec/generic/active_call_spec.rb spec/generic/rpc_server_spec.rb
+    spec/generic/service_spec.rb spec/generic/client_interceptors_spec.rb
+    spec/generic/rpc_desc_spec.rb spec/generic/interceptor_registry_spec.rb
+    spec/debug_message_spec.rb spec/logconfig_spec.rb spec/call_spec.rb
+    spec/client_auth_spec.rb
 
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    strategy:
+      matrix:
+        config: [dbg, opt]
     steps:
       - uses: ruby/setup-ruby@v1
         with:
@@ -38,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/gems
-          key: grpc-ruby-hang-gems-${{ inputs.version }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
+          key: grpc-ruby-hang-gems-${{ inputs.version }}-${{ matrix.config }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
       - name: Build grpc from source, keeping debug symbols
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -48,15 +75,17 @@ jobs:
           gem install --no-document grpc -v '${{ inputs.version }}'
           gem uninstall grpc --all --ignore-dependencies --executables
           dbg=$(mktemp -d)
-          GRPC_RUBY_DEBUG_SYMBOLS_OUTPUT_DIR=$dbg \
+          GRPC_CONFIG=${{ matrix.config }} GRPC_RUBY_DEBUG_SYMBOLS_OUTPUT_DIR=$dbg \
             gem install --no-document --platform ruby --ignore-dependencies \
             grpc -v '${{ inputs.version }}'
           gem install --no-document rspec logging simplecov
-          # extconf.rb strips grpc_c.so after saving its debug info; link
-          # the two again so gdb finds the symbols.
           so=$(find ~/gems/gems/grpc-'${{ inputs.version }}' -name grpc_c.so)
-          cp "$dbg"/*.dbg "$(dirname "$so")/"
-          objcopy --add-gnu-debuglink="$(ls "$(dirname "$so")"/*.dbg)" "$so"
+          # An opt build strips grpc_c.so after saving its debug info; link
+          # the two again so gdb finds the symbols.
+          if ls "$dbg"/*.dbg >/dev/null 2>&1; then
+            cp "$dbg"/*.dbg "$(dirname "$so")/"
+            objcopy --add-gnu-debuglink="$(ls "$(dirname "$so")"/*.dbg)" "$so"
+          fi
           file "$so"
 
   hunt:
@@ -66,7 +95,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        config: [dbg, opt]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,28 +106,36 @@ jobs:
           repository: grpc/grpc
           ref: v${{ inputs.version }}
           path: grpc
-          sparse-checkout: src/ruby/spec
+          sparse-checkout: |
+            src/ruby/spec
+            src/ruby/pb
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.RUBY_VERSION }}
       - uses: actions/cache/restore@v4
         with:
           path: ~/gems
-          key: grpc-ruby-hang-gems-${{ inputs.version }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
+          key: grpc-ruby-hang-gems-${{ inputs.version }}-${{ matrix.config }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
           fail-on-cache-miss: true
       - name: Machine
         run: |
           uname -a
           lscpu
           sudo apt-get install -y gdb >/dev/null
-      - name: Run the spec until it hangs
+      - name: Run the specs until one hangs
+        env:
+          GEM_HOME: /home/runner/gems
+          GEM_PATH: /home/runner/gems
+          GRPC_VERBOSITY: DEBUG
+          SPECS: ${{ inputs.specs }}
         run: |
-          export GEM_HOME=~/gems GEM_PATH=~/gems
+          [ "$SPECS" = ci ] && SPECS=$CI_SPECS
+          # shellcheck disable=SC2086
           scripts/grpc_ruby_hang.sh grpc/src/ruby '${{ inputs.version }}' \
-            '${{ inputs.runs }}' '${{ inputs.copies }}' results
+            '${{ inputs.rounds }}' '${{ inputs.copies }}' results 120 $SPECS
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.shard }}
+          name: results-${{ matrix.config }}-${{ matrix.shard }}
           path: results
           if-no-files-found: ignore

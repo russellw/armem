@@ -1,0 +1,103 @@
+# Hunt for the gRPC Ruby server shutdown hang on real arm64 hardware.
+# See scripts/grpc_ruby_hang.sh. Started by hand only (Actions tab, "Run
+# workflow"), so nothing runs on push and nothing runs from pull requests.
+#
+# The grpc gem is built from source, so gdb backtraces have symbols; the
+# build is cached per version, so only the first run of a version pays for it.
+
+name: gRPC Ruby hang
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: grpc gem version (the hang should be in 1.80.0 and earlier)
+        default: "1.80.0"
+      runs:
+        description: Spec runs per copy
+        default: "5000"
+      copies:
+        description: Copies run in parallel on each of the 4 runners
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  RUBY_VERSION: "3.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/gems
+          key: grpc-ruby-hang-gems-${{ inputs.version }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
+      - name: Build grpc from source, keeping debug symbols
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          export GEM_HOME=~/gems GEM_PATH=~/gems
+          # Install the precompiled gem for its dependencies, then replace it
+          # with a source build.
+          gem install --no-document grpc -v '${{ inputs.version }}'
+          gem uninstall grpc --all --ignore-dependencies --executables
+          dbg=$(mktemp -d)
+          GRPC_RUBY_DEBUG_SYMBOLS_OUTPUT_DIR=$dbg \
+            gem install --no-document --platform ruby --ignore-dependencies \
+            grpc -v '${{ inputs.version }}'
+          gem install --no-document rspec logging simplecov
+          # extconf.rb strips grpc_c.so after saving its debug info; link
+          # the two again so gdb finds the symbols.
+          so=$(find ~/gems/gems/grpc-'${{ inputs.version }}' -name grpc_c.so)
+          cp "$dbg"/*.dbg "$(dirname "$so")/"
+          objcopy --add-gnu-debuglink="$(ls "$(dirname "$so")"/*.dbg)" "$so"
+          file "$so"
+
+  hunt:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - uses: actions/checkout@v4
+        with:
+          repository: grpc/grpc
+          ref: v${{ inputs.version }}
+          path: grpc
+          sparse-checkout: src/ruby/spec
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/gems
+          key: grpc-ruby-hang-gems-${{ inputs.version }}-ruby${{ env.RUBY_VERSION }}-arm64-v1
+          fail-on-cache-miss: true
+      - name: Machine
+        run: |
+          uname -a
+          lscpu
+          sudo apt-get install -y gdb >/dev/null
+      - name: Run the spec until it hangs
+        run: |
+          export GEM_HOME=~/gems GEM_PATH=~/gems
+          scripts/grpc_ruby_hang.sh grpc/src/ruby '${{ inputs.version }}' \
+            '${{ inputs.runs }}' '${{ inputs.copies }}' results
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.shard }}
+          path: results
+          if-no-files-found: ignore

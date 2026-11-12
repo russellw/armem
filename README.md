@@ -1611,8 +1611,14 @@ The new code's release store and acquire load of the flag don't help with
 without LSE, clang builds every `fetch_sub` as an `LDAXR`/`STLXR` loop
 whatever its order, so `RELAXED` changes nothing there. So `f01a138e8`
 fixes no ARM-only bug, and the hang must have another cause. The Ruby
-test that showed it (`active_call_spec.rb`, skipped on ARM by PR
-[#40770](https://github.com/grpc/grpc/pull/40770)) is run again now.
+test that showed it is `active_call_spec.rb`, which PR
+[#40770](https://github.com/grpc/grpc/pull/40770) proposed skipping on ARM
+(it was closed unmerged).
+
+To find that cause, `scripts/grpc_ruby_hang.sh` runs the spec over and
+over against a given `grpc` gem, and dumps every thread's stack with gdb
+when a run hangs. The `gRPC Ruby hang` workflow runs it by hand on
+GitHub's arm64 runners, against a gem built from source with symbols.
 
 Each turn of the spinlock's exchange that finds the lock held writes back
 the 1 it read, so the tests bound that with `--stutter 1` (see

@@ -90,6 +90,8 @@ struct Monitor {
     srcs: Vec<View>,
     /// The view of the read.
     view: View,
+    /// The value read (for `Options::stutter`).
+    val: u128,
 }
 
 /// State of one thread under the Promising-ARM model.
@@ -136,6 +138,9 @@ struct TState {
     /// Store-exclusives that failed although they could have succeeded
     /// (counted only with `Options::spurious`).
     spurious: u32,
+    /// Read-modify-writes that wrote back the value they read (counted only
+    /// with `Options::stutter`).
+    stutters: u32,
 }
 
 impl TState {
@@ -158,6 +163,7 @@ impl TState {
             speculative: false,
             poison: 0,
             spurious: 0,
+            stutters: 0,
         }
     }
 
@@ -290,8 +296,10 @@ struct Solo<'a> {
     base: Vec<Msg>,
     fuel: u32,
     lse2: bool,
-    /// See `Options::spurious`, and whether a run reached that limit.
+    /// See `Options::spurious` and `Options::stutter`, and whether a run
+    /// reached either limit.
     spurious: Option<u32>,
+    stutter: Option<u32>,
     capped: std::cell::Cell<bool>,
     mode: Mode,
     /// Visited states (with the step counter zeroed, and dead registers
@@ -472,6 +480,7 @@ impl<'a> Solo<'a> {
             fuel: cfg.fuel,
             lse2: cfg.lse2,
             spurious: cfg.spurious,
+            stutter: cfg.stutter,
             capped: Default::default(),
             mode,
             visited: FxHashMap::default(),
@@ -1165,7 +1174,7 @@ impl<'a> Solo<'a> {
             MemOp::Load { rt, size, signed, .. } => {
                 let (v, dep) = base.core.private_load(addr, size);
                 base.core.set(rt, RV { val: size.extend(v as u64, signed), ..dep });
-                base.xcl = Some(Monitor { addr: addr.val, size, srcs: Vec::new(), view: dep.view });
+                base.xcl = Some(Monitor { addr: addr.val, size, srcs: Vec::new(), view: dep.view, val: v });
                 out.push(base);
             }
             MemOp::LoadExclPair { rt, rt2, size, .. } => {
@@ -1174,7 +1183,7 @@ impl<'a> Solo<'a> {
                 let (lo, hi) = split_pair(v, size);
                 base.core.set(rt, RV { val: lo, ..dep });
                 base.core.set(rt2, RV { val: hi, ..dep });
-                base.xcl = Some(Monitor { addr: addr.val, size: total, srcs: Vec::new(), view: dep.view });
+                base.xcl = Some(Monitor { addr: addr.val, size: total, srcs: Vec::new(), view: dep.view, val: v });
                 out.push(base);
             }
             MemOp::StoreExcl { data, rs, size, .. } | MemOp::StoreExclPair { data, rs, size, .. } => {
@@ -1276,7 +1285,7 @@ impl<'a> Solo<'a> {
                     s.core.set(rt, RV { val: size.extend(r.val as u64, signed), ..r.dep });
                     s.poison_reg(rt, r.poison != 0);
                     if excl {
-                        s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs, view: r.dep.view });
+                        s.xcl = Some(Monitor { addr: addr.val, size, srcs: r.srcs, view: r.dep.view, val: r.val });
                     }
                     s.core.retire(prog);
                     out.push((s, ext.to_vec()));
@@ -1297,7 +1306,7 @@ impl<'a> Solo<'a> {
                     let half = (1u16 << size.bytes()) - 1;
                     s.poison_reg(rt, r.poison & half != 0);
                     s.poison_reg(rt2, r.poison & !half != 0);
-                    s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs, view: r.dep.view });
+                    s.xcl = Some(Monitor { addr: addr.val, size: total, srcs: r.srcs, view: r.dep.view, val: r.val });
                     s.core.retire(prog);
                     out.push((s, ext.to_vec()));
                 }
@@ -1309,13 +1318,13 @@ impl<'a> Solo<'a> {
                 f.core.set(rs, status(false));
                 f.core.retire(prog);
                 let mut succeeded = Vec::new();
-                if let Some(m) = &st.xcl {
-                    if m.addr == addr.val && m.size == total {
+                if let Some(m) = st.xcl.as_ref().filter(|m| m.addr == addr.val && m.size == total) {
+                    let val = pair_value(data.val, data2.val, size);
+                    if let Some(w) = if m.val == val { self.stutters(&st) } else { Some(st.clone()) } {
                         let srcs = m.srcs.clone();
-                        let val = pair_value(data.val, data2.val, size);
                         let kind = WriteKind { release, xview: m.view, full: false };
                         let data = RV::joined(0, data, data2);
-                        for (mut s, e) in self.do_write(&st, ext, addr, total, val, data, kind, Some((&srcs[..], true))) {
+                        for (mut s, e) in self.do_write(&w, ext, addr, total, val, data, kind, Some((&srcs[..], true))) {
                             s.xcl = None;
                             s.core.set(rs, status(true));
                             s.core.retire(prog);
@@ -1435,12 +1444,12 @@ impl<'a> Solo<'a> {
                 f.core.set(rs, status(false));
                 f.core.retire(prog);
                 let mut succeeded = Vec::new();
-                if let Some(m) = &st.xcl {
-                    if m.addr == addr.val && m.size == size {
+                if let Some(m) = st.xcl.as_ref().filter(|m| m.addr == addr.val && m.size == size) {
+                    let val = size.mask(data.val) as u128;
+                    if let Some(w) = if m.val == val { self.stutters(&st) } else { Some(st.clone()) } {
                         let srcs = m.srcs.clone();
                         let kind = WriteKind { release, xview: m.view, full: false };
-                        let val = size.mask(data.val) as u128;
-                        for (mut s, e) in self.do_write(&st, ext, addr, size, val, data, kind, Some((&srcs[..], true))) {
+                        for (mut s, e) in self.do_write(&w, ext, addr, size, val, data, kind, Some((&srcs[..], true))) {
                             s.xcl = None;
                             s.core.set(rs, status(true));
                             s.core.retire(prog);
@@ -1500,7 +1509,10 @@ impl<'a> Solo<'a> {
                             }
                             let kind = WriteKind { release, xview: r.dep.view, full: acquire && release };
                             let atomic = Some((&r.srcs[..], false));
-                            for (s, e) in self.do_write(&r.state, ext, addr, size, new as u128, data, kind, atomic) {
+                            let Some(w) = (if new == old { self.stutters(&r.state) } else { Some(r.state.clone()) }) else {
+                                continue;
+                            };
+                            for (s, e) in self.do_write(&w, ext, addr, size, new as u128, data, kind, atomic) {
                                 for &o in &outs {
                                     let mut s = s.clone();
                                     s.core.set(rt, o);
@@ -1514,6 +1526,35 @@ impl<'a> Solo<'a> {
             }
         }
         out
+    }
+
+    /// The state `f` after a store-exclusive fails, unless the failure is
+    /// spurious (`can_succeed`) and the run has already failed as often as
+    /// `Options::spurious` allows.
+    fn store_excl_fails(&self, mut f: TState, can_succeed: bool) -> Option<TState> {
+        if let (Some(limit), true) = (self.spurious, can_succeed) {
+            if f.spurious >= limit {
+                self.capped.set(true);
+                return None;
+            }
+            f.spurious += 1;
+        }
+        Some(f)
+    }
+
+    /// The state `s` before a read-modify-write to shared memory writes
+    /// back the value it read, unless the run has already done that as
+    /// often as `Options::stutter` allows.
+    fn stutters(&self, s: &TState) -> Option<TState> {
+        let mut s = s.clone();
+        if let Some(limit) = self.stutter {
+            if s.stutters >= limit {
+                self.capped.set(true);
+                return None;
+            }
+            s.stutters += 1;
+        }
+        Some(s)
     }
 
     /// A `CAS` that fails on a later write by another thread, from `st`:
@@ -1543,20 +1584,6 @@ impl<'a> Solo<'a> {
     /// (An acquiring one would only lead the run on to no purpose: in a
     /// retry loop, such as `qemu_event_wait` in `c/qemu_event.c`, round
     /// and round until the fuel runs out.)
-    /// The state `f` after a store-exclusive fails, unless the failure is
-    /// spurious (`can_succeed`) and the run has already failed as often as
-    /// `Options::spurious` allows.
-    fn store_excl_fails(&self, mut f: TState, can_succeed: bool) -> Option<TState> {
-        if let (Some(limit), true) = (self.spurious, can_succeed) {
-            if f.spurious >= limit {
-                self.capped.set(true);
-                return None;
-            }
-            f.spurious += 1;
-        }
-        Some(f)
-    }
-
     fn cas_fails_later(&self, st: &TState, addr: RV, size: Size, kind: ReadKind) -> Option<TState> {
         let (a, n) = (addr.val, size.bytes());
         let others = match &self.reduction {

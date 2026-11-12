@@ -139,3 +139,37 @@ locations [x; 1:X5; 1:X6]
     }
     assert_eq!(run(&t, Model::Tso, &opts(None)).states.len(), 3, "P1 reads y as 0 then 0, 0 then 1, or 1 then 1");
 }
+
+/// P0 takes a lock that P1 holds by swapping in 1 until it reads 0, as
+/// HAProxy's MT_LIST does with MT_LIST_BUSY; P1 writes z and releases the
+/// lock. While the lock is held, each pass of P0 writes 1 over 1, so no
+/// state repeats and the search runs out of fuel. With `Options::stutter`,
+/// the runs stop writing back the value read, the search completes and
+/// says it was capped, and it finds a subset of the final states: here
+/// all of them, as P0 then reads z=1 however often it spun. The same
+/// holds for the exchange as an LDAXR/STXR loop (a store-exclusive that
+/// fails writes nothing, so its retries repeat a state).
+#[test]
+fn stutter_cap() {
+    for (name, take) in [
+        ("SWP", "L0:              | STR W3,[X4]   ;\n SWPA W3,W0,[X1]  | STLR WZR,[X1] ;\n CBNZ W0,L0       |               ;"),
+        (
+            "LDAXR/STXR",
+            "L0:              | STR W3,[X4]   ;\n LDAXR W0,[X1]    | STLR WZR,[X1] ;\n STXR W2,W3,[X1]  |               ;\n CBNZ W2,L0       |               ;\n CBNZ W0,L0       |               ;",
+        ),
+    ] {
+        let src = format!(
+            "AArch64 spinlock\n{{ x=1; 0:X1=x; 0:X4=z; 1:X1=x; 1:X4=z; }}\n P0               | P1            ;\n MOV W3,#1        | MOV W3,#1     ;\n {}\n LDR W5,[X4]      |               ;\nlocations [0:X5]\n",
+            take
+        );
+        let t = litmus::parse(&src).unwrap();
+        let opts = |stutter| armem::Options { fuel: 60, stutter, check_filter: true, ..Default::default() };
+        let free = run(&t, Model::Arm, &opts(None));
+        assert!(free.truncated && !free.capped, "{}", name);
+        for n in [0, 1, 2] {
+            let capped = run(&t, Model::Arm, &opts(Some(n)));
+            assert!(!capped.truncated && capped.capped, "{} stutter={}", name, n);
+            assert_eq!(capped.states.keys().collect::<Vec<_>>(), free.states.keys().collect::<Vec<_>>(), "{} stutter={}", name, n);
+        }
+    }
+}

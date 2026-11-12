@@ -91,11 +91,20 @@ pub struct Options {
     /// pass otherwise never repeats a state and runs until the fuel runs
     /// out. Behaviors that need more such failures are missed.
     pub spurious: Option<u32>,
+    /// In the ARM model, let each run of a thread perform at most this many
+    /// read-modify-writes to shared memory that write back the value they
+    /// read (an atomic instruction, or a store-exclusive storing what its
+    /// load-exclusive read), as a lock taken by exchanging a "busy" value
+    /// does on each pass while another thread holds it (None: without
+    /// limit). Each pass adds a write, so such a loop never repeats a state
+    /// and runs until the fuel runs out. Behaviors that need more such
+    /// passes are missed.
+    pub stutter: Option<u32>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, pct_depth: 1, max_memories: None, spurious: None }
+        Options { fuel: 200, lse2: false, por: true, dynamic_por: true, private: true, live: true, filter: true, check_filter: false, sample: None, seed: 0, pct_depth: 1, max_memories: None, spurious: None, stutter: None }
     }
 }
 

@@ -70,7 +70,7 @@ pub fn full(test: &Test, results: &[(Model, Outcomes)]) -> String {
             writeln!(s, "WARNING: only sampled executions were explored; other final states may be possible").unwrap();
         }
         if o.capped {
-            writeln!(s, "WARNING: some runs reached the limit on spurious store-exclusive failures; other final states may be possible").unwrap();
+            writeln!(s, "WARNING: some runs reached the limit set by --spurious or --stutter; other final states may be possible").unwrap();
         }
         if o.stats.states > 0 {
             writeln!(s, "Explored {} states", o.stats.states).unwrap();

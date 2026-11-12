@@ -6,6 +6,9 @@
 # W_FENCE etc. name an ordering; -DX=__ATOMIC_RELAXED removes it.
 # sample=N explores the ARM model on N random paths (for a "yes" only),
 # and fuel=N gives each thread N instructions (default 1000).
+# spurious=N and stutter=N limit how often each run of a thread may fail a
+# store-exclusive that could succeed, or write back the value that a
+# read-modify-write read (see --spurious and --stutter in README.md).
 
 seqlock -O2 no no
 seqlock -O2 yes no -DW_FENCE=__ATOMIC_RELAXED
@@ -534,3 +537,26 @@ folly_fc -Os no no -DSHUTDOWN
 folly_fc -Os yes yes -DSHUTDOWN -DOLD
 folly_fc -O0 no no -DSHUTDOWN
 folly_fc -O0 yes yes -DSHUTDOWN -DOLD
+
+# HAProxy's MT_LIST passing tasklets between threads (see "HAProxy
+# MT_LIST" in README.md): 2.2's list.h at 787dc2095, OLD from before it,
+# and V30 from the 3.0 branch. The owner's read of a tasklet's next
+# pointer after MT_LIST_BEHEAD is not ordered after the exchange that saw
+# it published, so it can be stale on ARM in all three; 787dc2095's store
+# barriers do not change that. Each MT_LIST lock spins by exchanging
+# MT_LIST_BUSY over MT_LIST_BUSY, a write on every pass, so stutter=1
+# bounds the runs; even so, two threads are too many for an exhaustive
+# ARM search, so it is sampled.
+haproxy_mt_list -O2 yes no -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O2 yes no -DOLD -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O2 yes no -DV30 -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O1 yes no -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O1 yes no -DOLD -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O1 yes no -DV30 -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -Os yes no -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -Os yes no -DOLD -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -Os yes no -DV30 -march=armv8.1-a stutter=1 sample=20
+haproxy_mt_list -O2 yes no stutter=1 spurious=1 sample=20
+haproxy_mt_list -O2 yes no -DOLD stutter=1 spurious=1 sample=20
+haproxy_mt_list -O2 yes no -DV30 stutter=1 spurious=1 sample=20
+haproxy_mt_list -O0 yes no -DV30 -march=armv8.1-a stutter=1 sample=20

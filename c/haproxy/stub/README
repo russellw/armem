@@ -1,0 +1,13 @@
+Freestanding stand-ins for the headers that include/haproxy/list.h
+includes, in 2.2 and 3.0: only what it uses, as an aarch64 build with
+clang compiles it.
+
+- haproxy/api.h gives _HA_ATOMIC_XCHG (a relaxed exchange) and the
+  barriers (__ha_barrier_store is DMB ISHST), copied from
+  include/haproxy/atomic.h, where they are the same at 787dc2095 and in
+  3.0; __ha_cpu_relax (ISB), which only 3.0's list.h uses; size_t, NULL,
+  and BUG_ON_HOT, a debugging check that is compiled out by default.
+- haproxy/thread.h is empty.
+
+The program includes the list-t.h (struct list and struct mt_list) of the
+version it tests.

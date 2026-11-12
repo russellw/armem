@@ -104,7 +104,8 @@ pub struct Outcomes {
     /// incomplete.
     pub over_budget: bool,
     /// Some run would have failed a store-exclusive spuriously more often
-    /// than `Options::spurious` allows, so the set may be incomplete.
+    /// than `Options::spurious` allows, or written back the value read more
+    /// often than `Options::stutter` allows, so the set may be incomplete.
     pub capped: bool,
     pub stats: Stats,
 }

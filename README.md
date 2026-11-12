@@ -31,6 +31,7 @@ cargo build --release
 ./target/release/armem --elf data.o FILE           # start from an ELF file's memory
 ./target/release/armem --sample 100 FILE           # 100 random paths, for big tests
 ./target/release/armem --spurious 1 FILE           # at most 1 spurious STXR failure per run
+./target/release/armem --stutter 1 FILE            # at most 1 RMW writing back what it read per run
 ./target/release/armem --no-por FILE               # without partial-order reduction
 ./target/release/armem --no-private FILE           # without private memory
 ./target/release/armem --no-live FILE              # without register liveness
@@ -542,9 +543,11 @@ tests too big for that, a line of `expected.txt` may give `sample=N`
 (`N` random paths), but only when the condition is expected to be
 reachable, since sampling may miss states. A line may also give
 `fuel=N`, for a program whose threads need more than the default 1,000
-instructions each, or `spurious=N` (see [Limitations](#limitations-current)).
-A `no` with `spurious=N` holds only for runs with at most `N` spurious
-store-exclusive failures each.
+instructions each, or `spurious=N` or `stutter=N` (see
+[Limitations](#limitations-current)). A `no` with `spurious=N` holds
+only for runs with at most `N` spurious store-exclusive failures each,
+and one with `stutter=N` only for runs with at most `N`
+read-modify-writes each that write back the value they read.
 A program may be C++ (`NAME.cpp`), and a verdict may be `fault` rather
 than `yes` or `no`: some execution faults, for example on a null pointer
 (see [Stacks](#stacks)).
@@ -1405,6 +1408,70 @@ repeats. With at most one spurious failure per run (`spurious=1`, see
 shutdown test holds at `-O0` to `-O2` and `-Os`, and with LSE at `-O2`,
 in 2 to 8 s.
 
+### HAProxy MT_LIST
+
+HAProxy passes tasklets between threads on lists built with its MT_LIST
+macros. A thread that wakes a tasklet owned by another appends it to the
+owner's `shared_tasklet_list`. The owner takes the whole list with
+`MT_LIST_BEHEAD`, splices it onto a private list, and runs each tasklet
+after unlinking it with `LIST_DEL_INIT`. MT_LIST locks a link by
+exchanging `MT_LIST_BUSY` (1) into it, with relaxed exchanges, and
+unlocks it with a plain store. Its only ordering is
+`__ha_barrier_store`, `DMB ISHST` on aarch64, between its stores.
+Commit `787dc2095` (July 2020, "add missing store barrier on
+MT_LIST_BEHEAD()") added four of them to `MT_LIST_BEHEAD`, after the
+scheduler's list was corrupted about once per million connections on 8
+Cortex-A53 cores.
+
+`c/haproxy` holds `list.h` and `list-t.h` in three versions (LGPL 2.1,
+see `c/haproxy/LICENSE`): `c/haproxy/include` from `787dc2095` (2.2),
+`c/haproxy/old` with `list.h` from before it, and `c/haproxy/3.0` from
+the 3.0 branch at `6038814` (October 2026), whose MT_LIST is the same as
+2.8's. `c/haproxy/stub` holds stand-ins for the headers that `list.h`
+includes: the exchange and the barriers, copied from HAProxy's
+`atomic.h`.
+
+In `haproxy_mt_list.c`, `waker` wakes tasklet `t1`, then `t2`, as 2.2's
+`tasklet_wakeup_on` does (`-DV30`: as 3.0's, with `MT_LIST_APPEND`).
+`owner` takes and runs the list once while it does, then waits for it
+and drains the list again. The condition is that some tasklet that was
+queued is not run exactly once, a list is left malformed, or the owner
+meets a pointer that is not a tasklet or a list head (which HAProxy
+would follow).
+
+The condition is reachable on ARM in all three versions, and never
+under TSO. The owner's exchange of the head's `prev` pointer can see the
+waker's last unlock, which publishes `t2`, while the owner's later read
+of `t1`'s `next` pointer, made by `LIST_DEL_INIT`, returns
+`MT_LIST_BUSY` or the head. The waker writes that pointer before the
+unlock, with a `DMB ISHST` between, but nothing orders the owner's read
+after its exchange. The read's address comes from the owner's other
+exchange, of the head's `next` pointer, which the waker doesn't write,
+and `DMB ISHST` orders only stores. With `MT_LIST_BUSY`, `LIST_DEL_INIT`
+writes to address 9, as in the crashes with `t->list.n = 0x1` at
+`LIST_DEL_INIT` in HAProxy issue
+[#958](https://github.com/haproxy/haproxy/issues/958). Those crashes had
+other causes, which were fixed, but in that issue an Arm engineer noted
+that MT_LIST's store barriers have nothing pairing them on the load side,
+and in 2.8 and 3.0 they still don't. With a `__ha_barrier_load()` at the
+end of `MT_LIST_BEHEAD`'s success path, or with acquire exchanges,
+sampled runs no longer reach it. Mainline replaced MT_LIST in 3.1 with
+`include/import/mt_list.h`, whose release fences compile to a full
+`DMB ISH` on aarch64, which orders the loads as well.
+
+The harness does not reach the bug `787dc2095` fixed: its store barriers
+make no difference here. That probably needs a third thread, or
+`MT_LIST_DEL` run concurrently with `MT_LIST_BEHEAD`.
+
+Each MT_LIST lock spins by exchanging `MT_LIST_BUSY` over itself, which
+writes on every pass, so `c/expected.txt` uses `stutter=1` (see
+[Limitations](#limitations-current)), and with `LDXR`/`STXR` loops
+`spurious=1` too. Even then the exhaustive ARM search of two threads
+does not finish in 30 minutes, so the ARM side is sampled (20 paths, in
+3 s with LSE, 8 s without, and 24 s at `-O0`). Sampling shows the
+condition reachable at `-O0` to `-O2` and `-Os`, but cannot show that
+any version is correct.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -1949,6 +2016,15 @@ lets a lone `LDXP` be torn.
   writes, so with it another thread may read `v`, then a write `w` from a
   third thread, then `v` again. The report then warns, and the summary
   says `(capped)`, if some run reached the limit.
+* A lock taken by exchanging in a "busy" value (as HAProxy's MT_LIST
+  does) writes that value over itself on every pass while another thread
+  holds the lock, so again no state repeats and the search runs out of
+  fuel. `--stutter N` lets each run of a thread perform at most `N`
+  read-modify-writes to shared memory that write back the value they read
+  (an atomic instruction, or a store-exclusive storing what its
+  load-exclusive read). That misses behaviors that need more such passes,
+  for example one where another thread reads each of the repeated writes.
+  It warns and says `(capped)` as `--spurious` does.
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
   atomics (other private memory can, if they neither acquire nor
@@ -2040,7 +2116,11 @@ process locks the ARM-only bug that its commit `46ff98a5d5` fixed in
 February 2026, and an ARM-only stale read in a lock handover that the
 current code still allows (see [Erlang](#erlang)), and in folly's
 FlatCombining the lost wakeups that its commit `6d16b1d` fixed in
-October 2026, the lost request on ARM only (see [folly](#folly)). In the
+October 2026, the lost request on ARM only (see [folly](#folly)), and in
+HAProxy's MT_LIST an ARM-only stale read when the scheduler takes a list
+of tasklets, before and after the barriers its commit `787dc2095` added,
+and still in its 2.8 and 3.0 branches (see
+[HAProxy MT_LIST](#haproxy-mt_list)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

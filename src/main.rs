@@ -25,6 +25,10 @@ options:
                      store-exclusive that could succeed at most N times
                      (default: without limit; may miss outcomes, for a
                      retry loop that writes on every pass)
+      --stutter N    in the ARM model, let each run of a thread perform at
+                     most N read-modify-writes that write back the value
+                     they read (default: without limit; may miss outcomes,
+                     for a lock taken by exchanging in a busy value)
       --max-memories N
                      stop the ARM search after N promise memories (the
                      report warns that other final states may be possible)
@@ -75,12 +79,13 @@ fn main() -> ExitCode {
             "--no-live" => opts.live = false,
             "--no-filter" => opts.filter = false,
             "--check-filter" => opts.check_filter = true,
-            "--sample" | "--seed" | "--pct-depth" | "--max-memories" | "--spurious" => match args.next().and_then(|v| v.parse().ok()) {
+            "--sample" | "--seed" | "--pct-depth" | "--max-memories" | "--spurious" | "--stutter" => match args.next().and_then(|v| v.parse().ok()) {
                 Some(n) if a == "--sample" => opts.sample = Some(n),
-                Some(n) if a == "--spurious" => match u32::try_from(n) {
-                    Ok(n) => opts.spurious = Some(n),
+                Some(n) if a == "--spurious" || a == "--stutter" => match u32::try_from(n) {
+                    Ok(n) if a == "--spurious" => opts.spurious = Some(n),
+                    Ok(n) => opts.stutter = Some(n),
                     Err(_) => {
-                        eprintln!("--spurious is too large");
+                        eprintln!("{} is too large", a);
                         return ExitCode::from(2);
                     }
                 },

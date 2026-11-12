@@ -1,0 +1,5 @@
+AArch64 haproxy_mt_list
+"Every tasklet that HAProxy's MT_LIST queues for another thread runs once, and the lists stay well formed"
+{ int bad; }
+ P0 = owner | P1 = waker ;
+exists (bad=1)

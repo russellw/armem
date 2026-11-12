@@ -1473,6 +1473,68 @@ does not finish in 30 minutes, so the ARM side is sampled (20 paths, in
 condition reachable at `-O0` to `-O2` and `-Os`, but cannot show that
 any version is correct.
 
+
+### CPython
+
+CPython's free-threaded build cached type attribute lookups in a global
+table guarded by a seqlock, `_PySeqLock` in `Python/lock.c`. A lookup
+(`_PyType_LookupRef`) reads an entry's version, the type's version and the
+entry's name and value between `_PySeqLock_BeginRead` and
+`_PySeqLock_EndRead`, and uses the value only if they match and the
+sequence is unchanged. An update (`update_cache_gil_disabled`) makes the
+sequence odd with a compare-and-swap, stores the entry's fields (relaxed),
+and stores the next even value. Commit `1d3cf79a5` (July 2024,
+gh-121368) fixed its memory ordering: lookups could return incorrect
+results on macOS arm64. It changed two functions:
+`_PySeqLock_EndRead` re-read the sequence with an acquire load, and now
+uses an acquire fence and a relaxed load; and `_PySeqLock_LockWrite` gained
+a release fence after its compare-and-swap. This is the pattern of
+`c/seqlock.c`, with the reader's fence (`R_FENCE`) or the writer's
+(`W_FENCE`) missing.
+
+`c/cpython` holds CPython's `pyatomic.h` headers unchanged from
+`1d3cf79a5` (PSF License, see `c/cpython/LICENSE`), and the seqlock
+section of `Python/lock.c` unchanged from `1d3cf79a5` (`c/cpython/new`)
+and from just before it (`c/cpython/old`). The rest of `lock.c` (mutexes
+and the parking lot) would need much of CPython to compile, so only that
+section is taken. `c/cpython/stub` stands in for the rest of CPython
+that they use.
+
+In `cpython_seqlock.c`, the writer and reader copy CPython's, without
+reference counting. `writer` replaces the entry for (version 1, `n1`, `a`)
+with (version 2, `n2`, `b`), as a lookup of another type and name that
+hash to the same slot would. `reader` looks up `n1` for a type whose
+version is 1. The condition is that it gets `b`, the new entry's value
+under the old entry's name and version. `-DOLD` takes both functions
+from before the fix, and `-DOLD_READ` and `-DOLD_WRITE` one each:
+
+| Version | `LDXR`/`STXR` | LSE |
+|---|---|---|
+| `1d3cf79a5` | no | no |
+| `OLD` | ARM only | ARM only |
+| `OLD_READ` | ARM only | ARM only |
+| `OLD_WRITE` | ARM only | no |
+
+The same holds at `-O0`, `-O1`, `-O2` and `-Os`, each in about 0.1 s.
+
+With the old `_PySeqLock_EndRead`, the reader's load of the value can be
+satisfied after its acquire load of the sequence, which orders only the
+accesses after it: the reader takes the new value with the old sequence.
+That happens on any ARM build, and is the half of the fix the commit
+message describes. With the old `_PySeqLock_LockWrite`, the writer's
+stores to the entry can be seen before its compare-and-swap makes the
+sequence odd, but only where the compare-and-swap is an `LDAXR`/`STLXR`
+loop: a store-release orders only what comes before it. LSE's `CASAL`
+orders the later stores, as herd7 with Arm's model agrees on the
+two-instruction test, so a build for Apple's arm64 chips, which all have
+LSE, doesn't need that half.
+
+CPython has since replaced the global table with a cache per type
+(commit `daf09e17bf`, July 2026), which synchronizes by a release store
+and acquire load of each entry's name and a check of the type's version,
+and removed `_PySeqLock` (`d2f4649592`, August 2026). That cache is not
+tested here.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -2121,7 +2183,9 @@ October 2026, the lost request on ARM only (see [folly](#folly)), and in
 HAProxy's MT_LIST an ARM-only stale read when the scheduler takes a list
 of tasklets, before and after the barriers its commit `787dc2095` added,
 and still in its 2.8 and 3.0 branches (see
-[HAProxy MT_LIST](#haproxy-mt_list)). In the
+[HAProxy MT_LIST](#haproxy-mt_list)), and in CPython's seqlock both halves
+of the ARM-only bug that its commit `1d3cf79a5` fixed, one of them only
+without LSE (see [CPython](#cpython)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

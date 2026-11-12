@@ -1,0 +1,5 @@
+AArch64 cpython_seqlock
+"A lookup in CPython's type cache returns the value of the entry it matched, or misses"
+{ }
+ P0 = writer | P1 = reader ;
+exists (got=b)

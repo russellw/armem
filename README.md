@@ -1457,7 +1457,8 @@ and in 2.8 and 3.0 they still don't. With a `__ha_barrier_load()` at the
 end of `MT_LIST_BEHEAD`'s success path, or with acquire exchanges,
 sampled runs no longer reach it. Mainline replaced MT_LIST in 3.1 with
 `include/import/mt_list.h`, whose release fences compile to a full
-`DMB ISH` on aarch64, which orders the loads as well.
+`DMB ISH` on aarch64, which orders the loads as well. This was reported
+as [haproxy/haproxy#3572](https://github.com/haproxy/haproxy/issues/3572).
 
 The harness does not reach the bug `787dc2095` fixed: its store barriers
 make no difference here. That probably needs a third thread, or

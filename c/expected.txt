@@ -596,3 +596,53 @@ cpython_typecache -O0 yes no -DRELAXED_STORES
 cpython_typecache -O0 yes no -DRELAXED_STORES -march=armv8.1-a
 cpython_typecache -O0 yes no -DRELAXED_LOADS
 cpython_typecache -O0 yes no -DRELAXED_LOADS -march=armv8.1-a
+
+# gRPC's completion queue shutdown (see "gRPC" in README.md), at commit
+# f01a138e8 and, with OLD, from before it, for the next queue, the pluck
+# queue (PLUCK) and the callback queue (CALLBACK). The fix made
+# shutdown_called atomic, but the old code was already ordered: by the
+# queue's lock, and by the acq_rel fetch_sub of pending_events. RELAXED
+# makes that fetch_sub relaxed, which only the callback queue, whose last
+# end_op finishes the shutdown without the lock, depends on; at -O0
+# without LSE clang makes it LDAXR/STLXR anyway. stutter=1 bounds the
+# spinlock that stands in for gpr_mu.
+grpc_cq -O2 no no stutter=1
+grpc_cq -O2 no no -march=armv8.1-a stutter=1
+grpc_cq -O0 no no stutter=1
+grpc_cq -O0 no no -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DOLD stutter=1
+grpc_cq -O2 no no -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DOLD stutter=1
+grpc_cq -O0 no no -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DOLD -DRELAXED stutter=1
+grpc_cq -O2 no no -DOLD -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DOLD -DRELAXED stutter=1
+grpc_cq -O0 no no -DOLD -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DPLUCK stutter=1
+grpc_cq -O2 no no -DPLUCK -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DPLUCK stutter=1
+grpc_cq -O0 no no -DPLUCK -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DPLUCK -DOLD stutter=1
+grpc_cq -O2 no no -DPLUCK -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DPLUCK -DOLD stutter=1
+grpc_cq -O0 no no -DPLUCK -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DPLUCK -DOLD -DRELAXED stutter=1
+grpc_cq -O2 no no -DPLUCK -DOLD -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DPLUCK -DOLD -DRELAXED stutter=1
+grpc_cq -O0 no no -DPLUCK -DOLD -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DCALLBACK stutter=1
+grpc_cq -O2 no no -DCALLBACK -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DCALLBACK stutter=1
+grpc_cq -O0 no no -DCALLBACK -march=armv8.1-a stutter=1
+grpc_cq -O2 yes no -DCALLBACK -DRELAXED stutter=1
+grpc_cq -O2 yes no -DCALLBACK -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DCALLBACK -DRELAXED stutter=1
+grpc_cq -O0 yes no -DCALLBACK -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O2 no no -DCALLBACK -DOLD stutter=1
+grpc_cq -O2 no no -DCALLBACK -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DCALLBACK -DOLD stutter=1
+grpc_cq -O0 no no -DCALLBACK -DOLD -march=armv8.1-a stutter=1
+grpc_cq -O2 yes no -DCALLBACK -DOLD -DRELAXED stutter=1
+grpc_cq -O2 yes no -DCALLBACK -DOLD -DRELAXED -march=armv8.1-a stutter=1
+grpc_cq -O0 no no -DCALLBACK -DOLD -DRELAXED stutter=1
+grpc_cq -O0 yes no -DCALLBACK -DOLD -DRELAXED -march=armv8.1-a stutter=1

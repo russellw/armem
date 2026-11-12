@@ -1564,6 +1564,62 @@ insertion's two counter updates at `-O1` and above into a vector `ADD`,
 which armem does not support, so the program is compiled with
 `-fno-vectorize -fno-slp-vectorize`.
 
+### gRPC
+
+gRPC's C core delivers completions through a completion queue. Its count
+`pending_events` starts at 1, gains 1 for each operation begun and loses
+1 for each ended, and `grpc_completion_queue_shutdown` drops the initial
+1. Whichever of them brings it to 0 finishes the shutdown, which
+`GRPC_CHECK`s that `shutdown_called` is set and shuts the pollset down,
+waking threads blocked in `grpc_completion_queue_next` or `_pluck`.
+Commit `f01a138e8` (April 2026, PR
+[#41510](https://github.com/grpc/grpc/pull/41510)) says that on ARM64 a
+server's shutdown could hang for 20 minutes or more because
+`shutdown_called` "lacks memory barriers, causing blocked threads to never
+wake up". It made the flag a `std::atomic<bool>`, stored with release and
+loaded with acquire when the shutdown is finished.
+
+`grpc_cq.cpp` copies the shutdown and end-of-operation functions from
+`src/core/lib/surface/completion_queue.cc` (Apache License 2.0, see
+`c/grpc/LICENSE`) at that commit and, with `-DOLD`, from just before it.
+Tracing, debug-only tag checks, the queue's reference counts and the
+EventEngine callbacks are left out. `gpr_mu` is a spinlock, and the
+pollset's kick does nothing while its shutdown counts calls. `setup`
+begins one operation, then `t0` shuts the queue down while `t1` ends the
+operation. The condition is that the shutdown's check fails, or that it
+is finished other than once. The queue is the `next` kind, or with
+`-DPLUCK` or `-DCALLBACK` the `pluck` or `callback` kind.
+
+Before the fix, the flag is written under the queue's lock, before the
+shutdown's acq_rel `fetch_sub` of `pending_events`. It is read under the
+lock, or in the finishing of the shutdown after a `fetch_sub` (or acquire
+load) that reads the count the shutdown left. No blocked thread reads it.
+The tests agree: neither the old code nor the new can meet the condition,
+for all three kinds, with and without LSE, at `-O0`, `-O1`, `-O2` and
+`-Os`, each in under 6 s. To show that the test can see a bug, `-DRELAXED`
+makes the `fetch_sub`s relaxed. Only the callback queue, whose last
+operation finishes the shutdown without the lock, depends on them:
+
+| Kind | old | `f01a138e8` | old, `RELAXED` | `f01a138e8`, `RELAXED` |
+|---|---|---|---|---|
+| `next` | no | no | no | no |
+| `pluck` | no | no | no | no |
+| `callback` | no | no | ARM only | ARM only |
+
+The new code's release store and acquire load of the flag don't help with
+`RELAXED`, since neither is ordered with the `fetch_sub`s. At `-O0`
+without LSE, clang builds every `fetch_sub` as an `LDAXR`/`STLXR` loop
+whatever its order, so `RELAXED` changes nothing there. So `f01a138e8`
+fixes no ARM-only bug, and the hang must have another cause. The Ruby
+test that showed it (`active_call_spec.rb`, skipped on ARM by PR
+[#40770](https://github.com/grpc/grpc/pull/40770)) is run again now.
+
+Each turn of the spinlock's exchange that finds the lock held writes back
+the 1 it read, so the tests bound that with `--stutter 1` (see
+[Usage](#usage)). Without the bound, the `next` queue at `-O2` without
+LSE takes about 150 s to give the same verdict, old or new, and with LSE
+it doesn't finish in 10 minutes.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -2215,7 +2271,9 @@ and still in its 2.8 and 3.0 branches (see
 [HAProxy MT_LIST](#haproxy-mt_list)), and in CPython's seqlock both halves
 of the ARM-only bug that its commit `1d3cf79a5` fixed, one of them only
 without LSE, while the per-type cache that replaced it holds (see
-[CPython](#cpython)). In the
+[CPython](#cpython)), and that gRPC's completion queue shutdown was
+already ordered on ARM before its commit `f01a138e8` made the flag
+atomic (see [gRPC](#grpc)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

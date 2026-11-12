@@ -1,0 +1,5 @@
+AArch64 grpc_cq
+"A completion queue's shutdown is finished once, after shutdown_called is set"
+{ setup(); int check_failed; int shutdowns; }
+ P0 = t0 | P1 = t1 ;
+exists (check_failed=1 \/ ~shutdowns=1)

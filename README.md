@@ -1699,6 +1699,60 @@ Each lost request's tag never comes back, though the shutdown's does,
 and `grpc_completion_queue_shutdown` then never finishes. Reported as
 gRPC issue [#43934](https://github.com/grpc/grpc/issues/43934).
 
+### PostgreSQL AIO
+
+PostgreSQL 18's asynchronous IO, with `io_method=worker`, hands each IO
+to an IO worker process through a handle in shared memory. The backend
+stages the IO and puts the handle's index on the workers' submission
+queue under an LWLock. A worker takes it, performs the IO and completes
+it: it stores the raw result, runs the shared completion callbacks into
+`->distilled_result`, and sets the handle's state to
+`PGAIO_HS_COMPLETED_SHARED` with `pgaio_io_update_state()`, which puts
+`pg_write_barrier()` (a release fence) before the store. The backend
+that owns the handle sees that state and reclaims it
+(`pgaio_io_reclaim()`), running the local callbacks on
+`->distilled_result` and passing the result back to the caller,
+`WaitReadBuffers()` among them. Commit `e9a3615a5` (June 2025, "aio: Add
+missing memory barrier when waiting for IO handle") says that on Apple
+hardware the new state could be seen before the result, which caused
+rare assertion failures, most often in `WaitReadBuffers()`. Its fix
+adds `pg_read_barrier()` in `pgaio_io_wait_for_free()`, which a
+backend that has no free handle calls, between its two checks of the
+state and the reclaims that follow. The usual path, waiting for a given
+IO, already reads the state in `pgaio_io_was_recycled()`, which has the
+barrier.
+
+`postgres_aio.c` copies the functions the handle passes through from
+`src/backend/storage/aio/aio.c`, `aio_callback.c` and `method_worker.c`
+at that commit and, with `-DOLD`, from just before it (PostgreSQL
+License, see `c/postgres/LICENSE`). Debug messages, resource owners,
+interrupts, Asserts (as in a production build), condition variables
+(the waits spin), latches, and synchronous execution are left out, and
+the IO has no callbacks. The LWLock is a spinlock. `backend`, with
+`io_max_concurrency=1`, acquires a handle, stages a read and submits it,
+then acquires a handle for its next IO, which waits for the first and
+reclaims it. `worker` takes the IO from the queue, reads 8,192 bytes and
+completes it. The condition is that the result passed back to the
+backend is not `PGAIO_RS_OK` with 8,192 bytes.
+
+The old code meets the condition on ARM only, and the fixed code never
+does, at `-O1`, `-O2` and `-Os`, with and without LSE. The full search
+takes 20 to 25 s for the fixed code and 30 to 120 s for the old, and
+one sampled path of the old code finds it in about 12 s. At `-O0` the
+ARM search does not finish in 15 minutes, but one sampled path finds the
+old code's bug (in 13 s with LSE, and 27 s without, which needs 2,000
+instructions of fuel), and neither version meets the condition under
+TSO. `c/expected.txt` samples the old code. The backend gets the
+status and the byte count that its own reclaim of the handle's previous
+use left (`PGAIO_RS_UNKNOWN` and 0), in any mix, since its loads of
+`->distilled_result` can be satisfied before its load of the state. The
+handoff on master (`77bba5454f`, November 2026) is the same, with the
+barriers, except that the handle's fields are no longer enum bitfields.
+
+Each turn of the spinlock's exchange that finds the lock held writes
+back the 1 it read, so the tests bound that with `--stutter 1` (see
+[Usage](#usage)).
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,

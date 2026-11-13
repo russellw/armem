@@ -678,3 +678,14 @@ grpc_server -O2 no no -DQUEUED -DFIX_RECHECK -DRELAXED stutter=1
 grpc_server -O2 no no -DQUEUED -DFIX_RECHECK -DRELAXED -march=armv8.1-a stutter=1
 grpc_server -O2 no no -DFIX_RECHECK -DRELAXED stutter=1
 grpc_server -O2 no no -DFIX_RECHECK -DRELAXED -march=armv8.1-a stutter=1
+# The old code's lines sample one path: the full search takes about 2 minutes
+# at -O2 and doesn't finish in 15 minutes at -O0, which also needs more fuel.
+postgres_aio -O2 no no stutter=1
+postgres_aio -O2 yes no -DOLD stutter=1 sample=1
+postgres_aio -O2 no no -march=armv8.1-a stutter=1
+postgres_aio -O2 yes no -DOLD -march=armv8.1-a stutter=1 sample=1
+postgres_aio -O1 no no stutter=1
+postgres_aio -O1 yes no -DOLD stutter=1 sample=1
+postgres_aio -Os no no stutter=1
+postgres_aio -Os yes no -DOLD stutter=1 sample=1
+postgres_aio -O0 yes no -DOLD stutter=1 sample=1 fuel=2000

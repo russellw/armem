@@ -1,0 +1,5 @@
+AArch64 postgres_aio
+"A backend that reclaims its IO handle from an IO worker gets the IO's result"
+{ setup(); int status; int bytes; int errors; }
+ P0 = backend | P1 = worker ;
+exists (~status=1 \/ ~bytes=8192 \/ ~errors=0)

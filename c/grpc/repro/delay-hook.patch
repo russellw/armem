@@ -1,0 +1,22 @@
+--- a/src/core/server/server.cc	2026-11-13 14:43:18.502016484 +0000
++++ b/src/core/server/server.cc	2026-11-13 14:43:18.503757924 +0000
+@@ -27,6 +27,7 @@
+ #include <inttypes.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -1650,6 +1651,11 @@
+     FailCall(cq_idx, rc, GRPC_ERROR_CREATE("Server Shutdown"));
+     return GRPC_CALL_OK;
+   }
++  // Reproducer hook: widen the window between the check above and the push
++  // below, as a preemption here would.
++  if (const char* delay = getenv("GRPC_REPRO_QUEUE_DELAY_US")) {
++    usleep(atoi(delay));
++  }
+   RequestMatcherInterface* rm;
+   switch (rc->type) {
+     case RequestedCall::Type::BATCH_CALL:

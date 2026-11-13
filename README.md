@@ -1678,6 +1678,26 @@ the same `head_` that the request's push exchanges. Whichever exchange
 comes second reads from the first, so either the request sees the flag
 or the pop sees the request.
 
+`c/grpc/repro/repro.cc` shows the bug in gRPC itself. Each iteration
+starts a server with no ports and races `grpc_server_request_call`
+against `grpc_server_shutdown_and_notify` on two threads; the request's
+tag should come back with `success=0`. `build.sh` builds it against gRPC
+core from the `grpc` Ruby source gem, optionally with `delay-hook.patch`
+(which sleeps between the check and the push when
+`GRPC_REPRO_QUEUE_DELAY_US` is set) and `fix-recheck.patch` (the recheck
+fix). On x86_64 with 1.85.0, whose request and shutdown code is the same
+as `28d1790b9c`'s:
+
+| Build | Result |
+|---|---|
+| unmodified, 4 pairs at once | 4 requests lost within 80,000 races (14 s) |
+| recheck fix, 4 and 8 pairs | none lost in 1,000,000 races each |
+| delay hook, 100 ms | lost on the first race |
+| delay hook and recheck fix, 100 ms | none lost in 20 races |
+
+Each lost request's tag never comes back, though the shutdown's does,
+and `grpc_completion_queue_shutdown` then never finishes.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,

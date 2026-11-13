@@ -1,0 +1,16 @@
+--- a/src/core/server/server.cc
++++ b/src/core/server/server.cc
+@@ -1666,6 +1666,13 @@
+       break;
+   }
+   rm->RequestCallWithPossiblePublish(cq_idx, rc);
++  // Shutdown may have killed pending requests between the check above and
++  // the push: if it has been called since, kill them again, so that this
++  // request is failed rather than left queued.
++  if (ShutdownCalled()) {
++    MutexLock lock(mu_call_);
++    KillPendingWorkLocked(GRPC_ERROR_CREATE("Server Shutdown"));
++  }
+   return GRPC_CALL_OK;
+ }
+ 

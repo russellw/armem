@@ -1696,7 +1696,8 @@ as `28d1790b9c`'s:
 | delay hook and recheck fix, 100 ms | none lost in 20 races |
 
 Each lost request's tag never comes back, though the shutdown's does,
-and `grpc_completion_queue_shutdown` then never finishes.
+and `grpc_completion_queue_shutdown` then never finishes. Reported as
+gRPC issue [#43934](https://github.com/grpc/grpc/issues/43934).
 
 ### Calls
 

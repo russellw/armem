@@ -1620,8 +1620,12 @@ over and over against a given `grpc` gem, and dumps every thread's stack
 with gdb when a run hangs. The `gRPC Ruby hang` workflow runs it by hand
 on GitHub's arm64 runners, as gRPC's arm64 CI runs them: dbg and opt
 builds from source, each spec file in its own process, 16 at once, with
-`GRPC_VERBOSITY=DEBUG`. 80,000 runs of `active_call_spec.rb` alone, 16 at
-once, on Neoverse-N2 with an opt build of 1.80.0, didn't hang.
+`GRPC_VERBOSITY=DEBUG`. On Neoverse-N2 with 1.80.0, neither hung: 80,000
+runs of `active_call_spec.rb` alone (opt, 4 at once on each of 4
+runners), and 69,120 runs of 27 of CI's 29 spec files (dbg and opt, 16 at
+once), 2,560 of them `active_call_spec.rb`. The only failures were 2 runs
+of `channel_connection_spec.rb` that lost the port they restart on to
+another spec.
 
 Each turn of the spinlock's exchange that finds the lock held writes back
 the 1 it read, so the tests bound that with `--stutter 1` (see

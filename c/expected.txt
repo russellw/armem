@@ -646,3 +646,35 @@ grpc_cq -O2 yes no -DCALLBACK -DOLD -DRELAXED stutter=1
 grpc_cq -O2 yes no -DCALLBACK -DOLD -DRELAXED -march=armv8.1-a stutter=1
 grpc_cq -O0 no no -DCALLBACK -DOLD -DRELAXED stutter=1
 grpc_cq -O0 yes no -DCALLBACK -DOLD -DRELAXED -march=armv8.1-a stutter=1
+
+# gRPC's server: QueueRequestedCall racing ShutdownAndNotify (see "gRPC" in
+# README.md), at commit 28d1790b9c. A request pushed after shutdown's last
+# KillPendingWorkLocked is never failed, under any memory model. FIX_LOCK
+# holds mu_call_ across the check and the push; FIX_RECHECK checks the flag
+# again after the push. QUEUED queues another request first, so the push
+# takes no lock; RELAXED makes ShutdownCalled()'s load relaxed, which the
+# recheck does not depend on, since the queue's exchanges of head_ order
+# it. QUEUED runs at -O2 only: at -O0 it needs more fuel than 1000 and
+# takes minutes. stutter=1 bounds the spinlocks.
+grpc_server -O2 yes yes stutter=1
+grpc_server -O2 yes yes -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DFIX_LOCK stutter=1
+grpc_server -O2 no no -DFIX_LOCK -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DFIX_RECHECK stutter=1
+grpc_server -O2 no no -DFIX_RECHECK -march=armv8.1-a stutter=1
+grpc_server -O0 yes yes stutter=1
+grpc_server -O0 yes yes -march=armv8.1-a stutter=1
+grpc_server -O0 no no -DFIX_LOCK stutter=1
+grpc_server -O0 no no -DFIX_LOCK -march=armv8.1-a stutter=1
+grpc_server -O0 no no -DFIX_RECHECK stutter=1
+grpc_server -O0 no no -DFIX_RECHECK -march=armv8.1-a stutter=1
+grpc_server -O2 yes yes -DQUEUED stutter=1
+grpc_server -O2 yes yes -DQUEUED -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_LOCK stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_LOCK -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_RECHECK stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_RECHECK -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_RECHECK -DRELAXED stutter=1
+grpc_server -O2 no no -DQUEUED -DFIX_RECHECK -DRELAXED -march=armv8.1-a stutter=1
+grpc_server -O2 no no -DFIX_RECHECK -DRELAXED stutter=1
+grpc_server -O2 no no -DFIX_RECHECK -DRELAXED -march=armv8.1-a stutter=1

@@ -1633,6 +1633,51 @@ the 1 it read, so the tests bound that with `--stutter 1` (see
 LSE takes about 150 s to give the same verdict, old or new, and with LSE
 it doesn't finish in 10 minutes.
 
+Reading the server's side of shutdown turned up a different bug, one
+that doesn't depend on memory order. `grpc_server_request_call` begins an
+operation on the notification queue, and `Server::QueueRequestedCall`
+then checks `ShutdownCalled()` and, if shutdown hasn't been called, pushes
+the request onto a lock-free queue to wait for a call.
+`Server::ShutdownAndNotify` fails the queued requests first and marks
+shutdown as called after, and `MaybeFinishShutdown` fails them once more
+before publishing the shutdown. A request whose check comes before the
+mark and whose push comes after that last kill is never failed. Its
+operation never ends, so the queue's shutdown never finishes and a
+thread waiting for it waits forever. If the server is destroyed instead,
+`~RealRequestMatcher`'s `GRPC_CHECK_EQ(queue.Pop(), nullptr)` fails. Ruby
+can't hit it, since the GVL serializes its calls to both functions, but a
+C++ server that requests calls on one thread while another shuts it down
+can.
+
+`grpc_server.cpp` copies `QueueRequestedCall`, `ShutdownAndNotify`,
+`MaybeFinishShutdown`, the matcher's queueing and killing, and the queue
+(`src/core/util/mpscq.cc`) from commit `28d1790b9c` (November 2026), for
+a server with no channels or listeners left, so that shutdown publishes
+at once. `t0` requests a call and `t1` shuts the server down. The
+condition is that the request is failed other than once, or that
+shutdown isn't published. With `-DQUEUED`, another request is queued
+first, so the push takes no lock. Two fixes are tried. `-DFIX_LOCK` holds
+`mu_call_` across the check and the push. `-DFIX_RECHECK` checks the flag
+again after the push and, if it is now set, fails the queued requests
+itself:
+
+| Variant | ARM | TSO |
+|---|---|---|
+| as in gRPC | yes | yes |
+| `-DFIX_LOCK` | no | no |
+| `-DFIX_RECHECK` | no | no |
+| `-DFIX_RECHECK -DRELAXED` | no | no |
+
+Each verdict is the same with and without `-DQUEUED` and LSE, at `-O2`
+and, without `-DQUEUED`, at `-O0` (`-DQUEUED` at `-O0` needs more fuel than 1000 and
+takes minutes). The recheck looks like store buffering, which ARM allows
+unless both sides are ordered. But it holds even with `-DRELAXED`, which
+makes `ShutdownCalled()`'s load relaxed. For the shutdown's pop to miss
+the request, the pop must reach its `Push(&stub_)`, an acq_rel exchange of
+the same `head_` that the request's push exchanges. Whichever exchange
+comes second reads from the first, so either the request sees the flag
+or the pop sees the request.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -2286,7 +2331,8 @@ of the ARM-only bug that its commit `1d3cf79a5` fixed, one of them only
 without LSE, while the per-type cache that replaced it holds (see
 [CPython](#cpython)), and that gRPC's completion queue shutdown was
 already ordered on ARM before its commit `f01a138e8` made the flag
-atomic (see [gRPC](#grpc)). In the
+atomic, while its server can lose a call requested during shutdown on
+any machine (see [gRPC](#grpc)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

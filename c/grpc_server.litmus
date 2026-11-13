@@ -1,0 +1,5 @@
+AArch64 grpc_server
+"A server's requested call is failed exactly once when the server shuts down"
+{ setup(); int failed0; int failed1; int published; }
+ P0 = t0 | P1 = t1 ;
+exists (~published=1 \/ (failed0=0 /\ failed1=0) \/ (failed0=1 /\ failed1=1))

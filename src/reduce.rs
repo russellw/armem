@@ -139,6 +139,12 @@ pub struct Reduction {
     release_writes: Vec<Footprints>,
     /// Writes of atomics and store-exclusives.
     atomic_writes: Vec<Footprints>,
+    /// Writes of acquire atomics that write back the value they read (an
+    /// add of 0), and of store-exclusives that write back the value an
+    /// acquire load-exclusive read, which copy a published value (see
+    /// `Publication`) without publishing anything, and all other writes.
+    copy_writes: Vec<Footprints>,
+    noncopy_writes: Vec<Footprints>,
     /// The thread may order any read before any later read: it has a full
     /// barrier, DMB LD, or an ISB (after a control dependency), or its
     /// dependencies were too costly to find.
@@ -275,6 +281,59 @@ impl Reduction {
             self.write_read(a, x) && hits(&self.reads[a], y) && !self.fresh(a, y)
         };
         !via_reader && !internal
+    }
+
+    /// May the memory `mem, y` be skipped because `y` is one piece of a
+    /// write split into single-copy-atomic pieces (an unaligned store, say)
+    /// and a piece of the same write with higher priority is not yet in
+    /// `mem`, and nothing may order that piece after `y`?
+    ///
+    /// `prunable` only compares the last two messages, so the pieces of one
+    /// write, which nothing orders, could be appended in any subset before
+    /// the rest: the 16 byte pieces of an unaligned 16-byte store gave
+    /// 2^16 memories. Let thread A write `y` with a write whose footprint
+    /// `F` (the only one by A overlapping `y`) contains `y` and starts below
+    /// it, and let some byte of `F` below `y` have no message of A in
+    /// `mem`. Suppose an execution's least memory (see the module comment)
+    /// begins `mem, y`, with `y` from an instance `I` of such a write.
+    /// - No earlier write by A overlaps `F` except one with footprint `F`,
+    ///   whose piece at `y`'s bytes would be coherence-before `y`, and so in
+    ///   `mem`: there is none, since `mem` has no message of A overlapping
+    ///   `y`.
+    /// - So the piece `x` of `I` holding that byte below `y` comes after
+    ///   `y`, and has higher priority. Its ordered-before predecessors in
+    ///   A are those of `y` (the same instruction, and so the same
+    ///   dependencies, barriers and acquires), which precede `y`. It has no
+    ///   coherence predecessor: no other thread writes `F`, and A has no
+    ///   earlier write to it. Nor a from-read predecessor: each other
+    ///   thread's reads of `F` read `x` or a later write (`fresh`).
+    /// - So moving `x` to just before `y` gives a memory of the same
+    ///   execution that is smaller, a contradiction.
+    ///
+    /// A pair of registers counts as one footprint (see `StorePair` in
+    /// `Havoc`), which overlaps the two halves', so their pieces are never
+    /// pruned this way: they have different data dependencies.
+    pub fn piece_prunable(&self, y: &Msg, mem: &[Msg]) -> bool {
+        let a = y.tid;
+        let (ya, yn) = (y.addr, y.size.bytes());
+        let overlap = |f: (u64, u64), g: (u64, u64)| f.0 < g.0 + g.1 && g.0 < f.0 + f.1;
+        let mut ws = self.writes[a].iter().copied().filter(|&f| overlap(f, (ya, yn)));
+        let (Some(f), None) = (ws.next(), ws.next()) else { return false };
+        if !(f.0 < ya && ya + yn <= f.0 + f.1) {
+            return false;
+        }
+        let Some(size) = Size::from_bytes(f.1) else { return false };
+        let whole = Msg { addr: f.0, size, val: 0, tid: a };
+        if self.writes[a].iter().any(|&g| g != f && overlap(g, f))
+            || hits(&self.atomic_writes[a], &whole)
+            || hits(&self.release_writes[a], &whole)
+            || (f.0..f.0 + f.1).any(|b| self.writers.get(&b).is_some_and(|w| w.iter().any(|&t| t != a)))
+            || (0..self.reads.len()).any(|c| c != a && hits(&self.reads[c], &whole) && !self.fresh(c, &whole))
+        {
+            return false;
+        }
+        let by_a = |lo: u64, hi: u64| mem.iter().any(|m| m.tid == a && m.addr < hi && lo < m.addr + m.size.bytes());
+        !by_a(ya, ya + yn) && (f.0..ya).any(|b| !by_a(b, b + 1))
     }
 }
 
@@ -471,7 +530,12 @@ fn orderings(code: &Code) -> (bool, bool, bool, bool) {
 /// after the source, its epoch (when finding ordering points), and (when
 /// finding the readers of publications) whether it has read a published
 /// value.
-type HState = (Core, Option<(u64, Size)>, Own, bool, Epoch, bool);
+type HState = (Core, Monitor, Own, bool, Epoch, bool);
+
+/// A run's exclusive monitor: the location of the last exclusive load, and
+/// the value it returned if it was an acquire and the analysis knows it
+/// (see `copying` in `Havoc`).
+type Monitor = Option<(u64, Size, Option<u64>)>;
 
 /// Where a run is between the thread's ordering points (when finding
 /// them, see `Events`; otherwise always the default). Each count stops at
@@ -711,6 +775,12 @@ struct Havoc<'a> {
     addr_dep: bool,
     /// Footprints of all writes, and of exclusive reads.
     write_fps: Footprints,
+    /// Footprints of the writes that copy the value they read (see
+    /// `Reduction::copy_writes`), and of all other writes.
+    copy_fps: Footprints,
+    noncopy_fps: Footprints,
+    /// Set while such a copy writes.
+    copying: bool,
     /// Instructions that read memory, with the footprints of their reads.
     read_pcs: BTreeMap<usize, Footprints>,
     /// Set when finding dependencies.
@@ -760,6 +830,9 @@ impl<'a> Havoc<'a> {
             budget,
             reads: Footprints::new(),
             write_fps: Footprints::new(),
+            copy_fps: Footprints::new(),
+            noncopy_fps: Footprints::new(),
+            copying: false,
             acquire_reads: Footprints::new(),
             release_writes: Footprints::new(),
             atomic_writes: Footprints::new(),
@@ -928,6 +1001,11 @@ impl<'a> Havoc<'a> {
             (t < UNKNOWN).then_some((v >> (8 * (i % h))) as u8)
         };
         self.write_fps.insert((a, n));
+        if self.copying {
+            self.copy_fps.insert((a, n));
+        } else {
+            self.noncopy_fps.insert((a, n));
+        }
         if let Some(e) = &mut self.events {
             let whole = parts.iter().enumerate().fold(0u128, |w, (j, p)| w | p.0 << (8 * h * j as u64));
             e.events.insert(((a, n), (data < UNKNOWN).then_some(whole), self.epoch, self.release));
@@ -1143,10 +1221,15 @@ impl<'a> Havoc<'a> {
             }
         }
         (self.epoch, self.release) = (now, release);
+        // A store-exclusive that fails writes nothing, so it is no release
+        // write: the run after it keeps the count of releases (a retry loop
+        // would otherwise saturate it).
+        let failed = Epoch { releases: now.releases, ..next };
+        let next = std::cell::Cell::new(next);
         let mut out = Vec::new();
-        let mut push = |mut c: Core, m: Option<(u64, Size)>, o: Own| {
+        let mut push = |mut c: Core, m: Monitor, o: Own| {
             c.retire(prog);
-            out.push((c, m, o, after, next, seen));
+            out.push((c, m, o, after, next.get(), seen));
         };
         (self.pc, self.after, self.ordered) = (core.pc, after, false);
         match op {
@@ -1154,7 +1237,8 @@ impl<'a> Havoc<'a> {
                 for (v, t) in self.read(&own, addr, size.bytes(), kind != LoadKind::Plain) {
                     let mut c = core.clone();
                     c.set(rt, reg(size.extend(v as u64, signed), t));
-                    push(c, if excl { Some((addr.val, size)) } else { mon }, own.clone());
+                    let copied = (kind != LoadKind::Plain && t < UNKNOWN).then_some(v as u64);
+                    push(c, if excl { Some((addr.val, size, copied)) } else { mon }, own.clone());
                 }
             }
             MemOp::LoadExclPair { addr, rt, rt2, size, acquire } => {
@@ -1174,7 +1258,7 @@ impl<'a> Havoc<'a> {
                         let mut c = core.clone();
                         c.set(rt, reg(lo as u64, t1));
                         c.set(rt2, reg(hi as u64, t2));
-                        push(c, Some((addr.val, total)), own.clone());
+                        push(c, Some((addr.val, total, None)), own.clone());
                     }
                 }
             }
@@ -1246,14 +1330,21 @@ impl<'a> Havoc<'a> {
                 if release {
                     self.release_writes.insert((addr.val, size.bytes()));
                 }
-                if mon == Some((addr.val, size)) {
+                if let Some((a, sz, copied)) = mon
+                    && (a, sz) == (addr.val, size)
+                {
+                    // A store of the value an acquire exclusive load read
+                    // writes it back, as an atomic add of 0 does.
+                    self.copying = taint(data) < UNKNOWN && copied == Some(size.mask(data.val));
                     let mut o = own.clone();
                     self.write(&mut o, addr, size.bytes(), size.mask(data.val) as u128, taint(data));
+                    self.copying = false;
                     let mut c = core.clone();
                     c.set(rs, status(0));
                     push(c, None, o);
                 }
                 core.set(rs, status(1));
+                next.set(failed);
                 push(core, None, own);
             }
             MemOp::StoreExclPair { addr, data, data2, rs, size, release } => {
@@ -1262,7 +1353,7 @@ impl<'a> Havoc<'a> {
                 if release {
                     self.release_writes.insert((addr.val, total.bytes()));
                 }
-                if mon == Some((addr.val, total)) {
+                if mon.is_some_and(|(a, sz, _)| (a, sz) == (addr.val, total)) {
                     let mut o = own.clone();
                     let (d1, d2) = (size.mask(data.val) as u128, size.mask(data2.val) as u128);
                     self.write_parts(&mut o, addr, total.bytes(), &[(d1, taint(data)), (d2, taint(data2))]);
@@ -1271,6 +1362,7 @@ impl<'a> Havoc<'a> {
                     push(c, None, o);
                 }
                 core.set(rs, status(1));
+                next.set(failed);
                 push(core, None, own);
             }
             MemOp::Rmw { addr, op, operand, cmp, rt, size, acquire, release, .. } => {
@@ -1279,6 +1371,12 @@ impl<'a> Havoc<'a> {
                 if release {
                     self.release_writes.insert((addr.val, n));
                 }
+                // An acquire atomic that writes back what it read.
+                self.copying = acquire
+                    && cmp.is_none()
+                    && taint(operand) == 0
+                    && size.mask(operand.val) == 0
+                    && matches!(op, RmwOp::Add | RmwOp::Clr | RmwOp::Eor | RmwOp::Set);
                 for (old, t) in self.read(&own, addr, n, acquire) {
                     let old = old as u64;
                     let mut o = own.clone();
@@ -1299,6 +1397,7 @@ impl<'a> Havoc<'a> {
                     c.set(rt, reg(old, t));
                     push(c, mon, o);
                 }
+                self.copying = false;
             }
             MemOp::Barrier(_) => push(core, mon, own),
             MemOp::Clrex => push(core, None, own),
@@ -1312,7 +1411,12 @@ impl<'a> Havoc<'a> {
         // A read of a published value (see `Publication`) is ordered before
         // every later read if it is an acquire, or once the run passes a
         // barrier that orders reads.
-        if let (Some(d), MemOp::Load { addr, rt, size, signed, .. }) = (&self.dep, op)
+        let published_read = match op {
+            MemOp::Load { addr, rt, size, signed, .. } => Some((addr, rt, size, signed)),
+            MemOp::Rmw { addr, rt, size, .. } => Some((addr, rt, size, false)),
+            _ => None,
+        };
+        if let (Some(d), Some((addr, rt, size, signed))) = (&self.dep, published_read)
             && !d.published.is_empty()
             && rt.idx != crate::isa::ZR
         {
@@ -1408,15 +1512,35 @@ fn must_precede(y: &Event, p: &Event) -> bool {
 
 /// The publications of writer `a` (see `Publication`), without the
 /// readers' side: groups of (location, value) pairs, each with the
-/// footprints it protects.
-fn publications(test: &Test, a: usize, events: &BTreeSet<Event>, writers: &HashMap<u64, BTreeSet<usize>>) -> Vec<(BTreeSet<((u64, u64), u128)>, Footprints)> {
+/// footprints it protects. `copies_only(t, p)` says whether thread `t`
+/// writes the location `p` only with acquire atomics or exclusive pairs
+/// that write back the value they read, and with `p`'s footprint (see
+/// `Reduction::copy_writes`).
+///
+/// Such copies do not stop `p` from publishing. Where A's write `p` alone
+/// gives `P` the value `v`, a copy writes `v` only after reading it from
+/// `p` or from an earlier copy, which it reads either from another thread
+/// (an `rfe` edge, ordered) or from its own thread's earlier copy, whose
+/// read is an acquire and so orders every later access. Its write follows
+/// its read (`rmw`, which a successful store-exclusive forms with its
+/// load-exclusive). By induction every copy, and every read of `v` from
+/// one (`rfe`, or after the acquire in the copying thread), is ordered
+/// after `p`, as a read of `v` from `p` itself is.
+fn publications(
+    test: &Test,
+    a: usize,
+    events: &BTreeSet<Event>,
+    writers: &HashMap<u64, BTreeSet<usize>>,
+    copies_only: &dyn Fn(usize, (u64, u64)) -> bool,
+) -> Vec<(BTreeSet<((u64, u64), u128)>, Footprints)> {
     let overlap = |f: (u64, u64), g: (u64, u64)| f.0 < g.0 + g.1 && g.0 < f.0 + f.1;
     let fps: BTreeSet<(u64, u64)> = events.iter().map(|e| e.0).collect();
     // For each footprint it may protect, the (location, value) pairs that do.
     let mut by: BTreeMap<(u64, u64), BTreeSet<((u64, u64), u128)>> = BTreeMap::new();
     for &p in &fps {
         let (pa, pn) = p;
-        let only_a = (pa..pa + pn).all(|b| writers.get(&b).is_some_and(|w| w.len() == 1 && w.contains(&a)));
+        let only_a = (pa..pa + pn)
+            .all(|b| writers.get(&b).is_some_and(|w| w.contains(&a) && w.iter().all(|&t| t == a || copies_only(t, p))));
         let same_fp = events.iter().filter(|e| overlap(e.0, p)).all(|e| e.0 == p && e.1.is_some());
         if !matches!(pn, 1 | 2 | 4 | 8) || pa % pn != 0 || !only_a || !same_fp {
             continue;
@@ -1494,6 +1618,8 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
         acquire_reads: vec![Footprints::new(); n],
         release_writes: vec![Footprints::new(); n],
         atomic_writes: vec![Footprints::new(); n],
+        copy_writes: vec![Footprints::new(); n],
+        noncopy_writes: vec![Footprints::new(); n],
         ..Reduction::default()
     };
     let mut read_pcs: Vec<BTreeMap<usize, Footprints>> = vec![BTreeMap::new(); n];
@@ -1505,15 +1631,25 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
     // rounds it has grown in, and the rounds since it last grew.
     let mut streaks: HashMap<u64, (usize, usize)> = HashMap::new();
     let mut writers: HashMap<u64, BTreeSet<usize>> = HashMap::new();
+    // The threads that may write each byte other than with copies (see
+    // `Reduction::copy_writes`), for `Havoc::own_only`. A copy is a
+    // single-copy-atomic read-modify-write that writes back the value it
+    // read, so it sits in the coherence order right after the write it
+    // read, with the same value: the values a byte takes, in coherence
+    // order, are those of the other writes. If one thread T makes them all,
+    // a read by T returns T's latest write, as with no copies: a later
+    // write of T is coherence-after the read, and so is any copy of it.
+    let mut own_writers: HashMap<u64, BTreeSet<usize>> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
         let mut grown: BTreeSet<u64> = BTreeSet::new();
         let mut new_vals = vals.clone();
         let mut new_writers = writers.clone();
+        let mut new_own_writers = own_writers.clone();
         let mut new_writer = false;
         let mut words_grown = false;
         for tid in 0..n {
             let mut h = loop {
-                let mut h = Havoc::new(test, tid, bound, &vals, &writers, &read_bytes[tid], &mut budget, None, lives[tid].as_ref());
+                let mut h = Havoc::new(test, tid, bound, &vals, &own_writers, &read_bytes[tid], &mut budget, None, lives[tid].as_ref());
                 let r = h.run(h.start());
                 if h.missed.is_empty() {
                     r?;
@@ -1532,6 +1668,13 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
             red.acquire_reads[tid].append(&mut h.acquire_reads);
             red.release_writes[tid].append(&mut h.release_writes);
             red.atomic_writes[tid].append(&mut h.atomic_writes);
+            for &(a, len) in &h.noncopy_fps {
+                for b in a..a + len {
+                    new_writer |= new_own_writers.entry(b).or_default().insert(tid);
+                }
+            }
+            red.copy_writes[tid].append(&mut h.copy_fps);
+            red.noncopy_writes[tid].append(&mut h.noncopy_fps);
             for ((a, len), vs) in h.word_writes {
                 for b in a..a + len {
                     new_vals.cover.entry(b).or_default().insert((a, len));
@@ -1590,6 +1733,7 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
         }
         vals = new_vals;
         writers = new_writers;
+        own_writers = new_own_writers;
         if grown.is_empty() && !new_writer && !words_grown {
             for (tid, th) in test.threads.iter().enumerate() {
                 let (full, rr, st, acquire) = orderings(&th.code);
@@ -1606,7 +1750,7 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
                         f.iter().any(|&(a, len)| (a..a + len).any(|b| writers.get(&b).is_some_and(|w| w.iter().any(|&t| t != tid))))
                     };
                     let pcs: BTreeSet<usize> = read_pcs[tid].iter().filter(|(_, f)| others(f)).map(|(&pc, _)| pc).collect();
-                    dep_orders(test, tid, bound, &vals, &writers, &read_bytes[tid], &pcs, lives[tid].as_ref())
+                    dep_orders(test, tid, bound, &vals, &own_writers, &read_bytes[tid], &pcs, lives[tid].as_ref())
                 } else {
                     Some(Vec::new())
                 };
@@ -1618,7 +1762,7 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
             }
             // Ordering points in program order, and publications.
             for a in 0..n {
-                let events = write_events(test, a, bound, &vals, &writers, &read_bytes[a], lives[a].as_ref());
+                let events = write_events(test, a, bound, &vals, &own_writers, &read_bytes[a], lives[a].as_ref());
                 red.write_epochs.push(events.as_ref().map(|es| {
                     let mut m: BTreeMap<(u64, u64), BTreeSet<u8>> = BTreeMap::new();
                     for e in es {
@@ -1628,11 +1772,15 @@ fn analyze_with(test: &Test, bound: Bound, live: bool) -> Option<Reduction> {
                 }));
                 let mut pubs = Vec::new();
                 let es_fps: Footprints = events.iter().flatten().map(|e| e.0).collect();
-                for (published, protected) in events.map(|es| publications(test, a, &es, &writers)).unwrap_or_default() {
+                let copies_only = |t: usize, p: (u64, u64)| {
+                    let overlap = |f: &(u64, u64)| f.0 < p.0 + p.1 && p.0 < f.0 + f.1;
+                    !red.noncopy_writes[t].iter().any(overlap) && red.copy_writes[t].iter().filter(|f| overlap(f)).all(|&f| f == p)
+                };
+                for (published, protected) in events.map(|es| publications(test, a, &es, &writers, &copies_only)).unwrap_or_default() {
                     let unordered = (0..n)
                         .map(|c| {
                             let reads = c != a && protected.iter().any(|&f| red.reads[c].iter().any(|&(p, m)| p < f.0 + f.1 && f.0 < p + m));
-                            reads.then(|| unpublished_reads(test, c, bound, &vals, &writers, &read_bytes[c], &published, lives[c].as_ref())).flatten()
+                            reads.then(|| unpublished_reads(test, c, bound, &vals, &own_writers, &read_bytes[c], &published, lives[c].as_ref())).flatten()
                         })
                         .collect();
                     let unprotected = es_fps.difference(&protected).copied().collect();

@@ -2125,6 +2125,10 @@ impl<'a> Explorer<'a> {
                         continue;
                     }
                 }
+                if self.reduction.as_ref().is_some_and(|r| r.piece_prunable(&msg, mem)) {
+                    self.results.stats.pruned += 1;
+                    continue;
+                }
                 let mut m2 = mem.to_vec();
                 m2.push(msg);
                 if skip(&m2) {

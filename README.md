@@ -2053,6 +2053,34 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   both sides of itself for the first rule. Counting it only before itself
   lost final states in a random test, where the write of a `SWPAL` must
   come before the thread's later store.)
+  Several rules make the pre-pass's publication rule hold in more code.
+  A store-exclusive that fails writes nothing and so is no release: the
+  pre-pass counts ordering points along its failure path without it.
+  Otherwise a lock's retry loop counts releases without bound, and every
+  write after it looks as if it may follow a release. Another thread
+  may write `P` too, if only with acquire atomics that write back the
+  value they read, such as PostgreSQL's `pg_atomic_read_membarrier_u32`,
+  an add of 0 (or, without LSE, a store-exclusive of what an acquire
+  load-exclusive read): such a copy of `v` writes it only after reading
+  it, from A's write or an earlier copy, so a read of `v` from a copy is
+  ordered after A's write as one from A's write is. A read by such an atomic
+  counts as a read of `P`. And a thread's reads of bytes only it writes
+  return its own earlier writes (coherence), so the pre-pass does not
+  take them to return the values its later writes store. Before that,
+  a writer that read back a counter of its own counted it up without
+  bound, its addresses widened to unknown, and the pre-pass gave up.
+  Finally, the pieces of a write that is split into single-copy-atomic
+  pieces (an unaligned store) are not ordered among themselves, but the
+  rule that compares the last two messages of a memory lets them come
+  in any subset before the rest: an unaligned 16-byte store has 16 byte
+  pieces, and so 2^16 orders. A memory whose last message is such a
+  piece is skipped while a piece of the same write with higher priority
+  (a lower address) is not yet in it, if no other write of the thread
+  overlaps the write, no other thread writes it, and every other
+  thread's reads of it are published (see `Reduction::piece_prunable`).
+  That cut a message-passing test with an unaligned `STR Q` from 65
+  memories to 8. `tests/por.rs` checks it with random tests that
+  publish an unaligned store through a flag.
 * **Dynamic reduction** (on by default; `--no-dynamic-por` turns it off;
   see [docs/dynamic-reduction.md](docs/dynamic-reduction.md)). Where the
   pre-pass cannot rule out that some thread orders the last two writes

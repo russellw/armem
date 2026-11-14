@@ -81,7 +81,10 @@ impl Rng {
 
 /// A random test: 2 or 3 threads of 2 to 4 accesses (fewer unless `large`) to three 32-bit
 /// locations, mixing sizes, barriers, dependencies, acquire/release,
-/// exclusives and atomics. Every register and location is observed.
+/// exclusives and atomics, and to an unaligned 8-byte location (whose
+/// writes are split into pieces), with atomics that write back what they
+/// read (copies, see `reduce::Reduction::copy_writes`). Every register and
+/// location is observed.
 fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
     let threads = 2 + rng.below(2);
     let mut cols: Vec<Vec<String>> = Vec::new();
@@ -127,7 +130,26 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
                 }
                 None => format!("[{}]", loc),
             };
-            match rng.below(13) {
+            match rng.below(15) {
+                // An unaligned 4-byte store or load: one access in byte
+                // pieces.
+                13 => {
+                    if rng.below(2) == 0 {
+                        code.push(format!("MOV W9,#{}", val * 0x101));
+                        code.push("STR W9,[X6,#2]".into());
+                    } else {
+                        let r = fresh();
+                        code.push(format!("{} {},[X6,#{}]", ["LDR", "LDR", "LDRH"][rng.below(3)], r, [2, 2, 4][rng.below(3)]));
+                        loaded.push(r);
+                    }
+                }
+                // An acquire atomic that writes back the value it read.
+                14 => {
+                    let r = fresh();
+                    code.push("MOV W9,#0".into());
+                    code.push(format!("{} W9,{},[{}]", ["LDADDA", "LDADDAL", "LDSETA", "LDEORAL"][rng.below(4)], r, loc));
+                    loaded.push(r);
+                }
                 // An exclusive pair, on the thread's own location.
                 12 if loc == "X4" && rng.below(2) == 0 => {
                     let (r, r2, s) = (fresh(), fresh(), fresh());
@@ -183,9 +205,9 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
         cols.push(code);
     }
     let rows = cols.iter().map(Vec::len).max().unwrap();
-    let mut src = format!("AArch64 random-{}\n{{ uint32_t x; uint32_t y; uint32_t z;", n);
+    let mut src = format!("AArch64 random-{}\n{{ uint32_t x; uint32_t y; uint32_t z; uint16_t q[4];", n);
     for tid in 0..threads {
-        src.push_str(&format!(" uint64_t p{0}; {0}:X1=x; {0}:X2=y; {0}:X3=z; {0}:X4=p{0};", tid));
+        src.push_str(&format!(" uint64_t p{0}; {0}:X1=x; {0}:X2=y; {0}:X3=z; {0}:X4=p{0}; {0}:X6=q;", tid));
     }
     src.push_str(" }\n");
     src.push_str(&(0..threads).map(|t| format!("P{}", t)).collect::<Vec<_>>().join(" | "));
@@ -196,7 +218,7 @@ fn random_test(rng: &mut Rng, n: usize, large: bool) -> String {
         src.push_str(" ;\n");
     }
     let own: Vec<String> = (0..threads).map(|t| format!("p{}", t)).collect();
-    src.push_str(&format!("locations [x; y; z; {}; {}]\n", own.join("; "), observed.join("; ")));
+    src.push_str(&format!("locations [x; y; z; q[1]; q[2]; {}; {}]\n", own.join("; "), observed.join("; ")));
     src
 }
 
@@ -210,12 +232,130 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// arguments, `ARMEM_POR_VERBOSE` prints the size and time of each test,
 /// and `ARMEM_POR_DUMP=n` prints test `n`.
 fn random_tests(count: usize, seed: u64, large: bool, budget: u64) {
+    random_tests_with(random_test, count, seed, large, budget)
+}
+
+/// A random test of a write split into pieces (an unaligned 4-byte store
+/// to `q`) published through a flag, for `Reduction::piece_prunable` and
+/// the publications it relies on: P0 stores to `q` (sometimes twice, or
+/// again after the flag) and then writes the flag, after a random ordering
+/// point (or none); each other thread may copy the flag with an acquire
+/// atomic or exclusive pair that writes back what it read, reads it, and reads part of `q`
+/// after a random ordering (or none), and P1 sometimes writes `q` too.
+fn random_publish_test(rng: &mut Rng, n: usize, _large: bool) -> String {
+    let threads = 2 + rng.below(2);
+    let mut cols: Vec<Vec<String>> = Vec::new();
+    let mut observed = Vec::new();
+    let mut p0 = Vec::new();
+    if rng.below(3) == 0 {
+        p0.push("MOV W9,#7".to_string());
+        p0.push("STR W9,[X2]".into());
+    }
+    p0.push("MOV W9,#0x0202".into());
+    p0.push("MOVK W9,#0x0202,LSL #16".into());
+    p0.push("STR W9,[X6,#2]".into());
+    if rng.below(5) == 0 {
+        p0.push("MOV W9,#3".into());
+        p0.push(["STRB W9,[X6,#3]", "STR W9,[X6,#2]"][rng.below(2)].into());
+    }
+    match rng.below(4) {
+        0 => p0.push("DMB ST".into()),
+        1 => p0.push("DMB SY".into()),
+        _ => {}
+    }
+    p0.push("MOV W9,#1".into());
+    p0.push(["STR W9,[X1]", "STLR W9,[X1]", "SWPAL W9,W10,[X1]", "STLR W9,[X1]"][rng.below(4)].into());
+    if p0.last().unwrap().starts_with("SWPAL") {
+        observed.push("0:X10".to_string());
+    }
+    if rng.below(5) == 0 {
+        p0.push("MOV W9,#5".into());
+        p0.push("STR W9,[X6,#2]".into());
+    }
+    cols.push(p0);
+    for tid in 1..threads {
+        let mut c = Vec::new();
+        let mut next = 10;
+        let mut fresh = |observed: &mut Vec<String>| {
+            let r = next;
+            next += 1;
+            observed.push(format!("{}:X{}", tid, r));
+            r
+        };
+        match rng.below(6) {
+            0 | 1 => {
+                let r = fresh(&mut observed);
+                c.push("MOV W9,#0".into());
+                c.push(format!("{} W9,W{},[X1]", ["LDADDA", "LDADDAL", "LDSETA"][rng.below(3)], r));
+            }
+            2 => {
+                // One attempt at a copy with an exclusive pair (or, with a
+                // plain load-exclusive or a store of 0, not a copy).
+                let (r, st) = (fresh(&mut observed), fresh(&mut observed));
+                c.push("MOV W9,#0".into());
+                c.push(format!("{} W{},[X1]", ["LDAXR", "LDAXR", "LDXR"][rng.below(3)], r));
+                let data = if rng.below(4) == 0 { 9 } else { r };
+                c.push(format!("{} W{},W{},[X1]", ["STXR", "STLXR"][rng.below(2)], st, data));
+            }
+            _ => {}
+        }
+        let f = fresh(&mut observed);
+        c.push(format!("{} W{},[X1]", ["LDR", "LDAR", "LDAPR", "LDAR"][rng.below(4)], f));
+        let read = ["LDR", "LDRB", "LDRH"][rng.below(3)];
+        let off = match read {
+            "LDRB" => 2 + rng.below(4),
+            "LDRH" => [2, 4][rng.below(2)],
+            _ => 2,
+        };
+        let r = fresh(&mut observed);
+        match rng.below(5) {
+            0 => {
+                c.push("DMB LD".into());
+                c.push(format!("{} W{},[X6,#{}]", read, r, off));
+            }
+            1 => {
+                c.push(format!("EOR W8,W{},W{}", f, f));
+                c.push(format!("ADD X7,X6,#{}", off));
+                c.push(format!("{} W{},[X7,W8,SXTW]", read, r));
+            }
+            2 => {
+                c.push(format!("CBZ W{},L{}", f, tid));
+                c.push("ISB".into());
+                c.push(format!("{} W{},[X6,#{}]", read, r, off));
+                c.push(format!("L{}:", tid));
+            }
+            _ => c.push(format!("{} W{},[X6,#{}]", read, r, off)),
+        }
+        if tid == 1 && rng.below(6) == 0 {
+            c.push("MOV W9,#9".into());
+            c.push("STRB W9,[X6,#4]".into());
+        }
+        cols.push(c);
+    }
+    let rows = cols.iter().map(Vec::len).max().unwrap();
+    let mut src = format!("AArch64 random-publish-{}\n{{ uint32_t flag; uint32_t y; uint16_t q[4];", n);
+    for tid in 0..threads {
+        src.push_str(&format!(" {0}:X1=flag; {0}:X2=y; {0}:X6=q;", tid));
+    }
+    src.push_str(" }\n");
+    src.push_str(&(0..threads).map(|t| format!("P{}", t)).collect::<Vec<_>>().join(" | "));
+    src.push_str(" ;\n");
+    for i in 0..rows {
+        let row: Vec<&str> = cols.iter().map(|c| c.get(i).map_or("", String::as_str)).collect();
+        src.push_str(&row.join(" | "));
+        src.push_str(" ;\n");
+    }
+    src.push_str(&format!("locations [flag; y; q[1]; q[2]; {}]\n", observed.join("; ")));
+    src
+}
+
+fn random_tests_with(generate: fn(&mut Rng, usize, bool) -> String, count: usize, seed: u64, large: bool, budget: u64) {
     let count = env("ARMEM_POR_TESTS", count);
     let budget = env("ARMEM_POR_BUDGET", budget);
     let mut rng = Rng(env("ARMEM_POR_SEED", seed));
     let (mut full, mut reduced, mut skipped) = (0, 0, 0);
     for n in 0..count {
-        let src = random_test(&mut rng, n, large);
+        let src = generate(&mut rng, n, large);
         let t = litmus::parse(&src).unwrap_or_else(|e| panic!("{}\n{}", e, src));
         let lse2 = rng.below(4) == 0;
         if std::env::var("ARMEM_POR_DUMP").is_ok_and(|d| d == n.to_string()) {
@@ -245,6 +385,13 @@ fn random_tests(count: usize, seed: u64, large: bool, budget: u64) {
 #[test]
 fn random_small() {
     random_tests(200, 1, false, 2_000);
+}
+
+/// Random tests of pieces published through a flag (see
+/// `random_publish_test`), part of the normal test run (about 20 s).
+#[test]
+fn random_publish() {
+    random_tests_with(random_publish_test, 60, 3, false, 5_000);
 }
 
 /// Larger random tests, which can take hours: run them with

@@ -1,0 +1,5 @@
+AArch64 mysql_ndb_jb
+"An NDB thread executes the prio A signals another thread sent it as they were sent"
+{ setup(); int count; int bad; }
+ P0 = consumer | P1 = producer ;
+exists (bad=1)

@@ -1911,6 +1911,63 @@ meeting the condition for each version, and with `-DRELAXED_TAKE` 218 of
 `--sample` paths can stall on one expensive memory, so these runs used
 `--sample 1` with seeds 1 to 300.
 
+### MySQL NDB job buffers
+
+NDB, MySQL Cluster's data node, runs its blocks on threads that pass
+signals through job buffer queues (`storage/ndb/src/kernel/vm/mt.cpp`).
+A queue is a ring of 32 KB job buffers with one consumer, the thread
+that owns it, and producers that hold the queue's write lock. A producer
+copies a signal into the current buffer and publishes it with
+`publish_position()`: `wmb()`, then the buffer's new `m_len`. When the
+buffer is nearly full it puts a fresh one (`m_len` 0) in the next slot
+and, after another `wmb()`, advances `m_write_index`. The consumer takes
+no lock. `read_jba_state()` (for the prio A queue; `read_all_jbb_state()`
+for prio B) loads `m_write_index` and then the current buffer's `m_len`,
+and after an `rmb()` `execute_signals()` runs the signals up to it. When
+it reaches the end of a buffer that isn't the last, it moves to the next
+buffer, loads that buffer's `m_len`, and goes on. On aarch64 `rmb()` and
+`wmb()` are both `DMB ISH`.
+
+Commit `145987997` (April 2022, Bug#33650674 "Missing memory barriers -
+Apple M1") added an `rmb()` where `run_job_buffers()` reads the prio A
+state again inside its loop, which had none. It also removed an earlier
+workaround (bug#3589359) that ran an `rmb()` before every signal on
+aarch64, as "too intrusive". `mysql_ndb_jb.c` holds excerpts of the
+producer and consumer as in trunk (November 2026; GPL-2.0, see
+`c/mysql/LICENSE`) and, with `-DFIX` and `-DOLD`, at `145987997` and just
+before it. `-DOLD -DNO_WORKAROUND` also leaves out the per-signal
+`rmb()`. `t1` sends two signals; by default each fills a buffer, so the
+second goes into the next one, and `-DSAME` puts both in one buffer. `t0`
+runs the prio A part of `run_job_buffers()` once, and records the
+signals it executes. The buffers start zeroed, standing for a recycled
+buffer's old contents, and the condition is a signal executed with other
+contents than were sent. `-DNEXT_RMB` adds an `rmb()` after the next
+buffer's `m_len` load.
+
+| Version | Next buffer | Same buffer |
+|---|---|---|
+| before bug#3589359 (`-DOLD -DNO_WORKAROUND`) | yes (and faults) | yes |
+| per-signal `rmb()` (`-DOLD`) | no | no |
+| `145987997` (`-DFIX`) | yes | no |
+| trunk | yes | no |
+| `145987997` or trunk with `-DNEXT_RMB` | no | no |
+
+Each verdict holds at `-O0` to `-O2` and `-Os`, with and without LSE,
+with one exception (below), and none is reachable under TSO. So armem
+finds the bug `145987997` fixed, and finds that removing the workaround
+reopened another path, still open in trunk. Moving to the next buffer
+loads its `m_len` and then its signals, and nothing orders those two
+loads. A buffer the producer is still filling can then show a new
+`m_len` with old contents, and the consumer executes a stale signal. The
+default scenario's fault before bug#3589359 is a load through a stale
+null `m_buffers[]` slot. Trunk's one exception is `-O0` without LSE,
+where clang compiles the release exchange in `wakeup_all()`'s inlined
+mutex as an `LDAXR`/`STLXR` loop, and that orders the loads. NDB's
+`wakeup_all()` calls glibc's `pthread_mutex_lock()` and
+`pthread_mutex_unlock()`, which glibc compiles like the `-O1` and up
+code here at any NDB `-O` level. `execute_signals()` drains the prio B
+queues the same way, so the same path applies to them.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,
@@ -2604,7 +2661,11 @@ without LSE, while the per-type cache that replaced it holds (see
 [CPython](#cpython)), and that gRPC's completion queue shutdown was
 already ordered on ARM before its commit `f01a138e8` made the flag
 atomic, while its server can lose a call requested during shutdown on
-any machine (see [gRPC](#grpc)). In the
+any machine (see [gRPC](#grpc)), and in MySQL NDB's job buffers the
+ARM-only bug that its commit `145987997` fixed in 2022, and an ARM-only
+stale read on moving to the next buffer that the same commit reopened
+by removing an earlier workaround, still in trunk (see
+[MySQL NDB job buffers](#mysql-ndb-job-buffers)). In the
 Chase–Lev
    work-stealing deque, armem finds which of its fences each compiler
    mapping needs (see [C programs](#c-programs)). Next come other

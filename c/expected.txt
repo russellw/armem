@@ -749,3 +749,91 @@ tokio_notify -O0 no no -DRELAXED_TAKE
 tokio_notify -O0 yes no -DRELAXED_TAKE -march=armv8.1-a
 tokio_notify -O0 no no -DWAITERS
 tokio_notify -O0 no no -DWAITERS -DOLD
+
+# MySQL NDB's prio A job buffer queue (mt.cpp): the consumer must execute
+# the signals as sent. Default: trunk, second signal in the next buffer;
+# -DSAME puts both in one buffer. -DFIX is 145987997, -DOLD just before it
+# (with the per-signal aarch64 rmb), -DNO_WORKAROUND without that rmb.
+# -DNEXT_RMB adds an rmb after the next buffer's m_len load. Trunk holds at
+# -O0 without LSE only because clang then makes wakeup_all's release
+# exchange an LDAXR/STLXR loop.
+mysql_ndb_jb -O2 yes no
+mysql_ndb_jb -O2 no no -DNEXT_RMB
+mysql_ndb_jb -O2 yes no -DFIX
+mysql_ndb_jb -O2 no no -DFIX -DNEXT_RMB
+mysql_ndb_jb -O2 no no -DOLD
+mysql_ndb_jb -O2 fault no -DOLD -DNO_WORKAROUND
+mysql_ndb_jb -O2 no no -DSAME
+mysql_ndb_jb -O2 no no -DFIX -DSAME
+mysql_ndb_jb -O2 no no -DOLD -DSAME
+mysql_ndb_jb -O2 yes no -DOLD -DNO_WORKAROUND -DSAME
+mysql_ndb_jb -O2 yes no -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O2 yes no -DFIX -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DFIX -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DOLD -march=armv8.1-a
+mysql_ndb_jb -O2 fault no -DOLD -DNO_WORKAROUND -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DSAME -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DFIX -DSAME -march=armv8.1-a
+mysql_ndb_jb -O2 no no -DOLD -DSAME -march=armv8.1-a
+mysql_ndb_jb -O2 yes no -DOLD -DNO_WORKAROUND -DSAME -march=armv8.1-a
+mysql_ndb_jb -O1 yes no
+mysql_ndb_jb -O1 no no -DNEXT_RMB
+mysql_ndb_jb -O1 yes no -DFIX
+mysql_ndb_jb -O1 no no -DFIX -DNEXT_RMB
+mysql_ndb_jb -O1 no no -DOLD
+mysql_ndb_jb -O1 fault no -DOLD -DNO_WORKAROUND
+mysql_ndb_jb -O1 no no -DSAME
+mysql_ndb_jb -O1 no no -DFIX -DSAME
+mysql_ndb_jb -O1 no no -DOLD -DSAME
+mysql_ndb_jb -O1 yes no -DOLD -DNO_WORKAROUND -DSAME
+mysql_ndb_jb -O1 yes no -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O1 yes no -DFIX -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DFIX -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DOLD -march=armv8.1-a
+mysql_ndb_jb -O1 fault no -DOLD -DNO_WORKAROUND -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DSAME -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DFIX -DSAME -march=armv8.1-a
+mysql_ndb_jb -O1 no no -DOLD -DSAME -march=armv8.1-a
+mysql_ndb_jb -O1 yes no -DOLD -DNO_WORKAROUND -DSAME -march=armv8.1-a
+mysql_ndb_jb -Os yes no
+mysql_ndb_jb -Os no no -DNEXT_RMB
+mysql_ndb_jb -Os yes no -DFIX
+mysql_ndb_jb -Os no no -DFIX -DNEXT_RMB
+mysql_ndb_jb -Os no no -DOLD
+mysql_ndb_jb -Os fault no -DOLD -DNO_WORKAROUND
+mysql_ndb_jb -Os no no -DSAME
+mysql_ndb_jb -Os no no -DFIX -DSAME
+mysql_ndb_jb -Os no no -DOLD -DSAME
+mysql_ndb_jb -Os yes no -DOLD -DNO_WORKAROUND -DSAME
+mysql_ndb_jb -Os yes no -march=armv8.1-a
+mysql_ndb_jb -Os no no -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -Os yes no -DFIX -march=armv8.1-a
+mysql_ndb_jb -Os no no -DFIX -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -Os no no -DOLD -march=armv8.1-a
+mysql_ndb_jb -Os fault no -DOLD -DNO_WORKAROUND -march=armv8.1-a
+mysql_ndb_jb -Os no no -DSAME -march=armv8.1-a
+mysql_ndb_jb -Os no no -DFIX -DSAME -march=armv8.1-a
+mysql_ndb_jb -Os no no -DOLD -DSAME -march=armv8.1-a
+mysql_ndb_jb -Os yes no -DOLD -DNO_WORKAROUND -DSAME -march=armv8.1-a
+mysql_ndb_jb -O0 no no
+mysql_ndb_jb -O0 no no -DNEXT_RMB
+mysql_ndb_jb -O0 yes no -DFIX
+mysql_ndb_jb -O0 no no -DFIX -DNEXT_RMB
+mysql_ndb_jb -O0 no no -DOLD
+mysql_ndb_jb -O0 fault no -DOLD -DNO_WORKAROUND
+mysql_ndb_jb -O0 no no -DSAME
+mysql_ndb_jb -O0 no no -DFIX -DSAME
+mysql_ndb_jb -O0 no no -DOLD -DSAME
+mysql_ndb_jb -O0 yes no -DOLD -DNO_WORKAROUND -DSAME
+mysql_ndb_jb -O0 yes no -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O0 yes no -DFIX -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DFIX -DNEXT_RMB -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DOLD -march=armv8.1-a
+mysql_ndb_jb -O0 fault no -DOLD -DNO_WORKAROUND -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DSAME -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DFIX -DSAME -march=armv8.1-a
+mysql_ndb_jb -O0 no no -DOLD -DSAME -march=armv8.1-a
+mysql_ndb_jb -O0 yes no -DOLD -DNO_WORKAROUND -DSAME -march=armv8.1-a

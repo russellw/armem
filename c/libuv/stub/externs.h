@@ -1,6 +1,7 @@
 /* The functions uv-common.c and unix/async.c call that are defined in the
    rest of libuv or in the C library. The test never calls them, so each is
-   a BRK, which armem reports as a fault if it runs. */
+   a BRK, which armem reports as a fault if it runs. A test that defines
+   uv__close and uv__io_stop itself defines UV_TEST_TEARDOWN. */
 __asm__(
   "  .text\n"
   "  .globl abort\nabort: brk #0\n"
@@ -17,9 +18,13 @@ __asm__(
   "  .globl snprintf\nsnprintf: brk #0\n"
   "  .globl strchr\nstrchr: brk #0\n"
   "  .globl strlen\nstrlen: brk #0\n"
+#ifndef UV_TEST_TEARDOWN
   "  .globl uv__close\nuv__close: brk #0\n"
+#endif
   "  .globl uv__io_init_start\nuv__io_init_start: brk #0\n"
+#ifndef UV_TEST_TEARDOWN
   "  .globl uv__io_stop\nuv__io_stop: brk #0\n"
+#endif
   "  .globl uv__loop_close\nuv__loop_close: brk #0\n"
   "  .globl uv__loop_configure\nuv__loop_configure: brk #0\n"
   "  .globl uv__process_title_cleanup\nuv__process_title_cleanup: brk #0\n"

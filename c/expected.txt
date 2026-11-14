@@ -324,6 +324,22 @@ libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -DSEE=__ATOMIC_ACQUIRE fuel=3000
 libuv_async -O0 no no -DDATA=__ATOMIC_RELEASE -march=armv8.1-a fuel=3000
 libuv_async -O0 yes yes -DOLD_SEND fuel=3000
 libuv_async -O0 yes yes -DOLD_SEND -march=armv8.1-a fuel=3000
+libuv_close -O2 yes no
+libuv_close -O2 no no -DFIXED
+libuv_close -O2 yes no -march=armv8.1-a
+libuv_close -O2 no no -DFIXED -march=armv8.1-a
+libuv_close -O1 yes no
+libuv_close -O1 no no -DFIXED
+libuv_close -O1 yes no -march=armv8.1-a
+libuv_close -O1 no no -DFIXED -march=armv8.1-a
+libuv_close -Os yes no
+libuv_close -Os no no -DFIXED
+libuv_close -Os yes no -march=armv8.1-a
+libuv_close -Os no no -DFIXED -march=armv8.1-a
+libuv_close -O0 no no
+libuv_close -O0 no no -DFIXED
+libuv_close -O0 yes no -march=armv8.1-a
+libuv_close -O0 no no -DFIXED -march=armv8.1-a
 
 # liburing's submission to an SQPOLL ring (queue.c, liburing.h, commit
 # c63f4aa6): a polling thread that sets IORING_SQ_NEED_WAKEUP and then

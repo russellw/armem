@@ -1011,6 +1011,43 @@ at `-O0` and `-O2`. This version is not in `c/`; it was checked with
 copies of the two files. This was reported as
 [libuv/libuv#5416](https://github.com/libuv/libuv/issues/5416).
 
+`uv_async_send` also counts itself busy while it writes to the eventfd.
+Its compare-and-swap adds 2 to a counter above the pending flag, and it
+subtracts 2 after the write. `uv__async_spin`, which `uv_close` and loop
+teardown run, waits for the counter to reach 0, after which nothing may
+use the handle or the fd. In 1.53.0 the subtraction and the spin's load
+are relaxed. libuv commit `067c56e3` (September 2026, #5307, after
+1.53.0) makes them a release and an acquire, for ThreadSanitizer's
+report of `close` in `uv__async_stop` racing `write` in `uv__async_send`
+(#5297). `libuv_close.c` tests teardown. `t0` runs `uv__async_stop`,
+which spins on the handle, closes the fd and sets it to -1, and then
+reuses the handle's memory. `t1` calls `uv_async_send`. The stub `write`
+records the fd it was given (in `uv_test_fd`), and the test defines
+`uv__close` and `uv__io_stop` itself (`-DUV_TEST_TEARDOWN` leaves them
+out of `externs.h`). The condition is a write to any fd other than 3.
+`-DFIXED` uses `c/libuv/fixed/src/uv-common.c`, which is 1.53.0's file
+with `067c56e3` applied:
+
+| Variant | LDAXR/STLXR (armv8-a) | LSE (armv8.1-a) | TSO |
+|---|---|---|---|
+| 1.53.0 | **yes** (no at `-O0`) | **yes** | no |
+| `067c56e3` | no | no | no |
+
+That holds at `-O0` to `-O2` and `-Os`, each run in under a second. In
+1.53.0, `t1` can load fd -1, the value set after the close. Its loads of
+`handle->loop` and the fd are satisfied after its subtraction is visible
+to `t0` (load buffering), and nothing in the relaxed code forbids that.
+At `-O0` without LSE clang compiles the relaxed subtraction as an
+`LDAXR`/`STLXR` loop anyway. Some executions run out of fuel, those in
+which `t0` spins while `t1` is mid-send. With 8,000 instructions they
+reach `sched_yield` (a `BRK` stub), and the verdicts don't change. On
+Linux this is probably not reachable: the real `write` gets from the fd
+to the eventfd's spinlock through address dependencies, and taking the
+lock is an acquire that orders the subtraction after the loads. The
+stub's `write` is a plain store, so only libuv's own orderings count, as
+in C11. With them, 1.53.0 relies on the kernel, as the commit message
+says, and `067c56e3` removes that reliance.
+
 ### liburing
 
 `c/liburing/src` holds liburing's `src/queue.c` and the headers it

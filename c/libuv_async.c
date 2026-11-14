@@ -37,6 +37,7 @@
 int data;
 int seen;
 int uv_test_woken;
+int uv_test_fd;
 int errno;
 
 static void cb(uv_async_t* handle) {

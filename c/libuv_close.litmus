@@ -1,0 +1,5 @@
+AArch64 libuv_close
+"uv_async_send does not use the handle or its fd after the loop's teardown has waited for it"
+{ int uv_test_woken; int uv_test_fd; int uv_test_closed; }
+ P0 = t0 | P1 = t1 ;
+exists (uv_test_woken=1 /\ ~uv_test_fd=3)

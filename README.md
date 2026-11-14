@@ -1754,6 +1754,63 @@ Each turn of the spinlock's exchange that finds the lock held writes
 back the 1 it read, so the tests bound that with `--stutter 1` (see
 [Usage](#usage)).
 
+### PostgreSQL invalidation queue
+
+A PostgreSQL backend that commits a catalog change appends invalidation
+messages to a circular buffer in shared memory, under `SInvalWriteLock`,
+and advances `maxMsgNum` (`src/backend/storage/ipc/sinvaladt.c`). Every
+other backend, whenever it takes a lock, checks its `hasMessages` flag
+and reads the messages up to `maxMsgNum` under `SInvalReadLock`. Commit
+`df3978c234` (September 2026, "Convert SISeg->maxMsgNum to an atomic
+variable") removes the spinlock `msgnumLock`, which the writer held to
+store `maxMsgNum` and the reader to load it, and which was there only
+for its barriers. Instead the writer stores it with
+`pg_atomic_write_membarrier_u32()` and the reader loads it with
+`pg_atomic_read_membarrier_u32()`. Two orderings matter. The messages
+must be seen before the new `maxMsgNum`. And the reader stores its
+`hasMessages = false` before it loads `maxMsgNum`, while the writer
+stores `maxMsgNum` before it sets each backend's `hasMessages = true`.
+If the reader's `false` lands after the writer's `true` while its load
+returns the old `maxMsgNum`, it misses the message until another one
+comes.
+
+`postgres_sinval.c` copies `SIInsertDataEntries()` and
+`SIGetDataEntries()` at that commit and, with `-DOLD`, from just before
+it (PostgreSQL License, see `c/postgres/LICENSE`), with PostgreSQL's
+arm64 atomics. The read is `__sync_fetch_and_add(ptr, 0)`, the write
+`__atomic_exchange_n()` with `__ATOMIC_SEQ_CST`, and the spinlocks
+`__sync_lock_test_and_set()` and `__sync_lock_release()`, with a plain
+test while spinning. `setup` queues one message. `writer` queues
+another, then releases a lock that `reader` then tries to take (in
+PostgreSQL, the heavyweight lock on the relation). `reader` reads its
+messages once while the writer runs, as on taking any lock, and again
+if it gets the lock, by when it must have the writer's message. The
+condition is that a reader that got the lock did not get exactly the two
+messages. `SICleanupQueue()`, signals and Asserts are left out.
+
+Neither the old code nor the new meets the condition, on ARM or under
+TSO, at `-O0` to `-O2` and `-Os`, with and without LSE, in at most 6 s
+each and without bounding `--stutter`: the commit is correct here. Both
+full barriers are needed. With `-DACQUIRE_READ`, an acquire load of
+`maxMsgNum`, the condition is met on ARM and under TSO (store
+buffering). With `-DRELEASE_WRITE`, a release store, it is met on ARM
+only: a release orders the messages before `maxMsgNum`, but not the
+stores of `hasMessages` after it, which TSO keeps in order.
+
+Before the pre-pass and private-memory changes this test prompted, the
+new code's search did not finish. Each lock has one user here, so it is
+private, and its acquire exchanges and release stores now make no write
+messages (see [Private memory](#how-it-works)). The reader's add of 0
+copies `maxMsgNum` without publishing anything. Without LSE, clang
+compiles that add as an `LDAXR` and an `STLXR` of the same register.
+The writer reads back its own `maxMsgNum`, and each 16-byte message is
+copied with an unaligned `STUR`, 16 pieces nothing orders (see the
+static reduction). At `-O2` the new code now takes 64 memories with LSE
+and 183 without, and the old code 789 (from 3,950). A plain store of
+`maxMsgNum`, which publishes nothing, still does not finish in 10
+minutes: the reader's reads of the message are then not published, so
+the reduction keeps every order of its pieces.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,

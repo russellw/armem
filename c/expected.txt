@@ -689,3 +689,35 @@ postgres_aio -O1 yes no -DOLD stutter=1 sample=1
 postgres_aio -Os no no stutter=1
 postgres_aio -Os yes no -DOLD stutter=1 sample=1
 postgres_aio -O0 yes no -DOLD stutter=1 sample=1 fuel=2000
+postgres_sinval -O2 no no
+postgres_sinval -O2 no no -DOLD
+postgres_sinval -O2 yes yes -DACQUIRE_READ
+postgres_sinval -O2 yes no -DRELEASE_WRITE
+postgres_sinval -O2 no no -march=armv8.1-a
+postgres_sinval -O2 no no -DOLD -march=armv8.1-a
+postgres_sinval -O2 yes yes -DACQUIRE_READ -march=armv8.1-a
+postgres_sinval -O2 yes no -DRELEASE_WRITE -march=armv8.1-a
+postgres_sinval -O1 no no
+postgres_sinval -O1 no no -DOLD
+postgres_sinval -O1 yes yes -DACQUIRE_READ
+postgres_sinval -O1 yes no -DRELEASE_WRITE
+postgres_sinval -O1 no no -march=armv8.1-a
+postgres_sinval -O1 no no -DOLD -march=armv8.1-a
+postgres_sinval -O1 yes yes -DACQUIRE_READ -march=armv8.1-a
+postgres_sinval -O1 yes no -DRELEASE_WRITE -march=armv8.1-a
+postgres_sinval -Os no no
+postgres_sinval -Os no no -DOLD
+postgres_sinval -Os yes yes -DACQUIRE_READ
+postgres_sinval -Os yes no -DRELEASE_WRITE
+postgres_sinval -Os no no -march=armv8.1-a
+postgres_sinval -Os no no -DOLD -march=armv8.1-a
+postgres_sinval -Os yes yes -DACQUIRE_READ -march=armv8.1-a
+postgres_sinval -Os yes no -DRELEASE_WRITE -march=armv8.1-a
+postgres_sinval -O0 no no
+postgres_sinval -O0 no no -DOLD
+postgres_sinval -O0 yes yes -DACQUIRE_READ
+postgres_sinval -O0 yes no -DRELEASE_WRITE
+postgres_sinval -O0 no no -march=armv8.1-a
+postgres_sinval -O0 no no -DOLD -march=armv8.1-a
+postgres_sinval -O0 yes yes -DACQUIRE_READ -march=armv8.1-a
+postgres_sinval -O0 yes no -DRELEASE_WRITE -march=armv8.1-a

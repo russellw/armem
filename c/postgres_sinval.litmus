@@ -1,0 +1,5 @@
+AArch64 postgres_sinval
+"A backend that takes a lock after another backend commits gets that backend's invalidation message"
+{ setup(); int got; int rel0; int rel1; int locked; int bad; int errors; }
+ P0 = reader | P1 = writer ;
+exists (locked=1 /\ ~(got=2 /\ rel0=1000 /\ rel1=1234 /\ bad=0 /\ errors=0))

@@ -1811,6 +1811,69 @@ and 183 without, and the old code 789 (from 3,950). A plain store of
 minutes: the reader's reads of the message are then not published, so
 the reduction keeps every order of its pieces.
 
+### tokio Notify
+
+tokio's `Notify` (`tokio/src/sync/notify.rs`) keeps its state in one word:
+two bits for `EMPTY`, `WAITING` or `NOTIFIED` (a stored `notify_one`
+permit), and above them a count of `notify_waiters` calls. Waiting futures
+are queued on an intrusive list under a mutex. Commit `d4fb4bb9` (tokio
+1.54.0, #8325, August 2026) weakened all 19 accesses to the state from
+`SeqCst` to `Acquire`, `Release` or `AcqRel`. Its argument: each decision
+that avoids the lock is made by a read-modify-write, which reads the
+latest value; a stale load is checked again by a later read-modify-write
+or under the mutex; and what the orderings must carry is the
+happens-before from data written before `notify_one` or `notify_waiters`
+to the task that consumes the notification. Being a weakening, any
+mistake in it would be a new bug.
+
+`tokio_notify.cpp` is a C++ port of `Notify`, `Notified`'s poll and drop,
+and the intrusive list (`util/linked_list.rs`, including the guarded list
+`notify_waiters` uses) from tokio 1.54.1 (MIT License), with one future and
+one notifier. `-DOLD` restores `SeqCst` everywhere. A waker is a flag,
+which `wake()` sets with a relaxed store, so that only `Notify` carries
+data, and the mutex is a spinlock. `t0` creates the future and polls it.
+If the poll returns `Pending`, `t0` checks the flag once, and if the waker
+has run it polls again. Once the poll returns `Ready`, `t0` reads `data`.
+`t1` writes `data` and calls `notify_one`. The condition is a lost wakeup
+(`t0` not ready and its waker never run) or a stale read (`t0` ready but
+`data` 0). With `-DWAITERS`, `t1` calls `notify_waiters` instead, but only
+if it sees that the future has been created, since `notify_waiters` only
+wakes futures created before it. With `-DDROP`, `t0` polls once and then
+drops the future, which must pass on a `notify_one` it received but did
+not consume. The condition is then that the permit is lost or duplicated,
+or a stale read. Two weakenings show what the harness catches.
+`-DRELAXED_TAKE` makes the poll's optimistic `NOTIFIED` to `EMPTY`
+compare-exchange, which takes a permit, relaxed. `-DRELAXED_INIT` makes
+the poll's first load of the state, which sees that `notify_waiters` was
+called, relaxed.
+
+| Scenario | Variant | ARM | TSO |
+|---|---|---|---|
+| `notify_one` | 1.54.1 | no | no |
+| `notify_one` | `-DOLD` | no | no |
+| `notify_one` | `-DRELAXED_TAKE` | yes | no |
+| `notify_waiters` | 1.54.1 | no | no |
+| `notify_waiters` | `-DOLD` | no | no |
+| `notify_waiters` | `-DRELAXED_INIT` | yes | no |
+| drop | 1.54.1 | no (sampled) | no |
+| drop | `-DOLD` | no (sampled) | no |
+| drop | `-DRELAXED_TAKE` | yes | — |
+
+So `d4fb4bb9` is correct here. The `notify_one` verdicts are exhaustive
+at `-O0` to `-O2` and `-Os`, with and without LSE, in 2 to 15 s each.
+At `-O0` without LSE, `-DRELAXED_TAKE` is not caught, because clang then
+compiles every compare-and-swap as an `LDAXR`/`STLXR` loop whatever its
+order. `notify_waiters` is exhaustive without LSE (14 s at `-O0`, 80 to
+100 s optimized). With LSE its ARM search doesn't finish in 20 minutes,
+old or new, at any level. At `-O2`, 200 single random paths each found
+nothing for either version and caught `-DRELAXED_INIT` on all 200. The
+drop scenario's ARM search doesn't finish in an hour at `-O2`, old or
+new. Of 300 single random paths each (10 s limit), 283 finished without
+meeting the condition for each version, and with `-DRELAXED_TAKE` 218 of
+300 met it. Its TSO and SC searches finish at once. A run of several
+`--sample` paths can stall on one expensive memory, so these runs used
+`--sample 1` with seeds 1 to 300.
+
 ### Calls
 
 `BL` and `BLR` put the address of the next instruction in X30, and `BR`,

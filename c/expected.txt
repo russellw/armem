@@ -721,3 +721,15 @@ postgres_sinval -O0 no no -march=armv8.1-a
 postgres_sinval -O0 no no -DOLD -march=armv8.1-a
 postgres_sinval -O0 yes yes -DACQUIRE_READ -march=armv8.1-a
 postgres_sinval -O0 yes no -DRELEASE_WRITE -march=armv8.1-a
+tokio_notify -O2 no no
+tokio_notify -O2 no no -march=armv8.1-a
+tokio_notify -O0 no no
+tokio_notify -O0 no no -march=armv8.1-a
+tokio_notify -O2 no no -DOLD
+tokio_notify -O2 no no -DOLD -march=armv8.1-a
+tokio_notify -O2 yes no -DRELAXED_TAKE
+tokio_notify -O2 yes no -DRELAXED_TAKE -march=armv8.1-a
+tokio_notify -O0 no no -DRELAXED_TAKE
+tokio_notify -O0 yes no -DRELAXED_TAKE -march=armv8.1-a
+tokio_notify -O0 no no -DWAITERS
+tokio_notify -O0 no no -DWAITERS -DOLD

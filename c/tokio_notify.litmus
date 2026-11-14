@@ -1,0 +1,5 @@
+AArch64 tokio_notify
+"A notification from tokio's Notify is neither lost nor seen before the data written ahead of it"
+{ setup(); int ready; int d; int woken; int skipped; int dropmode; uint64_t notify_state; }
+ P0 = t0 | P1 = t1 ;
+exists ((skipped=0 /\ ready=1 /\ d=0) \/ (dropmode=0 /\ skipped=0 /\ ready=0 /\ woken=0) \/ (dropmode=1 /\ ready=0 /\ ~notify_state=2) \/ (dropmode=1 /\ ready=1 /\ notify_state=2))

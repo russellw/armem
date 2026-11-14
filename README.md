@@ -1033,14 +1033,16 @@ with `067c56e3` applied:
 | 1.53.0 | **yes** (no at `-O0`) | **yes** | no |
 | `067c56e3` | no | no | no |
 
-That holds at `-O0` to `-O2` and `-Os`, each run in under a second. In
+That holds at `-O0` to `-O2` and `-Os`. In
 1.53.0, `t1` can load fd -1, the value set after the close. Its loads of
 `handle->loop` and the fd are satisfied after its subtraction is visible
 to `t0` (load buffering), and nothing in the relaxed code forbids that.
 At `-O0` without LSE clang compiles the relaxed subtraction as an
-`LDAXR`/`STLXR` loop anyway. Some executions run out of fuel, those in
-which `t0` spins while `t1` is mid-send. With 8,000 instructions they
-reach `sched_yield` (a `BRK` stub), and the verdicts don't change. On
+`LDAXR`/`STLXR` loop anyway. In executions where `t0` spins while `t1`
+is mid-send, `t0` runs all 997 turns of the spin's inner loop and calls
+`sched_yield`, which here just returns. The next pass of the outer loop
+repeats a state armem has already seen, so it is pruned. That takes 8,000
+instructions of fuel, or 20,000 at `-O0` (about 20 s per run). On
 Linux this is probably not reachable: the real `write` gets from the fd
 to the eventfd's spinlock through address dependencies, and taking the
 lock is an acquire that orders the subtraction after the loads. The

@@ -1,7 +1,9 @@
 /* The functions uv-common.c and unix/async.c call that are defined in the
    rest of libuv or in the C library. The test never calls them, so each is
    a BRK, which armem reports as a fault if it runs. A test that defines
-   uv__close and uv__io_stop itself defines UV_TEST_TEARDOWN. */
+   uv__close and uv__io_stop itself defines UV_TEST_TEARDOWN; there
+   uv__async_spin can run out of spins, so sched_yield returns, and the
+   spin's next pass repeats a state armem has seen, which it prunes. */
 __asm__(
   "  .text\n"
   "  .globl abort\nabort: brk #0\n"
@@ -14,7 +16,11 @@ __asm__(
   "  .globl memcpy\nmemcpy: brk #0\n"
   "  .globl memset\nmemset: brk #0\n"
   "  .globl realloc\nrealloc: brk #0\n"
+#ifdef UV_TEST_TEARDOWN
+  "  .globl sched_yield\nsched_yield: ret\n"
+#else
   "  .globl sched_yield\nsched_yield: brk #0\n"
+#endif
   "  .globl snprintf\nsnprintf: brk #0\n"
   "  .globl strchr\nstrchr: brk #0\n"
   "  .globl strlen\nstrlen: brk #0\n"

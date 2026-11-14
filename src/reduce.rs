@@ -375,9 +375,9 @@ impl Reduction {
     }
 
     /// The memory private to each thread, as sorted, disjoint byte ranges:
-    /// bytes that no other thread may read or write, and that the thread
-    /// accesses with no acquire or release instruction (exclusive and
-    /// atomic ones included). Every access of the thread, and every
+    /// bytes that no other thread may read or write (however the thread
+    /// accesses them: the memory model still orders its exclusive, atomic,
+    /// acquire and release accesses there). Every access of the thread, and every
     /// location in `observed`, lies either wholly in a thread's private
     /// memory or wholly outside it.
     pub fn private(&self, observed: &[(u64, u64)]) -> Vec<Vec<(u64, u64)>> {
@@ -389,9 +389,6 @@ impl Reduction {
         let mut private: Vec<BTreeSet<u64>> = (0..n)
             .map(|t| {
                 let mut p = accessed[t].clone();
-                for f in [&self.acquire_reads[t], &self.release_writes[t]] {
-                    p.retain(|b| !bytes(f).contains(b));
-                }
                 for (u, other) in accessed.iter().enumerate() {
                     if u != t {
                         p.retain(|b| !other.contains(b));

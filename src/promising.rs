@@ -1140,23 +1140,27 @@ impl<'a> Solo<'a> {
         }
     }
 
-    /// An exclusive or atomic access to memory private to the thread (see
-    /// `Stack::is_private`), or None for any other operation. The core
-    /// performs it on its private bytes, like a stack access: no message is
-    /// written and nothing is read from memory. No other thread accesses
-    /// these bytes, so the access is trivially atomic, and its outcomes are
-    /// those of the shared case with every other thread's writes left out.
-    /// The access neither acquires nor releases (the core faults on such
-    /// accesses to private memory), and so needs none of the views that
-    /// those use. A write is placed as early as it may be, as for a stack
-    /// store (see `successors`).
+    /// An exclusive, atomic, acquire or release access to memory private to
+    /// the thread (see `Stack::is_private`), or None for any other
+    /// operation. The core performs it on its private bytes, like a stack
+    /// access: no message is written and nothing is read from memory. No
+    /// other thread accesses these bytes, so the access is trivially atomic,
+    /// and its outcomes are those of the shared case with every other
+    /// thread's writes left out. A read returns the thread's own latest
+    /// write, as by forwarding (`do_read`), and a write is placed as early as
+    /// it may be, as a stack store is (see `successors`): right after its
+    /// pre-view in `do_write`, whose whole-number timestamps make "just
+    /// after `t`" compare like `t`. The views of the shared case still
+    /// apply, so an acquire or release orders the thread's other accesses as
+    /// it would there.
     fn private_successors(&self, st: &TState, op: MemOp) -> Option<Vec<TState>> {
         let prog = self.prog;
         let status = |ok: bool| RV::imm(if ok { 0 } else { 1 });
         let (addr, len) = match op {
-            MemOp::Load { addr, size, excl: true, .. }
-            | MemOp::StoreExcl { addr, size, .. }
-            | MemOp::Rmw { addr, size, .. } => (addr, size.bytes()),
+            MemOp::Load { addr, size, excl, kind, .. } if excl || kind != LoadKind::Plain => (addr, size.bytes()),
+            MemOp::Store { addr, size, release: true, .. } | MemOp::StoreExcl { addr, size, .. } | MemOp::Rmw { addr, size, .. } => {
+                (addr, size.bytes())
+            }
             MemOp::LoadExclPair { addr, size, .. } | MemOp::StoreExclPair { addr, size, .. } => {
                 (addr, 2 * size.bytes())
             }
@@ -1167,26 +1171,78 @@ impl<'a> Solo<'a> {
         }
         let mut base = st.clone();
         base.v_cap = base.v_cap.max(addr.pick);
-        // Place a private write: after everything it must follow.
-        let placed = |s: &mut TState, w: View| s.v_wold = s.v_wold.max(w).max(st.v_wnew).max(st.v_cap);
+        // A read, as in `do_read`: its dependencies (the register's view).
+        // An exclusive read that neither acquires nor is a NoRet atomic's
+        // read takes only the dependencies of the write it reads, as a
+        // stack load does.
+        let read = |s: &mut TState, size: Size, kind: ReadKind| -> (u128, RV) {
+            let (v, d) = s.core.private_load(addr, size);
+            if kind.load == LoadKind::Plain && !kind.noret {
+                return (v, d);
+            }
+            let mut vpre = addr.view.max(s.v_rnew);
+            if kind.load == LoadKind::Acquire {
+                vpre = vpre.max(s.v_rel);
+            }
+            let mut rview = d.view;
+            if kind.load != LoadKind::Plain {
+                rview = rview.max(s.core.private_xview(addr.val, size));
+            }
+            let vpost = vpre.max(rview);
+            let ppost = vpost.max(d.pick);
+            if kind.noret {
+                s.v_rnoret = s.v_rnoret.max(vpost);
+                s.v_rnoret_p = s.v_rnoret_p.max(ppost);
+            } else {
+                s.v_rold = s.v_rold.max(vpost);
+                s.v_rold_p = s.v_rold_p.max(ppost);
+            }
+            if kind.load != LoadKind::Plain {
+                s.v_rnew = s.v_rnew.max(vpost);
+                s.v_wnew = s.v_wnew.max(ppost);
+            }
+            (v, dep(vpost, ppost))
+        };
+        // Place a private write: right after everything it must follow (as
+        // `do_write`'s `vpre`).
+        let placed = |s: &mut TState, w: View, kind: WriteKind| {
+            let mut t = w.max(s.v_wnew).max(s.v_cap);
+            if kind.release {
+                t = t.max(s.v_rold_p).max(s.v_rnoret_p).max(s.v_wold);
+                s.v_rel = s.v_rel.max(t);
+            }
+            s.v_wold = s.v_wold.max(t);
+            if kind.full {
+                s.v_rnew = s.v_rnew.max(t);
+                s.v_wnew = s.v_wnew.max(t);
+            }
+        };
         let mut out = Vec::new();
         match op {
-            MemOp::Load { rt, size, signed, .. } => {
-                let (v, dep) = base.core.private_load(addr, size);
+            MemOp::Load { rt, size, signed, kind, excl, .. } => {
+                let (v, dep) = read(&mut base, size, ReadKind::of(kind));
                 base.core.set(rt, RV { val: size.extend(v as u64, signed), ..dep });
-                base.xcl = Some(Monitor { addr: addr.val, size, srcs: Vec::new(), view: dep.view, val: v });
+                if excl {
+                    base.xcl = Some(Monitor { addr: addr.val, size, srcs: Vec::new(), view: dep.view, val: v });
+                }
                 out.push(base);
             }
-            MemOp::LoadExclPair { rt, rt2, size, .. } => {
+            MemOp::LoadExclPair { rt, rt2, size, acquire, .. } => {
                 let total = size.double();
-                let (v, dep) = base.core.private_load(addr, total);
+                let kind = ReadKind::of(if acquire { LoadKind::Acquire } else { LoadKind::Plain });
+                let (v, dep) = read(&mut base, total, kind);
                 let (lo, hi) = split_pair(v, size);
                 base.core.set(rt, RV { val: lo, ..dep });
                 base.core.set(rt2, RV { val: hi, ..dep });
                 base.xcl = Some(Monitor { addr: addr.val, size: total, srcs: Vec::new(), view: dep.view, val: v });
                 out.push(base);
             }
-            MemOp::StoreExcl { data, rs, size, .. } | MemOp::StoreExclPair { data, rs, size, .. } => {
+            MemOp::Store { data, size, .. } => {
+                let w = base.core.private_store(addr, size, size.mask(data.val) as u128, data, 0);
+                placed(&mut base, w, WriteKind { release: true, ..WriteKind::default() });
+                out.push(base);
+            }
+            MemOp::StoreExcl { data, rs, size, release, .. } | MemOp::StoreExclPair { data, rs, size, release, .. } => {
                 // As for shared memory, failure is always possible.
                 let (total, val, data) = match op {
                     MemOp::StoreExclPair { data2, .. } => {
@@ -1197,21 +1253,22 @@ impl<'a> Solo<'a> {
                 let mut f = base.clone();
                 f.xcl = None;
                 f.core.set(rs, status(false));
-                let can_succeed = st.xcl.as_ref().is_some_and(|m| m.addr == addr.val && m.size == total);
-                if let Some(f) = self.store_excl_fails(f, can_succeed) {
+                let monitor = st.xcl.as_ref().filter(|m| m.addr == addr.val && m.size == total);
+                if let Some(f) = self.store_excl_fails(f, monitor.is_some()) {
                     out.push(f);
                 }
-                if can_succeed {
+                if let Some(m) = monitor {
                     let mut s = base;
-                    let w = s.core.private_store(addr, total, val, data);
-                    placed(&mut s, w);
+                    let w = s.core.private_store(addr, total, val, data, m.view);
+                    placed(&mut s, w, WriteKind { release, xview: m.view, full: false });
                     s.xcl = None;
                     s.core.set(rs, status(true));
                     out.push(s);
                 }
             }
-            MemOp::Rmw { op, operand, cmp, rt, size, .. } => {
-                let (v, dep) = base.core.private_load(addr, size);
+            MemOp::Rmw { op, operand, cmp, rt, size, acquire, release, noret, .. } => {
+                let load = if acquire { LoadKind::Acquire } else { LoadKind::Plain };
+                let (v, dep) = read(&mut base, size, ReadKind { load, noret });
                 let old = v as u64;
                 let reg = RV { val: old, ..dep };
                 match rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
@@ -1230,8 +1287,9 @@ impl<'a> Solo<'a> {
                         if let Some(c) = cmp {
                             outs.push(RV { val: old, view: c.view, pick: c.pick.max(dep.pick) });
                         }
-                        let w = base.core.private_store(addr, size, new as u128, data);
-                        placed(&mut base, w);
+                        let kind = WriteKind { release, xview: dep.view, full: acquire && release };
+                        let w = base.core.private_store(addr, size, new as u128, data, dep.view);
+                        placed(&mut base, w, kind);
                         for o in outs {
                             let mut s = base.clone();
                             s.core.set(rt, o);

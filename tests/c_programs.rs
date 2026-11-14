@@ -176,9 +176,27 @@ fn expected_verdicts() {
         return;
     };
     let (all, clang) = (expectations(), clang.as_str());
-    let failures: Vec<String> = std::thread::scope(|s| {
-        let handles: Vec<_> = all.iter().enumerate().map(|(i, e)| s.spawn(move || check(clang, i, e))).collect();
-        handles.into_iter().filter_map(|h| h.join().unwrap()).collect()
+    // One worker per core: running every line at once needs the memory of
+    // all of them together (more than 30 GB).
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (all, next) = (&all, &next);
+    let mut failures: Vec<(usize, String)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(e) = all.get(i) else { break out };
+                        out.extend(check(clang, i, e).map(|f| (i, f)));
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
+    failures.sort();
+    let failures: Vec<String> = failures.into_iter().map(|(_, f)| f).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

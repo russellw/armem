@@ -101,3 +101,8 @@ POR-pick-isb           yes  yes
 POR-swpal              yes  yes
 POR-swp-ldar           yes  yes
 POR-cas-dep            yes  no
+SB+rel-acq-private+dmb no   no
+SB+rel-acqpc-private+dmb yes yes
+MP+swpal-private+dmb   no   no
+MP+rel-private+dmb     yes  no
+MP+xchg-acq-private+dmb yes no

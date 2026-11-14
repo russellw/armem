@@ -1,0 +1,10 @@
+AArch64 SB+rel-acq-private+dmb
+"P0's private STLR then LDAR (RCsc) orders its store to x before its load of y"
+{ 0:X1=x; 0:X3=y; 0:X5=p; 1:X1=y; 1:X3=x; }
+ P0           | P1          ;
+ MOV W0,#1    | MOV W0,#1   ;
+ STR W0,[X1]  | STR W0,[X1] ;
+ STLR W0,[X5] | DMB SY      ;
+ LDAR W4,[X5] | LDR W2,[X3] ;
+ LDR W2,[X3]  |             ;
+exists (0:X2=0 /\ 1:X2=0)

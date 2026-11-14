@@ -21,9 +21,10 @@
 //! reduction's pre-pass, `reduce::Reduction::private`) is treated like its
 //! stack: the core performs plain accesses to it as local steps, and a
 //! store to it bypasses the store buffer, which no other thread could
-//! observe. An exclusive or atomic access to it is performed on the core's
-//! private bytes, but keeps its effect on the thread's own ordering: it
-//! waits for the store buffer to drain, as a locked operation does.
+//! observe. An exclusive, atomic, acquire or release access to it is
+//! performed on the core's private bytes, but keeps its effect on the
+//! thread's own ordering (see `private_atomic`): an exclusive store or
+//! atomic waits for the store buffer to drain, as a locked operation does.
 
 use crate::core::{Core, MemOp, RV, Step, StepQueue, VR, low_bytes, pair_value, rmw_result, split_pair};
 use crate::hash::FxHashMap;
@@ -146,11 +147,18 @@ fn run_local(core: &mut Core, prog: &crate::isa::Code, fuel: u32, live: Option<&
     true
 }
 
-/// An exclusive or atomic access by thread `t` to its private memory, if
-/// `op` is one: Some(whether it can be performed now), having performed it.
+/// An exclusive, atomic, acquire or release access by thread `t` to its
+/// private memory, if `op` is one: Some(whether it can be performed now),
+/// having performed it. It keeps its ordering of the thread's shared
+/// accesses: an exclusive store or atomic waits for the store buffer to
+/// drain, as a locked operation does, an RCsc acquire waits for the buffered
+/// release stores, as a shared one does, and a release store, which
+/// bypasses the buffer, makes a later RCsc acquire wait for every store
+/// buffered before it, as a buffered release store would.
 fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<bool> {
     let (addr, len) = match op {
-        MemOp::Load { addr, size, excl: true, .. } | MemOp::StoreExcl { addr, size, .. } | MemOp::Rmw { addr, size, .. } => {
+        MemOp::Load { addr, size, excl, kind, .. } if excl || kind != LoadKind::Plain => (addr, size.bytes()),
+        MemOp::Store { addr, size, release: true, .. } | MemOp::StoreExcl { addr, size, .. } | MemOp::Rmw { addr, size, .. } => {
             (addr, size.bytes())
         }
         MemOp::LoadExclPair { addr, size, .. } | MemOp::StoreExclPair { addr, size, .. } => (addr, 2 * size.bytes()),
@@ -162,10 +170,15 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
     let reg = |val: u64| RV { val, pick: 0, view: 0 };
     let drained = t.buf.is_empty();
     match op {
-        MemOp::Load { rt, size, signed, .. } => {
+        MemOp::Load { kind: LoadKind::Acquire, .. } | MemOp::LoadExclPair { acquire: true, .. } if t.rel != 0 => {
+            return Some(false);
+        }
+        MemOp::Load { rt, size, signed, excl, .. } => {
             let v = t.core.private_load(addr, size).0;
             t.core.set(rt, reg(size.extend(v as u64, signed)));
-            t.mon = Some((addr.val, size));
+            if excl {
+                t.mon = Some((addr.val, size));
+            }
         }
         MemOp::LoadExclPair { rt, rt2, size, .. } => {
             let total = size.double();
@@ -174,11 +187,15 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
             t.core.set(rt2, reg(hi));
             t.mon = Some((addr.val, total));
         }
+        MemOp::Store { data, size, .. } => {
+            t.core.private_store(addr, size, size.mask(data.val) as u128, RV::default(), 0);
+            t.rel = t.buf.len();
+        }
         MemOp::StoreExcl { .. } | MemOp::StoreExclPair { .. } | MemOp::Rmw { .. } if !drained => return Some(false),
         MemOp::StoreExcl { data, rs, size, .. } => {
             let success = t.mon == Some((addr.val, size));
             if success {
-                t.core.private_store(addr, size, size.mask(data.val) as u128, RV::default());
+                t.core.private_store(addr, size, size.mask(data.val) as u128, RV::default(), 0);
             }
             t.mon = None;
             t.core.set(rs, reg(if success { 0 } else { 1 }));
@@ -187,7 +204,7 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
             let total = size.double();
             let success = t.mon == Some((addr.val, total));
             if success {
-                t.core.private_store(addr, total, pair_value(data.val, data2.val, size), RV::default());
+                t.core.private_store(addr, total, pair_value(data.val, data2.val, size), RV::default(), 0);
             }
             t.mon = None;
             t.core.set(rs, reg(if success { 0 } else { 1 }));
@@ -195,7 +212,7 @@ fn private_atomic(t: &mut Thread, op: MemOp, prog: &crate::isa::Code) -> Option<
         MemOp::Rmw { op, operand, cmp, rt, size, .. } => {
             let old = t.core.private_load(addr, size).0 as u64;
             if let Some(new) = rmw_result(op, old, operand.val, cmp.map(|c| c.val), size) {
-                t.core.private_store(addr, size, new as u128, RV::default());
+                t.core.private_store(addr, size, new as u128, RV::default(), 0);
             }
             t.core.set(rt, reg(old));
         }

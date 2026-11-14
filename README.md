@@ -405,7 +405,8 @@ armem --elf seqlock.o c/seqlock.litmus
 ```
 
 `tests/c_programs.rs` compiles them with clang and checks the verdicts in
-`c/expected.txt`, when clang is installed. All the variants give the same
+`c/expected.txt`, when clang is installed, one line per core at a time
+(all at once needed more than 30 GB). All the variants give the same
 verdicts at `-O0`, `-O1`, `-Os` and `-O2`, except where noted:
 
 | Program | Ordering removed | ARM | TSO |
@@ -2106,8 +2107,7 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   each one, its value included. But a C program's results, and variables
   only one thread uses, are often in memory that no other thread
   accesses. The reduction's pre-pass finds each thread's private memory:
-  bytes that no other thread may read or write, and that the thread
-  accesses with no acquire or release instruction. A byte is private only if
+  bytes that no other thread may read or write. A byte is private only if
   every access to it, and every location the test observes, lies wholly
   in private memory or wholly outside it. The core performs accesses to
   it like those to the stack (see [Stacks](#stacks)), so they make no
@@ -2122,19 +2122,32 @@ its stack ...`), and the one-line summary marks the model with `(fault)`.
   litmus test and random test, the final states with private memory
   alone, and with private memory and the reduction, must equal those
   with neither.
-  Exclusive and atomic instructions that neither acquire nor release may
-  access private memory too. The model performs them (a store-exclusive
-  may always fail, and a successful `CAS` may leave `Rs` with the value
-  from either memory or the register), but on the thread's private bytes,
-  as a load and then a store, rather than with write messages. No other
-  thread writes those bytes, so the access is trivially atomic, and the
-  ordering that sets atomics apart only matters to acquire reads, which
-  are never private. This is what makes `ck_epoch_poll` tractable (see
-  [Concurrency Kit](#concurrency-kit)): ck pops a thread's lists of
-  deferred objects with an atomic exchange. While those were shared
-  writes, one poll against one reader's section took over 60 s; it now
-  takes 0.1 s. The random tests give each thread a location of its own,
-  which it sometimes accesses with atomics and exclusive pairs, to check
+  Exclusive, atomic, acquire and release instructions may access private
+  memory too. The model performs them (a store-exclusive may always fail,
+  and a successful `CAS` may leave `Rs` with the value from either memory
+  or the register), but on the thread's private bytes, as a load and then
+  a store, rather than with write messages. No other thread writes those
+  bytes, so the access is trivially atomic. Its ordering of the thread's
+  other accesses is kept: the model applies the views of a shared access,
+  with the read returning the thread's latest write as by forwarding, and
+  the write placed right after everything it must follow. So a private
+  release still orders the accesses before it, an acquire the accesses
+  after it, a release followed by an `LDAR` the two (as in
+  `SB+rel-acq-private+dmb`), and an acquire read of an atomic's or
+  exclusive pair's write follows that instruction's read. Under TSO a
+  private release store bypasses the store buffer but still makes a later
+  `LDAR` wait for the stores buffered before it. This is what makes
+  `ck_epoch_poll` tractable (see [Concurrency Kit](#concurrency-kit)): ck
+  pops a thread's lists of deferred objects with an atomic exchange. While
+  those were shared writes, one poll against one reader's section took
+  over 60 s; it now takes 0.1 s. A lock that only one thread takes, as
+  each of PostgreSQL's `SInvalReadLock` and `SInvalWriteLock` is in a test
+  with one reader and one writer, is private too. Its four writes (an
+  acquire exchange and a release store, twice) were shared writes, and in
+  a reduced version of that test, with the reader reading `maxMsgNum`
+  with an atomic add of 0, they multiplied 185 memories to 10,731. The
+  random tests give each thread a location of its own, which it sometimes
+  accesses with atomics, exclusive pairs, acquires and releases, to check
   this.
 * **Sampling** (`--sample N`, with `--seed`): for tests too big to explore
   exhaustively, armem follows `N` random paths through the promise
@@ -2308,8 +2321,7 @@ lets a lone `LDXP` be torn.
   It warns and says `(capped)` as `--spurious` does.
 * Stacks are private: a thread cannot access another thread's stack
   (that is reported as a fault), and stack memory cannot be used for
-  atomics (other private memory can, if they neither acquire nor
-  release).
+  atomics, acquires or releases (other private memory can).
 * The exhaustive search suits tests with tens of shared writes, not
   thousands. The reduction removes orders nothing can observe, and
   private memory removes writes no other thread can see, but writes that

@@ -109,10 +109,11 @@ pub fn stack_range(tid: usize) -> (u64, u64) {
 /// own), or to access its stack with an exclusive, atomic, acquire or
 /// release instruction.
 ///
-/// Private memory outside the stack may also be accessed with exclusive and
-/// atomic instructions that neither acquire nor release. The memory model
-/// performs those (a store-exclusive may fail, and so has two outcomes), but
-/// with `private_load` and `private_store` rather than with write messages.
+/// Private memory outside the stack may also be accessed with exclusive,
+/// atomic, acquire and release instructions. The memory model performs
+/// those (a store-exclusive may fail, and so has two outcomes, and their
+/// ordering still constrains the thread's other accesses), but with
+/// `private_load` and `private_store` rather than with write messages.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stack {
     pub lo: u64,
@@ -121,6 +122,10 @@ pub struct Stack {
     pub area: (u64, u64),
     /// Bytes stored so far, with the views of the store (as in `RV`).
     bytes: BTreeMap<u64, (u8, View, View)>,
+    /// For private bytes last written by an exclusive pair or atomic: the
+    /// view of its read, which orders an acquire read of the write (as
+    /// `promising::Fwd::xview` does).
+    xviews: BTreeMap<u64, View>,
     /// Memory outside the stack that is private to the thread (see
     /// `set_private`).
     private: Private,
@@ -168,7 +173,7 @@ enum Access {
 impl Stack {
     pub fn new(tid: usize, threads: usize) -> Stack {
         let (lo, hi) = stack_range(tid);
-        Stack { lo, hi, area: stack_area(threads), bytes: BTreeMap::new(), private: Private::default() }
+        Stack { lo, hi, area: stack_area(threads), bytes: BTreeMap::new(), xviews: BTreeMap::new(), private: Private::default() }
     }
 
     /// Treat `ranges` (sorted and disjoint) as private to the thread: memory
@@ -194,8 +199,9 @@ impl Stack {
     }
 
     /// Whether `len` bytes at `a` are in the private memory set by
-    /// `set_private` (not the stack). An exclusive or atomic access there is
-    /// performed with `Core::private_load` and `Core::private_store`.
+    /// `set_private` (not the stack). An exclusive, atomic, acquire or
+    /// release access there is performed with `Core::private_load` and
+    /// `Core::private_store`.
     pub fn is_private(&self, a: u64, len: u64) -> bool {
         let ranges = &self.private.0;
         let end = a.saturating_add(len);
@@ -224,7 +230,7 @@ impl Stack {
             if end > p {
                 return if a >= p && end <= q && access == Access::Plain {
                     Place::Stack
-                } else if a >= p && end <= q && access == Access::Atomic {
+                } else if a >= p && end <= q {
                     // Performed by the memory model (see `is_private`).
                     Place::Memory
                 } else {
@@ -262,12 +268,23 @@ impl Stack {
         for v in self.bytes.values_mut() {
             (v.1, v.2) = (0, 0);
         }
+        self.xviews.clear();
     }
 
     fn write(&mut self, a: u64, n: u64, val: u128, view: View, pick: View) {
         for i in 0..n {
             self.bytes.insert(a + i, ((val >> (8 * i)) as u8, view, pick));
         }
+        if !self.xviews.is_empty() {
+            for i in 0..n {
+                self.xviews.remove(&(a + i));
+            }
+        }
+    }
+
+    /// The largest `xviews` entry of `n` bytes at `a`.
+    fn xview(&self, a: u64, n: u64) -> View {
+        self.xviews.range(a..a + n).map(|(_, &v)| v).max().unwrap_or(0)
     }
 }
 
@@ -563,13 +580,26 @@ impl Core {
         (v, RV { val: 0, view, pick: pick.max(a.pick).max(view) })
     }
 
-    /// For an exclusive or atomic access to private memory: write `val`
-    /// (`size` bytes) at `a`, whose data has dependencies `data`, as a stack
-    /// store does. Returns the (pick) view of its address and data, which,
-    /// as for `Step::Local`'s `write`, the memory model must place the write
-    /// after.
-    pub fn private_store(&mut self, a: RV, size: Size, val: u128, data: RV) -> View {
+    /// For an acquire read of private memory: the view of the read of the
+    /// exclusive pair or atomic that last wrote any of `size` bytes at `a`
+    /// (0 if none did).
+    pub fn private_xview(&self, a: u64, size: Size) -> View {
+        self.stack.xview(a, size.bytes())
+    }
+
+    /// For an exclusive, atomic or release access to private memory: write
+    /// `val` (`size` bytes) at `a`, whose data has dependencies `data`, as a
+    /// stack store does. `xview` is the view of the read of an exclusive
+    /// pair or atomic writing (or 0). Returns the (pick) view of its address
+    /// and data, which, as for `Step::Local`'s `write`, the memory model
+    /// must place the write after.
+    pub fn private_store(&mut self, a: RV, size: Size, val: u128, data: RV, xview: View) -> View {
         self.stack.write(a.val, size.bytes(), val, a.view.max(data.view), a.pick.max(data.pick));
+        if xview != 0 {
+            for i in 0..size.bytes() {
+                self.stack.xviews.insert(a.val + i, xview);
+            }
+        }
         data.pick.max(data.view).max(a.pick)
     }
 

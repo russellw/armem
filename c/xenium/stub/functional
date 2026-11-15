@@ -1,0 +1,8 @@
+// Stand-in for <functional>: std::hash, which xenium::hash wraps; the
+// harnesses give vyukov_hash_map a hash policy of their own.
+#ifndef STUB_FUNCTIONAL
+#define STUB_FUNCTIONAL
+namespace std {
+template<typename T> struct hash;
+}
+#endif

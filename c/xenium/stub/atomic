@@ -1,5 +1,5 @@
-// Stand-in for <atomic>: what the kfifo queue uses, on clang's __atomic
-// builtins, as libstdc++'s is. The generic builtins take any trivially
+// Stand-in for <atomic>: what the kfifo queue and the hash map use, on
+// clang's __atomic builtins, as libstdc++'s is. The generic builtins take any trivially
 // copyable type of 1, 2, 4 or 8 bytes, such as xenium's marked_ptr.
 #ifndef STUB_ATOMIC
 #define STUB_ATOMIC
@@ -30,6 +30,13 @@ template<typename T> struct atomic {
 		return *reinterpret_cast<T*>(r);
 	}
 	void store(T x, memory_order m = memory_order_seq_cst) noexcept { __atomic_store(&v, &x, m); }
+	operator T() const noexcept { return load(); }
+	T operator=(T x) noexcept { store(x); return x; }
+	T exchange(T x, memory_order m = memory_order_seq_cst) noexcept {
+		alignas(sizeof(T)) unsigned char r[sizeof(T)];
+		__atomic_exchange(&v, &x, reinterpret_cast<T*>(r), m);
+		return *reinterpret_cast<T*>(r);
+	}
 	bool compare_exchange_strong(T& e, T x, memory_order s, memory_order f) noexcept {
 		return __atomic_compare_exchange(&v, &e, &x, false, s, f);
 	}

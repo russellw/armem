@@ -1,4 +1,5 @@
-// Stand-in for <type_traits>: what the kfifo queue and its headers use.
+// Stand-in for <type_traits>: what the kfifo queue, the hash map and
+// their headers use.
 #ifndef STUB_TYPE_TRAITS
 #define STUB_TYPE_TRAITS
 #include <cstddef>
@@ -24,6 +25,12 @@ template<typename T> struct is_pointer : false_type {};
 template<typename T> struct is_pointer<T*> : true_type {};
 template<typename T> struct is_trivially_copyable : integral_constant<bool, __is_trivially_copyable(T)> {};
 template<typename T> struct is_empty : integral_constant<bool, __is_empty(T)> {};
+template<typename T> struct is_trivial : integral_constant<bool, __is_trivial(T)> {};
+template<typename B, typename D> struct is_base_of : integral_constant<bool, __is_base_of(B, D)> {};
+template<typename T> struct alignment_of : integral_constant<size_t, alignof(T)> {};
+template<typename T> struct is_reference : false_type {};
+template<typename T> struct is_reference<T&> : true_type {};
+template<typename T> struct is_reference<T&&> : true_type {};
 template<typename T> struct is_default_constructible : integral_constant<bool, __is_constructible(T)> {};
 }
 #endif

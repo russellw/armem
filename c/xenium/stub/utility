@@ -1,4 +1,6 @@
-// Stand-in for <utility>: move, forward and swap.
+// Stand-in for <utility>: move, forward, swap and pair, and
+// forward_iterator_tag (from <iterator>), which vyukov_hash_map.hpp uses
+// without including it.
 #ifndef STUB_UTILITY
 #define STUB_UTILITY
 #include <type_traits>
@@ -8,6 +10,11 @@ template<typename T> constexpr typename remove_reference<T>::type&& move(T&& t) 
 }
 template<typename T> constexpr T&& forward(typename remove_reference<T>::type& t) noexcept { return static_cast<T&&>(t); }
 template<typename T> constexpr T&& forward(typename remove_reference<T>::type&& t) noexcept { return static_cast<T&&>(t); }
+template<typename A, typename B> struct pair {
+	A first;
+	B second;
+};
+struct forward_iterator_tag {};
 template<typename T> void swap(T& a, T& b) noexcept { T t(move(a)); a = move(b); b = move(t); }
 }
 #endif

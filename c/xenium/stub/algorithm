@@ -1,7 +1,8 @@
-// Stand-in for <algorithm>: std::max.
+// Stand-in for <algorithm>: std::min and std::max.
 #ifndef STUB_ALGORITHM
 #define STUB_ALGORITHM
 namespace std {
+template<typename T> constexpr const T& min(const T& a, const T& b) { return b < a ? b : a; }
 template<typename T> constexpr const T& max(const T& a, const T& b) { return a < b ? b : a; }
 }
 #endif

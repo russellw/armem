@@ -1542,3 +1542,61 @@ nine with the fix. A second scenario, in which `t0` pops A itself and
 then pops again, can't reach the fault even on main: `t0`'s first pop
 finds `head_` and `tail_` the same and calls `advance_tail()`, which
 reads `S->next` itself.
+
+## xenium hash map
+
+xenium's `vyukov_hash_map` (`vyukov_hash_map.hpp`, `impl/vyukov_hash_map.hpp`,
+`impl/vyukov_hash_map_traits.hpp`) keeps up to three items per bucket in
+arrays `key[]` and `value[]`, and more in a list of extension items
+taken from shared free lists. A bucket's `state` word holds a lock bit,
+the item count, a delete marker and a version. `emplace` and `erase`
+lock the bucket; `erase` bumps the version, and marks the slot it
+overwrites while it moves an item into it (the last array item, or the
+first extension item). `try_get_value()` takes no lock: it loads `state`
+(acquire), compares each key, loads the value (acquire), and rereads
+`state` (relaxed), retrying if the version changed and skipping a marked
+slot.
+
+PR #43 (squashed into main as `1c449ae`, July 2025, "Fix memory order
+issues in vyukov_hash_map") made the key loads in `try_get_value()`
+acquire and the stores of keys release, after the values (`89393e0`
+for erase's moves, `27e22f6` for emplace's stores into array slots and
+extension items, `fe837f7` for erase through an iterator).
+`xenium_hash_map.cpp` runs main, and with `-DPRE` `e427a4e` (main before
+#43), and with `-DNO_27E22F6` main with `27e22f6` reverted. The old
+copies are in `c/xenium/e427a4e` and `c/xenium/no-27e22f6`. Keys and
+values are ints, the hash is the identity, every key goes to bucket 0,
+and the reclaimer never frees. In each scenario `t1` changes the bucket
+while `t0` looks a key up once, and the condition is `t0` getting a value
+never stored with its key (or, in the default scenario, missing a key
+that is in the map throughout):
+
+* default: J and K fill slots 0 and 1; `t1` erases J, which moves K into
+  slot 0; `t0` looks up K.
+* `-DREUSE`: `t1` erases K (the last slot) and emplaces L, which goes
+  into K's old slot; `t0` looks up L.
+* `-DEXT`: 128 buckets (the fewest with an extension bucket), three
+  items in the array and K in an extension item; `t1` erases K and
+  emplaces L, which takes K's extension item back from the free list;
+  `t0` looks up L.
+
+| Version | Move | Array slot reuse | Extension item reuse |
+|---|---|---|---|
+| main | no | no | no |
+| `e427a4e` (`-DPRE`) | yes (gets J's value for K) | yes (gets K's value for L) | yes (gets K's value for L) |
+| main without `27e22f6` | no | no | yes (gets K's value for L) |
+
+Every verdict is the same at `-O0` (with 3000 fuel), `-O1`, `-O2` and `-Os`,
+with and without LSE, and nothing is reachable under TSO. Each run takes
+under 2 s, except `-DEXT` at `-O0` (about 75 s, 100 s with LSE). So
+main holds, and the bugs #43 fixed are ARM-only: before it, `t0` can
+read a moved or new key late, after its relaxed reread of `state`, and
+pair it with the slot's old value. Part of `27e22f6` isn't needed on
+ARM: once the key load is acquire, `emplace`'s relaxed stores into an
+array slot come after its acquire compare-and-swap on `state`, which
+reads from `erase`'s release of the new version, so a `t0` that sees
+them also sees the version and retries. The C++ model gives no such
+edge, so the fix is still right in C++. Its acquire load of an extension
+item's key is needed on ARM: `t0` reaches a reused item through a
+pointer read before the erase, so nothing orders its key load before
+the reread of `state`.

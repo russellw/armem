@@ -1,0 +1,5 @@
+AArch64 xenium_hash_map
+"A lookup gets a value never stored with its key, or misses a key always present"
+{ setup(); int found0; int value0; int bad0; }
+P0 = t0 | P1 = t1 ;
+exists (bad0=1)

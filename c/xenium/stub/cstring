@@ -1,8 +1,9 @@
-// Stand-in for <cstring>: memcpy, as the builtin.
+// Stand-in for <cstring>: memcpy and memset, as the builtins.
 #ifndef STUB_CSTRING
 #define STUB_CSTRING
 #include <cstddef>
 namespace std {
 inline void* memcpy(void* d, const void* s, size_t n) noexcept { return __builtin_memcpy(d, s, n); }
+inline void* memset(void* d, int c, size_t n) noexcept { return __builtin_memset(d, c, n); }
 }
 #endif

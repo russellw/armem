@@ -1,0 +1,5 @@
+AArch64 xenium_kfifo
+"A pop of a queue that is never empty finds it empty"
+{ setup(); int found0; int empty0; int got1; }
+P0 = t0 | P1 = t1 ;
+exists (empty0=1)

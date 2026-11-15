@@ -1478,3 +1478,66 @@ CoreCLR, the lock-free readers that go from a header index to the table
 go through `PassiveGetSyncBlock()`. The others are the GC's own scans,
 the heap walk for ETW's bulk type events, and COM wrappers, which keep
 their own copy of the index. Nothing to report.
+
+## xenium kfifo queue
+
+xenium's `kirsch_kfifo_queue` (`kirsch_kfifo_queue.hpp`) is a linked
+list of segments of k slots, with `head_` and `tail_` pointing to
+segments. `push()` scans the tail segment for an empty slot with relaxed
+loads and fills one with a release compare-and-swap, or, if the segment
+is full, links a new one and advances `tail_`. `do_pop()` takes `head_`
+(acquire), scans its segment for a full slot with relaxed loads, and
+loads `tail_` (acquire). If it found nothing, the queue is empty when
+`head_` and `tail_` are the same segment and a relaxed reread of `tail_`
+hasn't changed; otherwise `advance_head()` moves `head_` to the next
+segment, which it loads (acquire) without checking for null, and
+`do_pop()` retries.
+
+Commit `048e278` (October 2026, "Fix potential race in kirsch kfifo
+queue", on the unmerged branch `fix/kirsch-kfifo-queue`) adds an acquire
+fence after a scan that finds nothing and makes the compare-and-swaps
+that empty a slot release (acq_rel in `do_pop()`), because the relaxed
+slot loads can be satisfied after the loads of `tail_`, so a pop can
+miss an item and report the queue empty. `xenium_kfifo.cpp` runs the
+header from main (`1c449ae`, July 2025; MIT, see `c/xenium/LICENSE`)
+and, with `-DFIX`, from `048e278`, with segments of one slot and a
+reclaimer that never frees. A (1) is pushed in setup, filling segment S.
+`t1` pushes B (2), which links S2, moves `tail_` to it and puts B
+there, and then pops A. `t0` pops once. The queue is never empty, and
+the condition is `t0` finding it empty. To keep the search small, `t0`
+runs `do_pop()` copied into the harness, stopping when it finds an item,
+and `push()`'s first pass (which calls `advance_tail()`) is copied too,
+with S2 allocated in setup; `push()` and `try_pop()` themselves run the
+rest. `-DFENCE_ONLY` is main with just the fence, and `-DTAIL_ACQUIRE`
+is main with the reread of `tail_` acquire.
+
+| Version | Found empty | Null `head_` |
+|---|---|---|
+| main | yes | yes (fault) |
+| `048e278` (`-DFIX`) | no | no |
+| main with the fence (`-DFENCE_ONLY`) | no | no |
+| main with an acquire reread (`-DTAIL_ACQUIRE`) | yes | no |
+
+main and `048e278` give the same verdicts at `-O0` (with 3000 fuel) to
+`-O2` and `-Os`, and the other two at `-O1` and `-O2`. Nothing is
+reachable under TSO. Each run takes under a minute. So armem finds the
+race `048e278` fixes, and a worse outcome of it on main: if the relaxed
+reread of `tail_` sees S2 while the acquire load before it saw S, the
+empty check fails, and `advance_head()`'s first load of `S->next` can
+still see null while its second load sees S2. It then moves `head_` to
+null, and the next pop faults loading the segment's `k`. With the fix,
+seeing the slot empty brings `t1`'s link of S2, so both loads see it.
+The fence alone holds on ARM only because `t1`'s pop (`LDAXR`) can't
+come before its `STLXR`s in `push()`; C++ doesn't promise that, so the
+release compare-and-swaps are needed too. Making the reread acquire
+stops the crash but not the false empty. With LSE some executions
+exceed even 3000 fuel, so those builds aren't in `expected.txt`; main
+still faults there.
+
+An earlier version of the harness, running `push()` and `try_pop()`
+unchanged on both threads, was too big to explore. Sampling it found
+the same fault on main (one path in nine that finished), and none in
+nine with the fix. A second scenario, in which `t0` pops A itself and
+then pops again, can't reach the fault even on main: `t0`'s first pop
+finds `head_` and `tail_` the same and calls `advance_tail()`, which
+reads `S->next` itself.

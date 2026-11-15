@@ -867,3 +867,17 @@ dotnet_synctable -O2 no no -DPLAIN_ENTRY
 dotnet_synctable -O0 no no -DPLAIN_ENTRY
 dotnet_synctable -O2 no no -DPLAIN_ENTRY -march=armv8.1-a
 dotnet_synctable -O0 no no -DPLAIN_ENTRY -march=armv8.1-a
+
+# xenium's kirsch_kfifo_queue (kirsch_kfifo_queue.hpp): a pop that finds
+# its slot empty while another thread links a new segment. main (1c449ae)
+# can report the queue empty and can move head_ to null (the fault);
+# -DFIX is 048e278. -DFENCE_ONLY is main with 048e278's fence, and
+# -DTAIL_ACQUIRE is main with the empty check's reread of tail_ acquire.
+xenium_kfifo -O2 fault no
+xenium_kfifo -O2 no no -DFIX
+xenium_kfifo -O2 no no -DFENCE_ONLY
+xenium_kfifo -O2 yes no -DTAIL_ACQUIRE
+xenium_kfifo -O1 fault no
+xenium_kfifo -O1 no no -DFIX
+xenium_kfifo -O0 fault no fuel=3000
+xenium_kfifo -O0 no no -DFIX fuel=3000

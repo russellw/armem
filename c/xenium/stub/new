@@ -1,0 +1,11 @@
+// Stand-in for <new>: placement new, and the allocation functions the
+// test defines (a fixed pool).
+#ifndef STUB_NEW
+#define STUB_NEW
+#include <cstddef>
+void* operator new(std::size_t);
+void operator delete(void*) noexcept;
+void operator delete(void*, std::size_t) noexcept;
+inline void* operator new(std::size_t, void* p) noexcept { return p; }
+inline void operator delete(void*, void*) noexcept {}
+#endif

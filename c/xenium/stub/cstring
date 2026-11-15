@@ -1,0 +1,8 @@
+// Stand-in for <cstring>: memcpy, as the builtin.
+#ifndef STUB_CSTRING
+#define STUB_CSTRING
+#include <cstddef>
+namespace std {
+inline void* memcpy(void* d, const void* s, size_t n) noexcept { return __builtin_memcpy(d, s, n); }
+}
+#endif

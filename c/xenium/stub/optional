@@ -1,0 +1,10 @@
+// Stand-in for <optional>, for pop()'s declaration; the test uses
+// try_pop().
+#ifndef STUB_OPTIONAL
+#define STUB_OPTIONAL
+namespace std {
+struct nullopt_t { explicit constexpr nullopt_t(int) {} };
+inline constexpr nullopt_t nullopt{0};
+template<typename T> class optional;
+}
+#endif

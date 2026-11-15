@@ -558,7 +558,7 @@ than `yes` or `no`: some execution faults, for example on a null pointer
 armem has been run on lock-free code from Concurrency Kit, DPDK,
 liburcu, QEMU, libuv, liburing, readerwriterqueue, Boost.Lockfree,
 atomic_queue, Erlang, folly, HAProxy, CPython, gRPC, PostgreSQL, tokio,
-MySQL NDB and .NET. The harnesses are in `c/`, and the record of what armem
+MySQL NDB, .NET and xenium. The harnesses are in `c/`, and the record of what armem
 finds in each, with the variants tested and the run times, is in
 [docs/results.md](docs/results.md).
 

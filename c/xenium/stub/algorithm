@@ -1,0 +1,7 @@
+// Stand-in for <algorithm>: std::max.
+#ifndef STUB_ALGORITHM
+#define STUB_ALGORITHM
+namespace std {
+template<typename T> constexpr const T& max(const T& a, const T& b) { return a < b ? b : a; }
+}
+#endif

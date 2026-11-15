@@ -837,3 +837,33 @@ mysql_ndb_jb -O0 no no -DSAME -march=armv8.1-a
 mysql_ndb_jb -O0 no no -DFIX -DSAME -march=armv8.1-a
 mysql_ndb_jb -O0 no no -DOLD -DSAME -march=armv8.1-a
 mysql_ndb_jb -O0 yes no -DOLD -DNO_WORKAROUND -DSAME -march=armv8.1-a
+
+# .NET CoreCLR's sync block table (syncblk.h): a lock-free TryGetHashCode
+# must return the object's hash code while another thread gives it a sync
+# block, growing the table. Default: main; -DOLD is just before a95fccd35,
+# whose reader loads the header index and g_pSyncTable unordered.
+# -DNO_GROW takes a free slot instead of growing the table. -DPLAIN_ENTRY
+# is main's reader with the entry stored plainly.
+dotnet_synctable -O2 no no
+dotnet_synctable -O2 no no -march=armv8.1-a
+dotnet_synctable -O0 no no
+dotnet_synctable -O0 no no -march=armv8.1-a
+dotnet_synctable -O1 no no
+dotnet_synctable -Os no no
+dotnet_synctable -O2 yes no -DOLD
+dotnet_synctable -O2 yes no -DOLD -march=armv8.1-a
+dotnet_synctable -O0 yes no -DOLD
+dotnet_synctable -O0 yes no -DOLD -march=armv8.1-a
+dotnet_synctable -O1 yes no -DOLD
+dotnet_synctable -Os yes no -DOLD
+dotnet_synctable -O2 yes no -DOLD -DZERO_HEAP
+dotnet_synctable -O2 no no -DZERO_HEAP
+dotnet_synctable -O2 no no -DNO_GROW
+dotnet_synctable -O0 no no -DNO_GROW
+dotnet_synctable -O2 no no -DOLD -DNO_GROW
+dotnet_synctable -O0 no no -DOLD -DNO_GROW
+dotnet_synctable -O2 no no -DOLD -DNO_GROW -march=armv8.1-a
+dotnet_synctable -O2 no no -DPLAIN_ENTRY
+dotnet_synctable -O0 no no -DPLAIN_ENTRY
+dotnet_synctable -O2 no no -DPLAIN_ENTRY -march=armv8.1-a
+dotnet_synctable -O0 no no -DPLAIN_ENTRY -march=armv8.1-a

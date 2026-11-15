@@ -1,0 +1,5 @@
+AArch64 dotnet_synctable
+"A lock-free hash code lookup returns the object's hash code while another thread gives the object a sync block"
+{ setup(); int result; int bad; }
+ P0 = reader | P1 = writer ;
+exists (bad=1)

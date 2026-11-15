@@ -1424,3 +1424,57 @@ code here at any NDB `-O` level. `execute_signals()` drains the prio B
 queues the same way, so the same path applies to them. This was
 reported as [MySQL bug #121785](https://bugs.mysql.com/121785), with
 the `-DNEXT_RMB` `rmb()` as the suggested fix.
+
+## .NET sync block table
+
+In .NET's CoreCLR, an object's header word holds a thin lock, a hash
+code, or an index into `g_pSyncTable`, the process-wide array of
+`SyncTableEntry`s, each pointing to the object's `SyncBlock`
+(`src/coreclr/vm/syncblk.h`, `syncblk.cpp`). `ObjHeader::GetSyncBlock()`
+runs under the sync block cache lock. When no slot is free,
+`NewSyncBlockSlot()` calls `Grow()`, which copies the table into one
+twice the size and publishes it with an exchange, keeping the old table
+until the next GC. Then, holding the header's spin lock, `GetSyncBlock()`
+moves the header's hash code into the new `SyncBlock`, stores the
+`SyncBlock` in the entry, and puts the index into the header with a
+compare-and-swap. `Object::TryGetHashCode()` takes no lock: it reads the
+header, and for an index, `PassiveGetSyncBlock()` reads the header again
+and then `g_pSyncTable[index].m_SyncBlock`.
+
+Commit `a95fccd35` (October 2026, "Order sync-table lookups and
+SyncBlock publication", dotnet/runtime#135179, fixing #134252) makes
+`PassiveGetSyncBlock()` read the header with acquire and stores the
+entry with a release store. Before it, both loads of the header were
+plain, and the load of `g_pSyncTable` doesn't depend on the header.
+`dotnet_synctable.c` holds excerpts of both sides as in main (November
+2026; MIT, see `c/dotnet/LICENSE`) and, with `-DOLD`, just before
+`a95fccd35`, with the PAL's `Interlocked` functions as clang compiles
+them (no added barrier). The object starts with hash code 5 in its
+header, and the table is full. `t1` runs `GetSyncBlock()` for the
+object, so it grows the table from two entries to four and takes index
+2. The old table is followed by heap memory holding a stale `SyncBlock`
+pointer (hash code 7, or null with `-DZERO_HEAP`). `t0` runs
+`TryGetHashCode()`, and the condition is any result but 5. `-DNO_GROW`
+takes a free slot instead, so the table isn't replaced. `-DPLAIN_ENTRY`
+keeps main's reader but stores the entry plainly.
+
+| Version | Table grows | Free slot (`-DNO_GROW`) |
+|---|---|---|
+| before `a95fccd35` (`-DOLD`) | yes | no |
+| main | no | no |
+| main's reader, plain entry store (`-DPLAIN_ENTRY`) | no | |
+
+Each verdict holds at `-O0` to `-O2` and `-Os`, with and without LSE,
+and none is reachable under TSO. Each run takes under a second. So
+armem finds the bug `a95fccd35` fixed. The old lookup can load
+`g_pSyncTable` before the header, then pair the new index with the old
+table, reading past its end. With a free slot, the old code holds,
+because the entry's address depends on the index read from the header.
+Of the fix's two halves, only the reader's acquire matters: the
+header's compare-and-swap (`STLXR` or `CASAL`) already orders the entry
+store before the index. NativeAOT got the same fix in `d148189ce`, in
+C# (`ObjectHeader.NativeAot.cs`), so it isn't run here. In current
+CoreCLR, the lock-free readers that go from a header index to the table
+go through `PassiveGetSyncBlock()`. The others are the GC's own scans,
+the heap walk for ETW's bulk type events, and COM wrappers, which keep
+their own copy of the index. Nothing to report.

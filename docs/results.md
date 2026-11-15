@@ -1600,3 +1600,43 @@ edge, so the fix is still right in C++. Its acquire load of an extension
 item's key is needed on ARM: `t0` reaches a reused item through a
 pointer read before the erase, so nothing orders its key load before
 the reread of `state`.
+
+## libomp distributed barrier
+
+LLVM libomp's distributed barrier (`__kmp_dist_barrier_gather` and
+`__kmp_dist_barrier_release` in `openmp/runtime/src/kmp_barrier.cpp`,
+used with `KMP_*_BARRIER_PATTERN=dist`) puts threads in groups, each led
+by its first thread. To arrive, a thread stores 0 to its `stillNeed`
+flag. A leader waits for its group's flags, stores its own, and waits
+for every leader's; each thread then executes a full fence. To depart,
+the primary thread stores the next value to the go flags of the leaders
+and of its own group, and each leader passes it on to its group; the go
+flags are seq_cst stores, waited for with acquire loads.
+
+`0fa6182e2` (September 2026, "Fix dist barrier arrival
+synchronization", #213845) made `stillNeed`, a `volatile` flag before,
+atomic: the arrival store is a release, and an acquire fence follows
+each wait for the flags. Its reproducer fails on Grace with a thread
+reading another's data from before the barrier. `libomp_dist_barrier.c`
+transcribes main (`6cd3ff3a0`), with `-DPRE` the flag as before the fix,
+and with `-DNO_ACQ` the fix without its acquire fences. Each thread
+writes its own word, passes the barrier once and reads the next
+thread's; the condition is a thread reading the old value. Two threads
+form one group; `libomp_dist_barrier3.c` has three, in groups {0, 1} and
+{2}, so that data also passes through a leader and the primary. With
+`-DREDUCE` each leader instead reads its group's words right after it
+sees their flags, before the full fence, as the reduction does.
+
+| Version | After the barrier | In the reduction |
+|---|---|---|
+| main | no | no |
+| before `0fa6182e2` (`-DPRE`) | yes | yes |
+| main without the acquire fences (`-DNO_ACQ`) | no | yes |
+
+The verdicts are the same with two and three threads and at `-O0` and
+`-O2`, and nothing is reachable under TSO. So the fix is complete for
+these paths, and the bug was ARM-only: the plain store of `stillNeed`
+was not ordered after the thread's own writes. Reads after the barrier
+don't need the acquire fences on ARM, because the full fence at the end
+of the arrival orders them after the flag loads. The reduction runs
+before that fence and does need them.

@@ -905,3 +905,33 @@ xenium_hash_map -O0 no no -DREUSE fuel=3000
 xenium_hash_map -O0 yes no -DREUSE -DPRE fuel=3000
 xenium_hash_map -O0 no no -DEXT fuel=3000
 xenium_hash_map -O0 yes no -DEXT -DNO_27E22F6 fuel=3000
+
+# LLVM libomp's distributed barrier (kmp_barrier.cpp), arrival and
+# departure. main (6cd3ff3a0, with 0fa6182e2) holds; -DPRE is before
+# 0fa6182e2, whose plain stillNeed store let a leader see a thread arrive
+# before its data; -DNO_ACQ removes 0fa6182e2's acquire fences, which on
+# ARM only the reduction's reads (-DREDUCE) need.
+libomp_dist_barrier -O2 no no
+libomp_dist_barrier -O2 yes no -DPRE
+libomp_dist_barrier -O2 no no -DNO_ACQ
+libomp_dist_barrier -O2 no no -DREDUCE
+libomp_dist_barrier -O2 yes no -DREDUCE -DPRE
+libomp_dist_barrier -O2 yes no -DREDUCE -DNO_ACQ
+libomp_dist_barrier3 -O2 no no
+libomp_dist_barrier3 -O2 yes no -DPRE
+libomp_dist_barrier3 -O2 no no -DNO_ACQ
+libomp_dist_barrier3 -O2 no no -DREDUCE
+libomp_dist_barrier3 -O2 yes no -DREDUCE -DPRE
+libomp_dist_barrier3 -O2 yes no -DREDUCE -DNO_ACQ
+libomp_dist_barrier -O0 no no
+libomp_dist_barrier -O0 yes no -DPRE
+libomp_dist_barrier -O0 no no -DNO_ACQ
+libomp_dist_barrier -O0 no no -DREDUCE
+libomp_dist_barrier -O0 yes no -DREDUCE -DPRE
+libomp_dist_barrier -O0 yes no -DREDUCE -DNO_ACQ
+libomp_dist_barrier3 -O0 no no
+libomp_dist_barrier3 -O0 yes no -DPRE
+libomp_dist_barrier3 -O0 no no -DNO_ACQ
+libomp_dist_barrier3 -O0 no no -DREDUCE
+libomp_dist_barrier3 -O0 yes no -DREDUCE -DPRE
+libomp_dist_barrier3 -O0 yes no -DREDUCE -DNO_ACQ

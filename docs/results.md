@@ -1525,7 +1525,8 @@ race `048e278` fixes, and a worse outcome of it on main: if the relaxed
 reread of `tail_` sees S2 while the acquire load before it saw S, the
 empty check fails, and `advance_head()`'s first load of `S->next` can
 still see null while its second load sees S2. It then moves `head_` to
-null, and the next pop faults loading the segment's `k`. With the fix,
+null, and the next pop faults loading the segment's `k`. Reported as
+[xenium#48](https://github.com/mpoeter/xenium/issues/48). With the fix,
 seeing the slot empty brings `t1`'s link of S2, so both loads see it.
 The fence alone holds on ARM only because `t1`'s pop (`LDAXR`) can't
 come before its `STLXR`s in `push()`; C++ doesn't promise that, so the

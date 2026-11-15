@@ -1968,7 +1968,9 @@ mutex as an `LDAXR`/`STLXR` loop, and that orders the loads. NDB's
 `wakeup_all()` calls glibc's `pthread_mutex_lock()` and
 `pthread_mutex_unlock()`, which glibc compiles like the `-O1` and up
 code here at any NDB `-O` level. `execute_signals()` drains the prio B
-queues the same way, so the same path applies to them.
+queues the same way, so the same path applies to them. This was
+reported as [MySQL bug #121785](https://bugs.mysql.com/121785), with
+the `-DNEXT_RMB` `rmb()` as the suggested fix.
 
 ### Calls
 

@@ -502,7 +502,7 @@ atomic_queue2 -O0 no no fuel=3000
 atomic_queue2 -O0 no no -DOLD_2020 fuel=3000
 atomic_queue2 -O0 no no -DSINGLE fuel=3000
 
-# Erlang's process locks (see "Erlang" in README.md). OLD is from before
+# Erlang's process locks (see "Erlang" in docs/results.md). OLD is from before
 # commit 46ff98a5d5, whose unlock trusted a relaxed load of the lock word
 # when every lock it released had a waiter: a thread handed a lock can see
 # its own stale waiter flag and dequeue from an empty queue. DATA checks
@@ -524,7 +524,7 @@ erlang_proc_lock -O0 fault no -DOLD
 erlang_proc_lock -O0 yes no -DDATA
 
 # folly's FlatCombining with a dedicated combiner (see "folly" in
-# README.md). OLD is from before 6d16b1d (October 2026), which added a
+# docs/results.md). OLD is from before 6d16b1d (October 2026), which added a
 # fence after the combiner resets pending_: without it, a requester's
 # post that finds pending_ still set, and so only fences and reloads it,
 # can be lost while the combiner scans the records before its reset is
@@ -555,7 +555,7 @@ folly_fc -O0 no no -DSHUTDOWN
 folly_fc -O0 yes yes -DSHUTDOWN -DOLD
 
 # HAProxy's MT_LIST passing tasklets between threads (see "HAProxy
-# MT_LIST" in README.md): 2.2's list.h at 787dc2095, OLD from before it,
+# MT_LIST" in docs/results.md): 2.2's list.h at 787dc2095, OLD from before it,
 # and V30 from the 3.0 branch. The owner's read of a tasklet's next
 # pointer after MT_LIST_BEHEAD is not ordered after the exchange that saw
 # it published, so it can be stale on ARM in all three; 787dc2095's store
@@ -578,7 +578,7 @@ haproxy_mt_list -O2 yes no -DV30 stutter=1 spurious=1 sample=20
 haproxy_mt_list -O0 yes no -DV30 -march=armv8.1-a stutter=1 sample=20
 
 # CPython's seqlock and the free-threaded type cache that used it (see
-# "CPython" in README.md), at commit 1d3cf79a5 and, with OLD, from before
+# "CPython" in docs/results.md), at commit 1d3cf79a5 and, with OLD, from before
 # it; OLD_READ and OLD_WRITE take one of the two functions it fixed from
 # the old file. The old _PySeqLock_EndRead lets the reader's loads of the
 # entry pass its acquire load of the sequence; the old _PySeqLock_LockWrite
@@ -613,7 +613,7 @@ cpython_typecache -O0 yes no -DRELAXED_STORES -march=armv8.1-a
 cpython_typecache -O0 yes no -DRELAXED_LOADS
 cpython_typecache -O0 yes no -DRELAXED_LOADS -march=armv8.1-a
 
-# gRPC's completion queue shutdown (see "gRPC" in README.md), at commit
+# gRPC's completion queue shutdown (see "gRPC" in docs/results.md), at commit
 # f01a138e8 and, with OLD, from before it, for the next queue, the pluck
 # queue (PLUCK) and the callback queue (CALLBACK). The fix made
 # shutdown_called atomic, but the old code was already ordered: by the
@@ -664,7 +664,7 @@ grpc_cq -O0 no no -DCALLBACK -DOLD -DRELAXED stutter=1
 grpc_cq -O0 yes no -DCALLBACK -DOLD -DRELAXED -march=armv8.1-a stutter=1
 
 # gRPC's server: QueueRequestedCall racing ShutdownAndNotify (see "gRPC" in
-# README.md), at commit 28d1790b9c. A request pushed after shutdown's last
+# docs/results.md), at commit 28d1790b9c. A request pushed after shutdown's last
 # KillPendingWorkLocked is never failed, under any memory model. FIX_LOCK
 # holds mu_call_ across the check and the push; FIX_RECHECK checks the flag
 # again after the push. QUEUED queues another request first, so the push
